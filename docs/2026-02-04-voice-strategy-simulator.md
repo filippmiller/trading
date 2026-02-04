@@ -97,3 +97,5 @@ Safety clamps:
 ## Prices UI
 - `/prices` page shows daily SPY open/close with dollar + percent change (green for up days, red for down days).
 - `GET /api/prices?limit=60` returns recent daily rows.
+## Daily Price Modal
+- Clicking a row in `/prices` opens a modal with an OHLC candlestick diagram and change stats.

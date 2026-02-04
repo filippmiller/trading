@@ -11,12 +11,14 @@ export async function GET(req: Request) {
 
   const pool = await getPool();
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT date, open, close FROM prices_daily WHERE symbol = 'SPY' ORDER BY date DESC LIMIT ${limit}`
+    `SELECT date, open, high, low, close FROM prices_daily WHERE symbol = 'SPY' ORDER BY date DESC LIMIT ${limit}`
   );
 
   const items = rows.map((row) => ({
     date: new Date(row.date).toISOString().slice(0, 10),
     open: Number(row.open),
+    high: Number(row.high),
+    low: Number(row.low),
     close: Number(row.close),
   }));
 
