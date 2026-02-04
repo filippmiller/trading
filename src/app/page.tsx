@@ -1,65 +1,146 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { ScenariosSection } from "@/components/ScenariosSection";
+import { scenarios } from "@/lib/scenarios";
+
+const quickPresets = [
+  {
+    id: "quick-streak-2",
+    label: "Streak Fade 2 (SL 0.5%, TP 1%)",
+    scenarioId: "streak-fade-2",
+  },
+  {
+    id: "quick-streak-3",
+    label: "Streak Fade 3 (SL 0.5%, TP 1%)",
+    scenarioId: "streak-fade-3",
+  },
+];
+
+export default function DashboardPage() {
+  const router = useRouter();
+  const [dataStatus, setDataStatus] = useState<{ count: number; latest: string | null } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [runLoading, setRunLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lookback, setLookback] = useState(60);
+  const [preset, setPreset] = useState(quickPresets[0].id);
+  const getErrorMessage = (err: unknown) =>
+    err instanceof Error ? err.message : "Unexpected error.";
+
+  const fetchStatus = async () => {
+    const response = await fetch("/api/data/status");
+    const payload = await response.json();
+    setDataStatus(payload);
+  };
+
+  useEffect(() => {
+    fetchStatus();
+  }, []);
+
+  const refreshData = async () => {
+    setError(null);
+    setLoading(true);
+    try {
+      const response = await fetch("/api/data/refresh", { method: "POST" });
+      if (!response.ok) throw new Error("Failed to refresh data.");
+      await fetchStatus();
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runQuickBacktest = async () => {
+    setError(null);
+    setRunLoading(true);
+    try {
+      const presetDef = quickPresets.find((item) => item.id === preset);
+      const scenario = scenarios.find((item) => item.id === presetDef?.scenarioId);
+      if (!scenario) throw new Error("Preset not found.");
+      const spec = scenario.buildSpec(scenario.defaultValues, lookback);
+      const response = await fetch("/api/backtest/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spec,
+          preset_name: scenario.name,
+        }),
+      });
+      if (!response.ok) throw new Error("Backtest failed.");
+      const payload = await response.json();
+      router.push(`/runs/${payload.id}`);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err));
+    } finally {
+      setRunLoading(false);
+    }
+  };
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+    <div className="space-y-8">
+      <section className="grid gap-4 md:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>SPY Data Status</CardTitle>
+            <CardDescription>Latest OHLCV snapshot stored in MSSQL.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="text-sm text-zinc-600">
+              Rows: {dataStatus?.count ?? "—"}
+            </div>
+            <div className="text-sm text-zinc-600">
+              Latest date: {dataStatus?.latest ?? "—"}
+            </div>
+            <Button onClick={refreshData} disabled={loading}>
+              Refresh SPY Data (6mo)
+            </Button>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Quick Backtest</CardTitle>
+            <CardDescription>Run a common preset in one click.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <label className="text-sm text-zinc-600">Preset</label>
+            <select
+              className="h-10 w-full rounded-md border border-zinc-200 bg-white px-3 text-sm"
+              value={preset}
+              onChange={(event) => setPreset(event.target.value)}
             >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+              {quickPresets.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+            <label className="text-sm text-zinc-600">Lookback (days)</label>
+            <Input
+              type="number"
+              min={20}
+              max={260}
+              step={1}
+              value={lookback}
+              onChange={(event) => setLookback(Number(event.target.value))}
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+            <Button onClick={runQuickBacktest} disabled={runLoading}>
+              Run Backtest
+            </Button>
+          </CardContent>
+        </Card>
+      </section>
+
+      {error && <div className="text-sm text-red-600">{error}</div>}
+
+      <ScenariosSection title="Scenarios" />
     </div>
   );
 }
