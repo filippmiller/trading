@@ -31,6 +31,7 @@ Template details:
 - sar_fade_flip: same as streak_fade plus flip_on_stop=true, flip_max_times
 - gap_fade: { enter_on: "open", direction: "fade", gap_threshold_pct, stop_loss_pct, take_profit_pct?, trailing_stop_pct?, hold_max_days }
 
+Percent fields must be decimals (e.g. 0.005 for 0.5%).
 If any values missing, use defaults: lookback_days=60, capital_base_usd=500, leverage=5, commission_per_side_usd=1, slippage_bps=2, margin_interest_apr=0.12, hold_max_days=1.
 Return JSON only.`;
 
@@ -66,6 +67,23 @@ Return JSON only.`;
     return NextResponse.json({ error: "Invalid JSON from model." }, { status: 500 });
   }
 
-  const spec = clampSpec(StrategySpecSchema.parse(parsed));
+  const normalizePct = (value: unknown) => {
+    if (typeof value !== "number") return value;
+    let v = value;
+    if (v > 1) v = v / 100;
+    if (v > 0.2) v = v / 100;
+    if (v > 0.2) v = 0.2;
+    return v;
+  };
+
+  const normalized = { ...(parsed as Record<string, unknown>) };
+  const pctFields = ["stop_loss_pct", "take_profit_pct", "trailing_stop_pct", "gap_threshold_pct"];
+  for (const field of pctFields) {
+    if (field in normalized) {
+      normalized[field] = normalizePct(normalized[field]);
+    }
+  }
+
+  const spec = clampSpec(StrategySpecSchema.parse(normalized));
   return NextResponse.json({ spec, provider: "openai" });
 }
