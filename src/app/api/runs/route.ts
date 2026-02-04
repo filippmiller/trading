@@ -11,9 +11,8 @@ export async function GET(req: Request) {
   const offset = page * limit;
 
   const pool = await getPool();
-  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT r.id, r.created_at, r.status, r.preset_name, m.total_pnl_usd, m.total_return_pct, m.trades_count FROM strategy_runs r LEFT JOIN run_metrics m ON r.id = m.run_id ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
-    [limit, offset]
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT r.id, r.created_at, r.status, r.preset_name, m.total_pnl_usd, m.total_return_pct, m.trades_count FROM strategy_runs r LEFT JOIN run_metrics m ON r.id = m.run_id ORDER BY r.created_at DESC LIMIT ${limit} OFFSET ${offset}`
   );
 
   return NextResponse.json({

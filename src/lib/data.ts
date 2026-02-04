@@ -83,8 +83,7 @@ export async function loadPrices(lookbackDays: number) {
   const pool = await getPool();
   const limit = Math.min(260, Math.max(1, Math.floor(lookbackDays)));
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    "SELECT date, open, high, low, close, volume FROM prices_daily WHERE symbol = 'SPY' ORDER BY date DESC LIMIT ?",
-    [limit]
+    `SELECT date, open, high, low, close, volume FROM prices_daily WHERE symbol = 'SPY' ORDER BY date DESC LIMIT ${limit}`
   );
   return rows
     .map((row) => ({
