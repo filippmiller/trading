@@ -94,3 +94,6 @@ Safety clamps:
 - Scheduled refresh (cron)
 - Multi-ticker support
 - Richer performance analytics (Sharpe, equity curve)
+## Prices UI
+- `/prices` page shows daily SPY open/close with dollar + percent change (green for up days, red for down days).
+- `GET /api/prices?limit=60` returns recent daily rows.
