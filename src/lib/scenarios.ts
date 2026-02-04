@@ -27,7 +27,11 @@ export type ScenarioDefinition = {
   fields: ScenarioField[];
   defaultValues: Record<string, number | boolean>;
   schema: z.ZodTypeAny;
-  buildSpec: (values: Record<string, number | boolean>, lookbackDays: number) => StrategySpec;
+  buildSpec: (
+    values: Record<string, number | boolean>,
+    lookbackDays: number,
+    symbol: string
+  ) => StrategySpec;
   riskWarning?: string;
 };
 
@@ -142,11 +146,11 @@ export const scenarios: ScenarioDefinition[] = [
       })
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
-    buildSpec(values, lookbackDays) {
+    buildSpec(values, lookbackDays, symbol) {
       const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_fade",
-        symbol: "SPY",
+        symbol,
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
@@ -179,11 +183,11 @@ export const scenarios: ScenarioDefinition[] = [
       })
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
-    buildSpec(values, lookbackDays) {
+    buildSpec(values, lookbackDays, symbol) {
       const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_fade",
-        symbol: "SPY",
+        symbol,
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
@@ -216,11 +220,11 @@ export const scenarios: ScenarioDefinition[] = [
       })
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
-    buildSpec(values, lookbackDays) {
+    buildSpec(values, lookbackDays, symbol) {
       const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_follow",
-        symbol: "SPY",
+        symbol,
         lookback_days: lookbackDays,
         direction: "follow",
         enter_on: "close",
@@ -252,11 +256,11 @@ export const scenarios: ScenarioDefinition[] = [
       })
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
-    buildSpec(values, lookbackDays) {
+    buildSpec(values, lookbackDays, symbol) {
       const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "gap_fade",
-        symbol: "SPY",
+        symbol,
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "open",
@@ -289,11 +293,11 @@ export const scenarios: ScenarioDefinition[] = [
       })
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
-    buildSpec(values, lookbackDays) {
+    buildSpec(values, lookbackDays, symbol) {
       const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "sar_fade_flip",
-        symbol: "SPY",
+        symbol,
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
@@ -328,11 +332,11 @@ export const scenarios: ScenarioDefinition[] = [
       })
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
-    buildSpec(values, lookbackDays) {
+    buildSpec(values, lookbackDays, symbol) {
       const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_fade",
-        symbol: "SPY",
+        symbol,
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
@@ -375,7 +379,7 @@ export const scenarios: ScenarioDefinition[] = [
       )
       .merge(baseCostsSchema),
     riskWarning: "High risk. Capped martingale only.",
-    buildSpec(values, lookbackDays) {
+    buildSpec(values, lookbackDays, symbol) {
       const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const martingale = MartingaleSchema.parse({
         base_capital_usd: Number(parsed.martingale_base_capital_usd),
@@ -387,7 +391,7 @@ export const scenarios: ScenarioDefinition[] = [
       });
       const spec: StrategySpec = {
         template: "streak_fade",
-        symbol: "SPY",
+        symbol,
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
@@ -422,11 +426,11 @@ export const scenarios: ScenarioDefinition[] = [
       })
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
-    buildSpec(values, lookbackDays) {
+    buildSpec(values, lookbackDays, symbol) {
       const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_fade",
-        symbol: "SPY",
+        symbol,
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",

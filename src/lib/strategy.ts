@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { normalizeSymbol, SYMBOL_REGEX } from "@/lib/symbols";
+
 export const CostsSchema = z.object({
   commission_per_side_usd: z.number().min(0).max(50),
   slippage_bps: z.number().min(0).max(50),
@@ -23,8 +25,13 @@ export const RegimeFilterSchema = z.object({
   ),
 });
 
+const SymbolSchema = z
+  .string()
+  .transform((value) => value.trim().toUpperCase())
+  .refine((value) => SYMBOL_REGEX.test(value), "Invalid symbol");
+
 const BaseSpecSchema = z.object({
-  symbol: z.literal("SPY"),
+  symbol: SymbolSchema,
   lookback_days: z.number().int().min(20).max(260),
   capital_base_usd: z.number().min(50).max(100000),
   leverage: z.number().min(1).max(10),
@@ -79,6 +86,7 @@ export type StrategySpec = z.infer<typeof StrategySpecSchema>;
 
 export function clampSpec(input: StrategySpec): StrategySpec {
   const spec = { ...input } as StrategySpec;
+  spec.symbol = normalizeSymbol(spec.symbol);
   spec.leverage = Math.min(10, Math.max(1, spec.leverage));
   if (spec.martingale_lite) {
     spec.martingale_lite.leverage = Math.min(

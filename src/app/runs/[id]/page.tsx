@@ -12,6 +12,7 @@ type RunDetails = {
     created_at: string;
     status: string;
     preset_name: string | null;
+    symbol: string;
     spec_json: string;
     lookback_days: number;
   };
@@ -77,10 +78,14 @@ export default function RunDetailPage() {
         <CardHeader>
           <CardTitle>Run Summary</CardTitle>
         </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-3">
+        <CardContent className="grid gap-3 md:grid-cols-4">
           <div>
             <div className="text-xs uppercase text-zinc-500">Preset</div>
             <div className="text-sm font-medium">{details.run.preset_name ?? "—"}</div>
+          </div>
+          <div>
+            <div className="text-xs uppercase text-zinc-500">Ticker</div>
+            <div className="text-sm font-medium">{details.run.symbol ?? "—"}</div>
           </div>
           <div>
             <div className="text-xs uppercase text-zinc-500">Total PnL</div>

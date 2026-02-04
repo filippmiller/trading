@@ -23,7 +23,7 @@ export async function POST(req: Request) {
     const voiceText = body.voice_text ? String(body.voice_text) : null;
     const llmProvider = body.llm_provider ? String(body.llm_provider) : null;
 
-    const prices = await loadPrices(spec.lookback_days);
+    const prices = await loadPrices(spec.lookback_days, spec.symbol);
     if (prices.length < 20) {
       return NextResponse.json({ error: "Not enough price data." }, { status: 400 });
     }

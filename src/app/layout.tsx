@@ -16,7 +16,7 @@ const mono = IBM_Plex_Mono({
 
 export const metadata: Metadata = {
   title: "Voice Strategy Simulator",
-  description: "Voice-driven strategy backtesting for SPY.",
+  description: "Voice-driven strategy backtesting for custom tickers.",
 };
 
 const navLinks = [

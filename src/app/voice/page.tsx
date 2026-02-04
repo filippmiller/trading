@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
@@ -8,15 +8,47 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 
+const SYMBOL_STORAGE_KEY = "symbols:last";
+
 export default function VoicePage() {
   const router = useRouter();
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [voiceText, setVoiceText] = useState("");
   const [specJson, setSpecJson] = useState<Record<string, unknown> | null>(null);
+  const [symbols, setSymbols] = useState<string[]>([]);
+  const [symbol, setSymbol] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const getErrorMessage = (err: unknown) =>
     err instanceof Error ? err.message : "Unexpected error.";
+
+  useEffect(() => {
+    const loadSymbols = async () => {
+      try {
+        const response = await fetch("/api/symbols");
+        const payload = await response.json();
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        setSymbols(items);
+        if (typeof window === "undefined") return;
+        const saved = window.localStorage.getItem(SYMBOL_STORAGE_KEY);
+        if (saved && items.includes(saved)) {
+          setSymbol(saved);
+        } else if (items.length) {
+          setSymbol(items[0]);
+        }
+      } catch {
+        setSymbols([]);
+      }
+    };
+    loadSymbols();
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (symbol) {
+      window.localStorage.setItem(SYMBOL_STORAGE_KEY, symbol);
+    }
+  }, [symbol]);
 
   const handleTranscribe = async () => {
     if (!audioFile) {
@@ -76,11 +108,12 @@ export default function VoicePage() {
     setError(null);
     setBusy(true);
     try {
+      const spec = symbol ? { ...specJson, symbol } : specJson;
       const response = await fetch("/api/backtest/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          spec: specJson,
+          spec,
           voice_text: voiceText,
           llm_provider: "openai",
         }),
@@ -106,6 +139,31 @@ export default function VoicePage() {
           <CardDescription>Upload audio or paste text to generate StrategySpec.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <label className="text-sm text-zinc-600">Ticker</label>
+            <select
+              className="h-10 w-full rounded-md border border-zinc-200 bg-white px-3 text-sm"
+              value={symbol}
+              onChange={(event) => setSymbol(event.target.value)}
+              disabled={!symbols.length}
+            >
+              {!symbols.length && <option value="">No tickers</option>}
+              {symbols.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+            <div className="text-xs text-zinc-500">
+              Selected ticker overrides the parsed StrategySpec on run.
+            </div>
+            {!symbols.length && (
+              <div className="text-xs text-zinc-500">
+                No tickers downloaded yet. Add one on the Dashboard first.
+              </div>
+            )}
+          </div>
+
           <div className="space-y-2">
             <label className="text-sm text-zinc-600">Audio file (m4a/wav/mp3)</label>
             <Input

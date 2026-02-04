@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const STORAGE_KEY = "scenarios:last";
+const SYMBOL_STORAGE_KEY = "symbols:last";
 
 type ValuesMap = Record<string, Record<string, number | boolean>>;
 
@@ -24,12 +25,30 @@ function buildInitialValues(): ValuesMap {
 const getErrorMessage = (err: unknown) =>
   err instanceof Error ? err.message : "Failed to run backtest.";
 
-export function ScenariosSection({ title = "Scenarios" }: { title?: string }) {
+type ScenariosSectionProps = {
+  title?: string;
+  symbolOverride?: string;
+  symbolsOverride?: string[];
+  onSymbolChange?: (symbol: string) => void;
+};
+
+export function ScenariosSection({
+  title = "Scenarios",
+  symbolOverride,
+  symbolsOverride,
+  onSymbolChange,
+}: ScenariosSectionProps) {
   const router = useRouter();
   const [active, setActive] = useState(scenarios[0]?.id ?? "");
   const [valuesMap, setValuesMap] = useState<ValuesMap>(buildInitialValues);
+  const [symbols, setSymbols] = useState<string[]>(symbolsOverride ?? []);
+  const [symbol, setSymbol] = useState(symbolOverride ?? "");
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState<string | null>(null);
+  const effectiveSymbols = symbolsOverride ?? symbols;
+  const effectiveSymbol = symbolOverride ?? symbol;
+  const isSymbolControlled = symbolOverride !== undefined;
+  const isSymbolsControlled = symbolsOverride !== undefined;
 
   useEffect(() => {
     const stored = typeof window !== "undefined" ? window.localStorage.getItem(STORAGE_KEY) : null;
@@ -45,16 +64,50 @@ export function ScenariosSection({ title = "Scenarios" }: { title?: string }) {
     }
   }, [active]);
 
+  useEffect(() => {
+    if (isSymbolsControlled) {
+      setSymbols(symbolsOverride ?? []);
+      return;
+    }
+    const loadSymbols = async () => {
+      try {
+        const response = await fetch("/api/symbols");
+        const payload = await response.json();
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        setSymbols(items);
+        if (typeof window === "undefined") return;
+        const saved = window.localStorage.getItem(SYMBOL_STORAGE_KEY);
+        if (saved && items.includes(saved)) {
+          setSymbol(saved);
+        } else if (items.length) {
+          setSymbol(items[0]);
+        }
+      } catch {
+        setSymbols([]);
+      }
+    };
+    loadSymbols();
+  }, [isSymbolsControlled, symbolsOverride]);
+
+  useEffect(() => {
+    if (isSymbolControlled) return;
+    if (typeof window === "undefined") return;
+    if (symbol) {
+      window.localStorage.setItem(SYMBOL_STORAGE_KEY, symbol);
+    }
+  }, [symbol, isSymbolControlled]);
+
   const activeScenario = scenarios.find((item) => item.id === active) ?? scenarios[0];
   const activeValues = valuesMap[activeScenario.id];
 
   const specPreview = useMemo(() => {
     try {
-      return activeScenario.buildSpec(activeValues, 60);
+      if (!effectiveSymbol) return null;
+      return activeScenario.buildSpec(activeValues, 60, effectiveSymbol);
     } catch {
       return null;
     }
-  }, [activeScenario, activeValues]);
+  }, [activeScenario, activeValues, effectiveSymbol]);
 
   const updateValue = (scenarioId: string, key: string, value: number | boolean) => {
     setValuesMap((prev) => ({
@@ -68,10 +121,14 @@ export function ScenariosSection({ title = "Scenarios" }: { title?: string }) {
 
   const runNow = async (lookbackDays: number) => {
     if (!activeScenario) return;
+    if (!effectiveSymbol) {
+      setError("Select a ticker with downloaded data.");
+      return;
+    }
     setError(null);
     setRunning(`${activeScenario.id}-${lookbackDays}`);
     try {
-      const spec = activeScenario.buildSpec(valuesMap[activeScenario.id], lookbackDays);
+      const spec = activeScenario.buildSpec(valuesMap[activeScenario.id], lookbackDays, effectiveSymbol);
       const response = await fetch("/api/backtest/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -105,7 +162,31 @@ export function ScenariosSection({ title = "Scenarios" }: { title?: string }) {
           <h2 className="text-xl font-semibold">{title}</h2>
           <p className="text-sm text-zinc-500">Curated, editable presets with quick runs.</p>
         </div>
+        <div className="flex items-center gap-2 text-sm">
+          <span className="text-zinc-500">Ticker</span>
+          <select
+            className="h-9 rounded-md border border-zinc-200 bg-white px-2 text-sm"
+            value={effectiveSymbol}
+            onChange={(event) =>
+              isSymbolControlled ? onSymbolChange?.(event.target.value) : setSymbol(event.target.value)
+            }
+            disabled={!effectiveSymbols.length || (isSymbolControlled && !onSymbolChange)}
+          >
+            {!effectiveSymbols.length && <option value="">No tickers</option>}
+            {effectiveSymbols.map((item) => (
+              <option key={item} value={item}>
+                {item}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
+
+      {effectiveSymbols.length === 0 && (
+        <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600">
+          No tickers downloaded yet. Add one on the Dashboard to run scenarios.
+        </div>
+      )}
 
       <Tabs value={active} onValueChange={setActive}>
         <TabsList className="flex flex-wrap gap-2 bg-transparent p-0">
@@ -167,21 +248,21 @@ export function ScenariosSection({ title = "Scenarios" }: { title?: string }) {
                   <div className="flex flex-wrap gap-2">
                     <Button
                       onClick={() => runNow(30)}
-                      disabled={running !== null}
+                      disabled={running !== null || !effectiveSymbol}
                     >
                       Run now (30d)
                     </Button>
                     <Button
                       onClick={() => runNow(60)}
                       variant="secondary"
-                      disabled={running !== null}
+                      disabled={running !== null || !effectiveSymbol}
                     >
                       Run now (60d)
                     </Button>
                     <Button
                       onClick={() => runNow(180)}
                       variant="outline"
-                      disabled={running !== null}
+                      disabled={running !== null || !effectiveSymbol}
                     >
                       Run now (6mo)
                     </Button>

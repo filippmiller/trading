@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 
 const formatNumber = (value: number, digits = 2) => value.toFixed(digits);
+const SYMBOL_STORAGE_KEY = "symbols:last";
 
 type PriceRow = {
   date: string;
@@ -24,20 +25,58 @@ type EnrichedRow = PriceRow & {
 export default function PricesPage() {
   const [rows, setRows] = useState<PriceRow[]>([]);
   const [limit, setLimit] = useState(60);
+  const [symbols, setSymbols] = useState<string[]>([]);
+  const [symbol, setSymbol] = useState("");
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<EnrichedRow | null>(null);
 
-  const fetchPrices = async () => {
+  const fetchPrices = async (symbolToLoad: string) => {
+    if (!symbolToLoad) {
+      setRows([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
-    const response = await fetch(`/api/prices?limit=${limit}`);
-    const payload = await response.json();
-    setRows(payload.items || []);
-    setLoading(false);
+    try {
+      const response = await fetch(
+        `/api/prices?symbol=${encodeURIComponent(symbolToLoad)}&limit=${limit}`
+      );
+      const payload = await response.json();
+      setRows(payload.items || []);
+    } finally {
+      setLoading(false);
+    }
   };
 
   useEffect(() => {
-    fetchPrices();
+    const loadSymbols = async () => {
+      try {
+        const response = await fetch("/api/symbols");
+        const payload = await response.json();
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        setSymbols(items);
+        if (typeof window === "undefined") return;
+        const saved = window.localStorage.getItem(SYMBOL_STORAGE_KEY);
+        if (saved && items.includes(saved)) {
+          setSymbol(saved);
+        } else if (items.length) {
+          setSymbol(items[0]);
+        }
+      } catch {
+        setSymbols([]);
+      }
+    };
+    loadSymbols();
   }, []);
+
+  useEffect(() => {
+    if (!symbol) return;
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(SYMBOL_STORAGE_KEY, symbol);
+    }
+    setSelected(null);
+    fetchPrices(symbol);
+  }, [symbol]);
 
   const enriched = useMemo<EnrichedRow[]>(() => {
     return rows.map((row) => {
@@ -71,12 +110,25 @@ export default function PricesPage() {
     <Card>
       <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div>
-          <CardTitle>Daily SPY Prices</CardTitle>
+          <CardTitle>Daily {symbol || "—"} Prices</CardTitle>
           <div className="text-sm text-zinc-500">
             Click a day to view its trading diagram.
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <select
+            className="h-10 rounded-md border border-zinc-200 bg-white px-2 text-sm"
+            value={symbol}
+            onChange={(event) => setSymbol(event.target.value)}
+            disabled={!symbols.length}
+          >
+            {!symbols.length && <option value="">No tickers</option>}
+            {symbols.map((item) => (
+              <option key={item} value={item}>
+                {item}
+              </option>
+            ))}
+          </select>
           <Input
             type="number"
             min={1}
@@ -85,12 +137,17 @@ export default function PricesPage() {
             onChange={(event) => setLimit(Number(event.target.value))}
             className="w-24"
           />
-          <Button onClick={fetchPrices} disabled={loading}>
+          <Button onClick={() => fetchPrices(symbol)} disabled={loading || !symbol}>
             Refresh
           </Button>
         </div>
       </CardHeader>
       <CardContent>
+        {symbols.length === 0 && (
+          <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600">
+            No tickers downloaded yet. Add one on the Dashboard first.
+          </div>
+        )}
         <div className="overflow-auto">
           <table className="w-full text-sm">
             <thead>

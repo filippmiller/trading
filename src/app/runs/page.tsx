@@ -11,6 +11,7 @@ type RunRow = {
   created_at: string;
   status: string;
   preset_name: string | null;
+  symbol: string;
   total_pnl_usd: number | null;
   total_return_pct: number | null;
   trades_count: number | null;
@@ -41,6 +42,7 @@ export default function RunsPage() {
               <tr className="border-b text-left text-zinc-500">
                 <th className="py-2">Date</th>
                 <th>Preset</th>
+                <th>Ticker</th>
                 <th>Status</th>
                 <th>PnL</th>
                 <th>Return</th>
@@ -53,6 +55,7 @@ export default function RunsPage() {
                 <tr key={run.id} className="border-b last:border-0">
                   <td className="py-2">{new Date(run.created_at).toISOString().slice(0, 10)}</td>
                   <td>{run.preset_name ?? "—"}</td>
+                  <td>{run.symbol ?? "—"}</td>
                   <td>
                     <Badge>{run.status}</Badge>
                   </td>

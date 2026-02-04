@@ -18,7 +18,7 @@ export async function POST(req: Request) {
 
 StrategySpec shape:
 - template: streak_fade | streak_follow | sar_fade_flip | gap_fade
-- symbol: "SPY"
+- symbol: ticker string (uppercase, max 16 chars)
 - lookback_days: int 20..260
 - capital_base_usd: number
 - leverage: number
@@ -32,7 +32,7 @@ Template details:
 - gap_fade: { enter_on: "open", direction: "fade", gap_threshold_pct, stop_loss_pct, take_profit_pct?, trailing_stop_pct?, hold_max_days }
 
 Percent fields must be decimals (e.g. 0.005 for 0.5%).
-If any values missing, use defaults: lookback_days=60, capital_base_usd=500, leverage=5, commission_per_side_usd=1, slippage_bps=2, margin_interest_apr=0.12, hold_max_days=1.
+If any values missing, use defaults: symbol="SPY", lookback_days=60, capital_base_usd=500, leverage=5, commission_per_side_usd=1, slippage_bps=2, margin_interest_apr=0.12, hold_max_days=1.
 Return JSON only.`;
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {

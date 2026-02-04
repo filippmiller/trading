@@ -1,5 +1,6 @@
 import { ensureDefaultSettings, ensureSchema } from "@/lib/migrations";
 import { getPool, mysql } from "@/lib/db";
+import { normalizeSymbol, toStooqSymbol } from "@/lib/symbols";
 
 export type PriceRow = {
   date: string;
@@ -30,60 +31,71 @@ function parseCsv(csv: string): PriceRow[] {
   return rows;
 }
 
-export async function fetchSpyDailyBars() {
-  const response = await fetch("https://stooq.com/q/d/l/?s=spy.us&i=d", {
-    cache: "no-store",
-  });
+export async function fetchDailyBars(symbol: string) {
+  const normalized = normalizeSymbol(symbol);
+  const stooqSymbol = toStooqSymbol(normalized);
+  const response = await fetch(
+    `https://stooq.com/q/d/l/?s=${encodeURIComponent(stooqSymbol)}&i=d`,
+    {
+      cache: "no-store",
+    }
+  );
   if (!response.ok) {
-    throw new Error("Failed to fetch SPY data from Stooq.");
+    throw new Error(`Failed to fetch ${normalized} data from Stooq.`);
   }
   const csv = await response.text();
   const rows = parseCsv(csv);
-  const cutoff = new Date();
-  cutoff.setMonth(cutoff.getMonth() - 6);
-  const cutoffStr = cutoff.toISOString().slice(0, 10);
-  return rows.filter((row) => row.date >= cutoffStr);
+  if (!rows.length) {
+    throw new Error(`No data returned for ${normalized}.`);
+  }
+  return rows;
 }
 
-export async function refreshSpyData() {
+export async function refreshSymbolData(symbol: string) {
   await ensureSchema();
   await ensureDefaultSettings();
+  const normalized = normalizeSymbol(symbol);
   const pool = await getPool();
-  const rows = await fetchSpyDailyBars();
+  const rows = await fetchDailyBars(normalized);
   let inserted = 0;
 
   for (const row of rows) {
     const [result] = await pool.execute<mysql.ResultSetHeader>(
       "INSERT INTO prices_daily (symbol, date, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE open = VALUES(open), high = VALUES(high), low = VALUES(low), close = VALUES(close), volume = VALUES(volume)",
-      ["SPY", row.date, row.open, row.high, row.low, row.close, row.volume]
+      [normalized, row.date, row.open, row.high, row.low, row.close, row.volume]
     );
     if (result.affectedRows === 1) inserted += 1;
   }
 
-  return { inserted, total: rows.length };
+  return { inserted, total: rows.length, symbol: normalized };
 }
 
-export async function getDataStatus() {
+export async function getDataStatus(symbol: string) {
   await ensureSchema();
   await ensureDefaultSettings();
+  const normalized = normalizeSymbol(symbol);
   const pool = await getPool();
   const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT COUNT(*) as count, MAX(date) as latest FROM prices_daily WHERE symbol = 'SPY'"
+    "SELECT COUNT(*) as count, MAX(date) as latest FROM prices_daily WHERE symbol = ?",
+    [normalized]
   );
   const row = rows[0];
   return {
+    symbol: normalized,
     count: Number(row?.count ?? 0),
     latest: row?.latest ? new Date(row.latest).toISOString().slice(0, 10) : null,
   };
 }
 
-export async function loadPrices(lookbackDays: number) {
+export async function loadPrices(lookbackDays: number, symbol: string) {
   await ensureSchema();
   await ensureDefaultSettings();
+  const normalized = normalizeSymbol(symbol);
   const pool = await getPool();
   const limit = Math.min(260, Math.max(1, Math.floor(lookbackDays)));
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT date, open, high, low, close, volume FROM prices_daily WHERE symbol = 'SPY' ORDER BY date DESC LIMIT ${limit}`
+    `SELECT date, open, high, low, close, volume FROM prices_daily WHERE symbol = ? ORDER BY date DESC LIMIT ${limit}`,
+    [normalized]
   );
   return rows
     .map((row) => ({
@@ -95,6 +107,15 @@ export async function loadPrices(lookbackDays: number) {
       volume: Number(row.volume),
     }))
     .reverse();
+}
+
+export async function getAvailableSymbols() {
+  await ensureSchema();
+  const pool = await getPool();
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    "SELECT DISTINCT symbol FROM prices_daily ORDER BY symbol ASC"
+  );
+  return rows.map((row) => String(row.symbol));
 }
 
 export async function getDefaultSettings() {
