@@ -76,7 +76,16 @@ Return JSON only.`;
     return v;
   };
 
-  const normalized = { ...(parsed as Record<string, unknown>) };
+  const rawSpec =
+    parsed && typeof parsed === "object" && "spec" in (parsed as Record<string, unknown>)
+      ? (parsed as Record<string, unknown>).spec
+      : parsed;
+
+  if (!rawSpec || typeof rawSpec !== "object") {
+    return NextResponse.json({ error: "Model returned invalid spec." }, { status: 500 });
+  }
+
+  const normalized = { ...(rawSpec as Record<string, unknown>) };
   const pctFields = ["stop_loss_pct", "take_profit_pct", "trailing_stop_pct", "gap_threshold_pct"];
   for (const field of pctFields) {
     if (field in normalized) {
