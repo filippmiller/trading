@@ -143,20 +143,20 @@ export const scenarios: ScenarioDefinition[] = [
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
     buildSpec(values, lookbackDays) {
-      const parsed = this.schema.parse(values);
+      const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_fade",
         symbol: "SPY",
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
-        streak_length: parsed.streak_length,
-        stop_loss_pct: parsed.stop_loss_pct,
-        take_profit_pct: optionalPct(parsed.take_profit_pct),
-        trailing_stop_pct: optionalPct(parsed.trailing_stop_pct),
-        hold_max_days: parsed.hold_max_days,
-        leverage: parsed.leverage,
-        capital_base_usd: parsed.capital_base_usd,
+        streak_length: Number(parsed.streak_length),
+        stop_loss_pct: Number(parsed.stop_loss_pct),
+        take_profit_pct: optionalPct(Number(parsed.take_profit_pct)),
+        trailing_stop_pct: optionalPct(Number(parsed.trailing_stop_pct)),
+        hold_max_days: Number(parsed.hold_max_days),
+        leverage: Number(parsed.leverage),
+        capital_base_usd: Number(parsed.capital_base_usd),
         costs: buildCosts(values),
       };
       return clampSpec(StrategySpecSchema.parse(spec));
@@ -180,20 +180,20 @@ export const scenarios: ScenarioDefinition[] = [
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
     buildSpec(values, lookbackDays) {
-      const parsed = this.schema.parse(values);
+      const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_fade",
         symbol: "SPY",
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
-        streak_length: parsed.streak_length,
-        stop_loss_pct: parsed.stop_loss_pct,
-        take_profit_pct: optionalPct(parsed.take_profit_pct),
-        trailing_stop_pct: optionalPct(parsed.trailing_stop_pct),
-        hold_max_days: parsed.hold_max_days,
-        leverage: parsed.leverage,
-        capital_base_usd: parsed.capital_base_usd,
+        streak_length: Number(parsed.streak_length),
+        stop_loss_pct: Number(parsed.stop_loss_pct),
+        take_profit_pct: optionalPct(Number(parsed.take_profit_pct)),
+        trailing_stop_pct: optionalPct(Number(parsed.trailing_stop_pct)),
+        hold_max_days: Number(parsed.hold_max_days),
+        leverage: Number(parsed.leverage),
+        capital_base_usd: Number(parsed.capital_base_usd),
         costs: buildCosts(values),
       };
       return clampSpec(StrategySpecSchema.parse(spec));
@@ -217,20 +217,20 @@ export const scenarios: ScenarioDefinition[] = [
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
     buildSpec(values, lookbackDays) {
-      const parsed = this.schema.parse(values);
+      const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_follow",
         symbol: "SPY",
         lookback_days: lookbackDays,
         direction: "follow",
         enter_on: "close",
-        streak_length: parsed.streak_length,
-        stop_loss_pct: parsed.stop_loss_pct,
-        take_profit_pct: optionalPct(parsed.take_profit_pct),
-        trailing_stop_pct: optionalPct(parsed.trailing_stop_pct),
-        hold_max_days: parsed.hold_max_days,
-        leverage: parsed.leverage,
-        capital_base_usd: parsed.capital_base_usd,
+        streak_length: Number(parsed.streak_length),
+        stop_loss_pct: Number(parsed.stop_loss_pct),
+        take_profit_pct: optionalPct(Number(parsed.take_profit_pct)),
+        trailing_stop_pct: optionalPct(Number(parsed.trailing_stop_pct)),
+        hold_max_days: Number(parsed.hold_max_days),
+        leverage: Number(parsed.leverage),
+        capital_base_usd: Number(parsed.capital_base_usd),
         costs: buildCosts(values),
       };
       return clampSpec(StrategySpecSchema.parse(spec));
@@ -253,20 +253,20 @@ export const scenarios: ScenarioDefinition[] = [
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
     buildSpec(values, lookbackDays) {
-      const parsed = this.schema.parse(values);
+      const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "gap_fade",
         symbol: "SPY",
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "open",
-        gap_threshold_pct: parsed.gap_threshold_pct,
-        stop_loss_pct: parsed.stop_loss_pct,
-        take_profit_pct: optionalPct(parsed.take_profit_pct),
-        trailing_stop_pct: optionalPct(parsed.trailing_stop_pct),
+        gap_threshold_pct: Number(parsed.gap_threshold_pct),
+        stop_loss_pct: Number(parsed.stop_loss_pct),
+        take_profit_pct: optionalPct(Number(parsed.take_profit_pct)),
+        trailing_stop_pct: optionalPct(Number(parsed.trailing_stop_pct)),
         hold_max_days: 0,
-        leverage: parsed.leverage,
-        capital_base_usd: parsed.capital_base_usd,
+        leverage: Number(parsed.leverage),
+        capital_base_usd: Number(parsed.capital_base_usd),
         costs: buildCosts(values),
       };
       return clampSpec(StrategySpecSchema.parse(spec));
@@ -290,22 +290,22 @@ export const scenarios: ScenarioDefinition[] = [
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
     buildSpec(values, lookbackDays) {
-      const parsed = this.schema.parse(values);
+      const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "sar_fade_flip",
         symbol: "SPY",
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
-        streak_length: parsed.streak_length,
-        stop_loss_pct: parsed.stop_loss_pct,
-        take_profit_pct: optionalPct(parsed.take_profit_pct),
-        trailing_stop_pct: optionalPct(parsed.trailing_stop_pct),
-        hold_max_days: parsed.hold_max_days,
+        streak_length: Number(parsed.streak_length),
+        stop_loss_pct: Number(parsed.stop_loss_pct),
+        take_profit_pct: optionalPct(Number(parsed.take_profit_pct)),
+        trailing_stop_pct: optionalPct(Number(parsed.trailing_stop_pct)),
+        hold_max_days: Number(parsed.hold_max_days),
         flip_on_stop: true,
         flip_max_times: 1,
-        leverage: parsed.leverage,
-        capital_base_usd: parsed.capital_base_usd,
+        leverage: Number(parsed.leverage),
+        capital_base_usd: Number(parsed.capital_base_usd),
         costs: buildCosts(values),
       };
       return clampSpec(StrategySpecSchema.parse(spec));
@@ -329,20 +329,20 @@ export const scenarios: ScenarioDefinition[] = [
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
     buildSpec(values, lookbackDays) {
-      const parsed = this.schema.parse(values);
+      const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_fade",
         symbol: "SPY",
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
-        streak_length: parsed.streak_length,
-        stop_loss_pct: parsed.stop_loss_pct,
-        take_profit_pct: optionalPct(parsed.take_profit_pct),
-        trailing_stop_pct: optionalPct(parsed.trailing_stop_pct),
-        hold_max_days: parsed.hold_max_days,
-        leverage: parsed.leverage,
-        capital_base_usd: parsed.capital_base_usd,
+        streak_length: Number(parsed.streak_length),
+        stop_loss_pct: Number(parsed.stop_loss_pct),
+        take_profit_pct: optionalPct(Number(parsed.take_profit_pct)),
+        trailing_stop_pct: optionalPct(Number(parsed.trailing_stop_pct)),
+        hold_max_days: Number(parsed.hold_max_days),
+        leverage: Number(parsed.leverage),
+        capital_base_usd: Number(parsed.capital_base_usd),
         costs: buildCosts(values),
       };
       return clampSpec(StrategySpecSchema.parse(spec));
@@ -376,14 +376,14 @@ export const scenarios: ScenarioDefinition[] = [
       .merge(baseCostsSchema),
     riskWarning: "High risk. Capped martingale only.",
     buildSpec(values, lookbackDays) {
-      const parsed = this.schema.parse(values);
+      const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const martingale = MartingaleSchema.parse({
-        base_capital_usd: parsed.martingale_base_capital_usd,
-        leverage: parsed.martingale_leverage,
-        max_steps: parsed.martingale_max_steps,
-        step_multiplier: parsed.martingale_step_multiplier,
-        max_exposure_usd: parsed.martingale_max_exposure_usd,
-        max_daily_loss_usd: parsed.martingale_max_daily_loss_usd,
+        base_capital_usd: Number(parsed.martingale_base_capital_usd),
+        leverage: Number(parsed.martingale_leverage),
+        max_steps: Number(parsed.martingale_max_steps),
+        step_multiplier: Number(parsed.martingale_step_multiplier),
+        max_exposure_usd: Number(parsed.martingale_max_exposure_usd),
+        max_daily_loss_usd: Number(parsed.martingale_max_daily_loss_usd),
       });
       const spec: StrategySpec = {
         template: "streak_fade",
@@ -391,11 +391,11 @@ export const scenarios: ScenarioDefinition[] = [
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
-        streak_length: parsed.streak_length,
-        stop_loss_pct: parsed.stop_loss_pct,
-        take_profit_pct: optionalPct(parsed.take_profit_pct),
-        trailing_stop_pct: optionalPct(parsed.trailing_stop_pct),
-        hold_max_days: parsed.hold_max_days,
+        streak_length: Number(parsed.streak_length),
+        stop_loss_pct: Number(parsed.stop_loss_pct),
+        take_profit_pct: optionalPct(Number(parsed.take_profit_pct)),
+        trailing_stop_pct: optionalPct(Number(parsed.trailing_stop_pct)),
+        hold_max_days: Number(parsed.hold_max_days),
         leverage: martingale.leverage,
         capital_base_usd: martingale.base_capital_usd,
         martingale_lite: martingale,
@@ -423,22 +423,25 @@ export const scenarios: ScenarioDefinition[] = [
       .merge(baseSizingSchema)
       .merge(baseCostsSchema),
     buildSpec(values, lookbackDays) {
-      const parsed = this.schema.parse(values);
+      const parsed = this.schema.parse(values) as Record<string, number | boolean>;
       const spec: StrategySpec = {
         template: "streak_fade",
         symbol: "SPY",
         lookback_days: lookbackDays,
         direction: "fade",
         enter_on: "close",
-        streak_length: parsed.streak_length,
-        stop_loss_pct: parsed.stop_loss_pct,
-        take_profit_pct: optionalPct(parsed.take_profit_pct),
-        trailing_stop_pct: optionalPct(parsed.trailing_stop_pct),
-        hold_max_days: parsed.hold_max_days,
-        leverage: parsed.leverage,
-        capital_base_usd: parsed.capital_base_usd,
+        streak_length: Number(parsed.streak_length),
+        stop_loss_pct: Number(parsed.stop_loss_pct),
+        take_profit_pct: optionalPct(Number(parsed.take_profit_pct)),
+        trailing_stop_pct: optionalPct(Number(parsed.trailing_stop_pct)),
+        hold_max_days: Number(parsed.hold_max_days),
+        leverage: Number(parsed.leverage),
+        capital_base_usd: Number(parsed.capital_base_usd),
         costs: buildCosts(values),
-        regime_filter: buildRegime(values),
+        regime_filter: buildRegime({
+          ...values,
+          use_regime_filter: Boolean(parsed.use_regime_filter),
+        }),
       };
       return clampSpec(StrategySpecSchema.parse(spec));
     },

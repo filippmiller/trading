@@ -29,6 +29,15 @@ function toCsv(rows: Array<Record<string, unknown>>) {
   return lines.join("\n");
 }
 
+const formatNumber = (value: unknown, digits = 2) => {
+  if (typeof value === "number") return value.toFixed(digits);
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (!Number.isNaN(parsed)) return parsed.toFixed(digits);
+  }
+  return "—";
+};
+
 export default function RunDetailPage() {
   const params = useParams();
   const runId = String(params.id);
@@ -75,20 +84,22 @@ export default function RunDetailPage() {
           </div>
           <div>
             <div className="text-xs uppercase text-zinc-500">Total PnL</div>
-            <div className="text-sm font-medium">{metrics.total_pnl_usd?.toFixed?.(2) ?? "—"}</div>
+            <div className="text-sm font-medium">{formatNumber(metrics.total_pnl_usd, 2)}</div>
           </div>
           <div>
             <div className="text-xs uppercase text-zinc-500">Return</div>
             <div className="text-sm font-medium">
               {metrics.total_return_pct !== undefined
-                ? `${(metrics.total_return_pct * 100).toFixed(2)}%`
+                ? `${formatNumber(Number(metrics.total_return_pct) * 100, 2)}%`
                 : "—"}
             </div>
           </div>
           <div>
             <div className="text-xs uppercase text-zinc-500">Win rate</div>
             <div className="text-sm font-medium">
-              {metrics.win_rate !== undefined ? `${(metrics.win_rate * 100).toFixed(1)}%` : "—"}
+              {metrics.win_rate !== undefined
+                ? `${formatNumber(Number(metrics.win_rate) * 100, 1)}%`
+                : "—"}
             </div>
           </div>
           <div>
@@ -99,7 +110,7 @@ export default function RunDetailPage() {
             <div className="text-xs uppercase text-zinc-500">Max drawdown</div>
             <div className="text-sm font-medium">
               {metrics.max_drawdown_pct !== undefined
-                ? `${(metrics.max_drawdown_pct * 100).toFixed(2)}%`
+                ? `${formatNumber(Number(metrics.max_drawdown_pct) * 100, 2)}%`
                 : "—"}
             </div>
           </div>

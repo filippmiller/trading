@@ -1,15 +1,15 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 import { ensureSchema } from "@/lib/migrations";
 import { getPool, sql } from "@/lib/db";
 
 export async function GET(
-  _req: Request,
-  { params }: { params: { id: string } }
+  _req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
 ) {
   await ensureSchema();
   const pool = await getPool();
-  const runId = params.id;
+  const { id: runId } = await params;
 
   const runResult = await pool
     .request()
