@@ -1,17 +1,17 @@
 # Voice-Driven Strategy Simulator (2026-02-04)
 
 ## Summary
-MVP Next.js (App Router) app for SPY daily backtesting with MSSQL, voice/text-to-StrategySpec parsing, and a scenarios tab library. Data refresh pulls 6 months of daily bars from Stooq server-side.
+MVP Next.js (App Router) app for SPY daily backtesting with MySQL, voice/text-to-StrategySpec parsing, and a scenarios tab library. Data refresh pulls 6 months of daily bars from Stooq server-side.
 
 ## Architecture
 - Web: Next.js App Router + TypeScript
 - UI: Tailwind + shadcn/ui-style components
 - API: Next.js route handlers
-- DB: MSSQL (Railway)
+- DB: MySQL (Railway)
 - LLM: OpenAI (transcribe + parse)
 
 Key modules:
-- `src/lib/db.ts` MSSQL connection
+- `src/lib/db.ts` MySQL connection
 - `src/lib/migrations.ts` idempotent schema + defaults
 - `src/lib/strategy.ts` Zod StrategySpec schema + clamps
 - `src/lib/backtest.ts` backtest engine
@@ -56,9 +56,9 @@ Safety clamps:
 
 ## Deploy on Railway
 1. Create a Railway project with one Next.js service.
-2. Add an MSSQL database in Railway.
+2. Add an MySQL database in Railway.
 3. Set Railway Variables:
-   - `DATABASE_URL` (or `MSSQL_HOST`, `MSSQL_USER`, `MSSQL_PASSWORD`, `MSSQL_DB`, `MSSQL_PORT`)
+   - `DATABASE_URL` (or `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DB`, `MYSQL_PORT`)
    - `OPENAI_API_KEY`
    - (optional) `ANTHROPIC_API_KEY`
 4. Deploy the repo. The app auto-creates tables on first use.
@@ -67,7 +67,7 @@ Safety clamps:
 1. Install dependencies:
    - `npm install`
 2. Create `.env.local` (do not commit) with:
-   - `DATABASE_URL=...` or MSSQL parts
+   - `DATABASE_URL=...` or MySQL parts
    - `OPENAI_API_KEY=...`
 3. Start dev server:
    - `npm run dev`

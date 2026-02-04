@@ -1,5 +1,5 @@
 import { ensureDefaultSettings, ensureSchema } from "@/lib/migrations";
-import { getPool, sql } from "@/lib/db";
+import { getPool, mysql } from "@/lib/db";
 
 export type PriceRow = {
   date: string;
@@ -53,19 +53,11 @@ export async function refreshSpyData() {
   let inserted = 0;
 
   for (const row of rows) {
-    const result = await pool
-      .request()
-      .input("symbol", sql.VarChar(16), "SPY")
-      .input("date", sql.Date, row.date)
-      .input("open", sql.Decimal(18, 6), row.open)
-      .input("high", sql.Decimal(18, 6), row.high)
-      .input("low", sql.Decimal(18, 6), row.low)
-      .input("close", sql.Decimal(18, 6), row.close)
-      .input("volume", sql.BigInt, row.volume)
-      .query(
-        "IF NOT EXISTS (SELECT 1 FROM prices_daily WHERE symbol = @symbol AND date = @date) BEGIN INSERT INTO prices_daily (symbol, date, open, high, low, close, volume) VALUES (@symbol, @date, @open, @high, @low, @close, @volume) END"
-      );
-    if (result.rowsAffected[0] > 0) inserted += 1;
+    const [result] = await pool.execute<mysql.ResultSetHeader>(
+      "INSERT INTO prices_daily (symbol, date, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE open = VALUES(open), high = VALUES(high), low = VALUES(low), close = VALUES(close), volume = VALUES(volume)",
+      ["SPY", row.date, row.open, row.high, row.low, row.close, row.volume]
+    );
+    if (result.affectedRows === 1) inserted += 1;
   }
 
   return { inserted, total: rows.length };
@@ -75,13 +67,13 @@ export async function getDataStatus() {
   await ensureSchema();
   await ensureDefaultSettings();
   const pool = await getPool();
-  const result = await pool
-    .request()
-    .query("SELECT COUNT(*) as count, MAX(date) as latest FROM prices_daily WHERE symbol = 'SPY'");
-  const row = result.recordset[0];
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT COUNT(*) as count, MAX(date) as latest FROM prices_daily WHERE symbol = 'SPY'"
+  );
+  const row = rows[0];
   return {
-    count: Number(row.count || 0),
-    latest: row.latest ? row.latest.toISOString().slice(0, 10) : null,
+    count: Number(row?.count ?? 0),
+    latest: row?.latest ? new Date(row.latest).toISOString().slice(0, 10) : null,
   };
 }
 
@@ -89,23 +81,13 @@ export async function loadPrices(lookbackDays: number) {
   await ensureSchema();
   await ensureDefaultSettings();
   const pool = await getPool();
-  const result = await pool
-    .request()
-    .input("limit", sql.Int, lookbackDays)
-    .query(
-      "SELECT TOP (@limit) date, open, high, low, close, volume FROM prices_daily WHERE symbol = 'SPY' ORDER BY date DESC"
-    );
-  type PriceDbRow = {
-    date: Date;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-  };
-  const rows = (result.recordset as PriceDbRow[])
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT date, open, high, low, close, volume FROM prices_daily WHERE symbol = 'SPY' ORDER BY date DESC LIMIT ?",
+    [lookbackDays]
+  );
+  return rows
     .map((row) => ({
-      date: row.date.toISOString().slice(0, 10),
+      date: new Date(row.date).toISOString().slice(0, 10),
       open: Number(row.open),
       high: Number(row.high),
       low: Number(row.low),
@@ -113,20 +95,19 @@ export async function loadPrices(lookbackDays: number) {
       volume: Number(row.volume),
     }))
     .reverse();
-  return rows;
 }
 
 export async function getDefaultSettings() {
   await ensureSchema();
   await ensureDefaultSettings();
   const pool = await getPool();
-  const result = await pool
-    .request()
-    .input("key", sql.VarChar(64), "defaults")
-    .query("SELECT [value] FROM app_settings WHERE [key] = @key");
-  if (result.recordset.length === 0) return null;
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT `value` FROM app_settings WHERE `key` = ?",
+    ["defaults"]
+  );
+  if (!rows.length) return null;
   try {
-    return JSON.parse(result.recordset[0].value);
+    return JSON.parse(rows[0].value);
   } catch {
     return null;
   }
@@ -136,11 +117,8 @@ export async function updateDefaultSettings(values: Record<string, unknown>) {
   await ensureSchema();
   const pool = await getPool();
   const key = "defaults";
-  await pool
-    .request()
-    .input("key", sql.VarChar(64), key)
-    .input("value", sql.NVarChar(sql.MAX), JSON.stringify(values))
-    .query(
-      "UPDATE app_settings SET [value] = @value, updated_at = SYSUTCDATETIME() WHERE [key] = @key"
-    );
+  await pool.execute(
+    "UPDATE app_settings SET `value` = ?, updated_at = CURRENT_TIMESTAMP(6) WHERE `key` = ?",
+    [JSON.stringify(values), key]
+  );
 }

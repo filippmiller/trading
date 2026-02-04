@@ -89,7 +89,7 @@ export default function DashboardPage() {
         <Card>
           <CardHeader>
             <CardTitle>SPY Data Status</CardTitle>
-            <CardDescription>Latest OHLCV snapshot stored in MSSQL.</CardDescription>
+            <CardDescription>Latest OHLCV snapshot stored in MySQL.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             <div className="text-sm text-zinc-600">

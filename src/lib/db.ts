@@ -1,53 +1,48 @@
-import sql from "mssql";
+import mysql from "mysql2/promise";
 
-let pool: sql.ConnectionPool | null = null;
+let pool: mysql.Pool | null = null;
 
 function parseDatabaseUrl() {
   const url = process.env.DATABASE_URL;
   if (!url) return null;
   const parsed = new URL(url);
-  const user = decodeURIComponent(parsed.username);
-  const password = decodeURIComponent(parsed.password);
-  const server = parsed.hostname;
-  const port = parsed.port ? Number(parsed.port) : 1433;
-  const database = parsed.pathname.replace("/", "");
-  return { user, password, server, port, database };
+  return {
+    host: parsed.hostname,
+    port: parsed.port ? Number(parsed.port) : 3306,
+    user: decodeURIComponent(parsed.username),
+    password: decodeURIComponent(parsed.password),
+    database: parsed.pathname.replace("/", ""),
+  };
 }
 
-function getConfig(): sql.config {
+function getConfig(): mysql.PoolOptions {
   const fromUrl = parseDatabaseUrl();
-  const server = fromUrl?.server ?? process.env.MSSQL_HOST ?? "";
-  const port = fromUrl?.port ?? (process.env.MSSQL_PORT ? Number(process.env.MSSQL_PORT) : 1433);
-  const user = fromUrl?.user ?? process.env.MSSQL_USER ?? "";
-  const password = fromUrl?.password ?? process.env.MSSQL_PASSWORD ?? "";
-  const database = fromUrl?.database ?? process.env.MSSQL_DB ?? "";
+  const host = fromUrl?.host ?? process.env.MYSQLHOST ?? process.env.MYSQL_HOST ?? "";
+  const port = fromUrl?.port ?? Number(process.env.MYSQLPORT ?? process.env.MYSQL_PORT ?? 3306);
+  const user = fromUrl?.user ?? process.env.MYSQLUSER ?? process.env.MYSQL_USER ?? "";
+  const password = fromUrl?.password ?? process.env.MYSQLPASSWORD ?? process.env.MYSQL_PASSWORD ?? "";
+  const database = fromUrl?.database ?? process.env.MYSQLDATABASE ?? process.env.MYSQL_DB ?? "";
 
-  if (!server || !user || !password || !database) {
-    throw new Error("Missing MSSQL connection environment variables.");
+  if (!host || !user || !password || !database) {
+    throw new Error("Missing MySQL connection environment variables.");
   }
 
   return {
-    server,
+    host,
     port,
     user,
     password,
     database,
-    options: {
-      encrypt: true,
-      trustServerCertificate: true,
-    },
-    pool: {
-      max: 10,
-      min: 0,
-      idleTimeoutMillis: 30000,
-    },
+    waitForConnections: true,
+    connectionLimit: 10,
+    timezone: "Z",
   };
 }
 
 export async function getPool() {
   if (pool) return pool;
-  pool = await sql.connect(getConfig());
+  pool = mysql.createPool(getConfig());
   return pool;
 }
 
-export { sql };
+export { mysql };

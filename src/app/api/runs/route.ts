@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { ensureSchema } from "@/lib/migrations";
-import { getPool, sql } from "@/lib/db";
+import { getPool, mysql } from "@/lib/db";
 
 export async function GET(req: Request) {
   await ensureSchema();
@@ -11,26 +11,13 @@ export async function GET(req: Request) {
   const offset = page * limit;
 
   const pool = await getPool();
-  const result = await pool
-    .request()
-    .input("offset", sql.Int, offset)
-    .input("limit", sql.Int, limit)
-    .query(
-      "SELECT r.id, r.created_at, r.status, r.preset_name, m.total_pnl_usd, m.total_return_pct, m.trades_count FROM strategy_runs r LEFT JOIN run_metrics m ON r.id = m.run_id ORDER BY r.created_at DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY"
-    );
-
-  type RunRow = {
-    id: string;
-    created_at: Date;
-    status: string;
-    preset_name: string | null;
-    total_pnl_usd: number | null;
-    total_return_pct: number | null;
-    trades_count: number | null;
-  };
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT r.id, r.created_at, r.status, r.preset_name, m.total_pnl_usd, m.total_return_pct, m.trades_count FROM strategy_runs r LEFT JOIN run_metrics m ON r.id = m.run_id ORDER BY r.created_at DESC LIMIT ? OFFSET ?",
+    [limit, offset]
+  );
 
   return NextResponse.json({
-    items: (result.recordset as RunRow[]).map((row) => ({
+    items: rows.map((row) => ({
       id: row.id,
       created_at: row.created_at,
       status: row.status,
