@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
+import { StrategyChat } from "@/components/StrategyChat";
 
 const SYMBOL_STORAGE_KEY = "symbols:last";
 
@@ -190,9 +191,18 @@ export default function VoicePage() {
           </div>
 
           {specJson && (
-            <div className="rounded-lg bg-zinc-950/5 p-3 text-xs text-zinc-700">
-              <div className="mb-2 text-xs font-semibold text-zinc-600">Parsed StrategySpec</div>
-              <pre className="whitespace-pre-wrap">{JSON.stringify(specJson, null, 2)}</pre>
+            <div className="space-y-4">
+              <div className="rounded-lg bg-zinc-950/5 p-3 text-xs text-zinc-700">
+                <div className="mb-2 text-xs font-semibold text-zinc-600">Parsed StrategySpec</div>
+                <pre className="whitespace-pre-wrap">{JSON.stringify(specJson, null, 2)}</pre>
+              </div>
+
+              <div className="border-t border-zinc-200 pt-4">
+                <StrategyChat
+                  currentSpec={specJson}
+                  onSpecUpdate={(newSpec) => setSpecJson(newSpec)}
+                />
+              </div>
             </div>
           )}
 

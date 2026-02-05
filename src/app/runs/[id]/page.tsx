@@ -5,6 +5,8 @@ import { useParams } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { EquityCurve } from "@/components/charts/EquityCurve";
+import { BacktestCritique } from "@/components/BacktestCritique";
 
 type RunDetails = {
   run: {
@@ -121,6 +123,30 @@ export default function RunDetailPage() {
           </div>
         </CardContent>
       </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Equity Curve</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <EquityCurve
+            trades={details.trades.map((t) => ({
+              entry_date: String(t.entry_date),
+              exit_date: String(t.exit_date),
+              pnl_usd: Number(t.pnl_usd),
+            }))}
+            baseCapital={(() => {
+              try {
+                return JSON.parse(details.run.spec_json).capital_base_usd || 500;
+              } catch {
+                return 500;
+              }
+            })()}
+          />
+        </CardContent>
+      </Card>
+
+      <BacktestCritique runId={runId} />
 
       <div className="flex flex-wrap gap-2">
         <Button onClick={() => download(`trades-${runId}.csv`, details.trades)}>

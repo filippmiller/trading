@@ -62,6 +62,30 @@ const schemaStatements = [
     \`value\` LONGTEXT NOT NULL,
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
   ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS reversal_entries (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    cohort_date DATE NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    direction VARCHAR(8) NOT NULL,
+    day_change_pct DECIMAL(10,4) NOT NULL,
+    entry_price DECIMAL(18,6) NOT NULL,
+    d1_morning DECIMAL(18,6) NULL,
+    d1_midday DECIMAL(18,6) NULL,
+    d1_close DECIMAL(18,6) NULL,
+    d2_morning DECIMAL(18,6) NULL,
+    d2_midday DECIMAL(18,6) NULL,
+    d2_close DECIMAL(18,6) NULL,
+    d3_morning DECIMAL(18,6) NULL,
+    d3_midday DECIMAL(18,6) NULL,
+    d3_close DECIMAL(18,6) NULL,
+    final_pnl_usd DECIMAL(18,6) NULL,
+    final_pnl_pct DECIMAL(18,6) NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY UX_reversal_cohort_symbol (cohort_date, symbol),
+    INDEX IX_reversal_status (status),
+    INDEX IX_reversal_cohort (cohort_date)
+  ) ENGINE=InnoDB;`,
 ];
 
 async function ensureColumn(table: string, column: string, definition: string) {
