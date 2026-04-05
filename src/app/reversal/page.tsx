@@ -1,39 +1,28 @@
 "use client";
 
 import { useEffect, useState, useMemo } from "react";
+import { 
+  Activity, 
+  ArrowUpCircle, 
+  ArrowDownCircle, 
+  RefreshCw, 
+  Settings2, 
+  TrendingUp, 
+  TrendingDown, 
+  History,
+  AlertCircle,
+  CheckCircle2,
+  Calendar
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import {
-  ReversalEntry,
-  ReversalSettings,
-  calculateEntryPnL,
-  MEASUREMENT_FIELDS,
-  MeasurementField,
+import { 
+  ReversalEntry, 
+  ReversalSettings, 
+  calculateEntryPnL 
 } from "@/lib/reversal";
-
-type Mover = {
-  symbol: string;
-  name: string;
-  price: number;
-  change: number;
-  changePct: number;
-  consecutiveDays?: number;
-  trendDirection?: "UP" | "DOWN";
-  cumulativeChangePct?: number;
-};
-
-type MoversData = {
-  gainers: Mover[];
-  losers: Mover[];
-  timestamp: string;
-};
-
-type CohortsData = {
-  cohorts: Record<string, ReversalEntry[]>;
-};
 
 const DEFAULT_SETTINGS: ReversalSettings = {
   position_size_usd: 100,
@@ -43,688 +32,274 @@ const DEFAULT_SETTINGS: ReversalSettings = {
   leverage_multiplier: 1,
 };
 
-export default function ReversalPage() {
-  const [movers, setMovers] = useState<MoversData | null>(null);
+export default function ReversalDashboard() {
   const [cohorts, setCohorts] = useState<Record<string, ReversalEntry[]>>({});
   const [settings, setSettings] = useState<ReversalSettings>(DEFAULT_SETTINGS);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
-  const [selectedGainers, setSelectedGainers] = useState<Set<string>>(new Set());
-  const [selectedLosers, setSelectedLosers] = useState<Set<string>>(new Set());
-  const [editingEntry, setEditingEntry] = useState<number | null>(null);
-  const [measurementInputs, setMeasurementInputs] = useState<Record<string, string>>({});
+  const [view, setView] = useState<'active' | 'history'>('active');
 
-  // Load data on mount
   useEffect(() => {
-    loadSettings();
-    loadCohorts();
+    loadData();
   }, []);
 
-  const loadSettings = async () => {
-    try {
-      const response = await fetch("/api/reversal/settings");
-      const data = await response.json();
-      if (data.settings) setSettings(data.settings);
-    } catch (err) {
-      console.error("Failed to load settings", err);
-    }
-  };
-
-  const loadCohorts = async () => {
-    try {
-      const response = await fetch("/api/reversal");
-      const data: CohortsData = await response.json();
-      setCohorts(data.cohorts || {});
-    } catch (err) {
-      console.error("Failed to load cohorts", err);
-    }
-  };
-
-  const fetchMovers = async () => {
+  const loadData = async () => {
     setLoading(true);
-    setError(null);
     try {
-      const response = await fetch("/api/reversal/movers");
-      if (!response.ok) throw new Error("Failed to fetch movers");
-      const data: MoversData = await response.json();
-      setMovers(data);
-      // Auto-select those with 2+ consecutive days trend
-      setSelectedGainers(
-        new Set(
-          data.gainers
-            .filter((m) => (m.consecutiveDays || 0) >= 2)
-            .slice(0, 5)
-            .map((m) => m.symbol)
-        )
-      );
-      setSelectedLosers(
-        new Set(
-          data.losers
-            .filter((m) => (m.consecutiveDays || 0) >= 2)
-            .slice(0, 5)
-            .map((m) => m.symbol)
-        )
-      );
+      const [setRes, cohRes] = await Promise.all([
+        fetch("/api/reversal/settings"),
+        fetch("/api/reversal")
+      ]);
+      const setData = await setRes.json();
+      const cohData = await cohRes.json();
+      if (setData.settings) setSettings(setData.settings);
+      setCohorts(cohData.cohorts || {});
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to fetch movers");
+      setError("Failed to sync with surveillance backend.");
     } finally {
       setLoading(false);
     }
   };
 
-  const saveSettings = async () => {
+  const runSync = async () => {
+    setLoading(true);
     try {
-      const response = await fetch("/api/reversal/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings),
-      });
-      if (!response.ok) throw new Error("Failed to save settings");
-      setShowSettings(false);
+      await fetch("/api/surveillance/sync");
+      await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save settings");
+      setError("Surveillance sync failed.");
+    } finally {
+      setLoading(false);
     }
   };
 
-  const createCohort = async () => {
-    if (!movers) return;
+  // Stats Logic
+  const stats = useMemo(() => {
+    const allEntries = Object.values(cohorts).flat();
+    const active = allEntries.filter(e => e.status === 'ACTIVE');
+    const completed = allEntries.filter(e => e.status === 'COMPLETED');
+    const totalPnl = completed.reduce((sum, e) => sum + (e.final_pnl_usd || 0), 0);
+    const winRate = completed.length > 0 
+      ? (completed.filter(e => (e.final_pnl_usd || 0) > 0).length / completed.length) * 100 
+      : 0;
 
-    const today = new Date().toISOString().split("T")[0];
-    const entries: Array<{
-      symbol: string;
-      direction: "LONG" | "SHORT";
-      day_change_pct: number;
-      entry_price: number;
-      consecutive_days?: number;
-      cumulative_change_pct?: number;
-    }> = [];
-
-    // Losers -> LONG (buy expecting reversal up)
-    for (const loser of movers.losers) {
-      if (selectedLosers.has(loser.symbol)) {
-        entries.push({
-          symbol: loser.symbol,
-          direction: "LONG",
-          day_change_pct: loser.changePct,
-          entry_price: loser.price,
-          consecutive_days: loser.consecutiveDays,
-          cumulative_change_pct: loser.cumulativeChangePct,
-        });
-      }
-    }
-
-    // Gainers -> SHORT (sell expecting reversal down)
-    for (const gainer of movers.gainers) {
-      if (selectedGainers.has(gainer.symbol)) {
-        entries.push({
-          symbol: gainer.symbol,
-          direction: "SHORT",
-          day_change_pct: gainer.changePct,
-          entry_price: gainer.price,
-          consecutive_days: gainer.consecutiveDays,
-          cumulative_change_pct: gainer.cumulativeChangePct,
-        });
-      }
-    }
-
-    if (entries.length === 0) {
-      setError("Select at least one stock to track");
-      return;
-    }
-
-    try {
-      const response = await fetch("/api/reversal", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cohort_date: today, entries }),
-      });
-      if (!response.ok) throw new Error("Failed to create cohort");
-      await loadCohorts();
-      setMovers(null);
-      setSelectedGainers(new Set());
-      setSelectedLosers(new Set());
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create cohort");
-    }
-  };
-
-  const updateMeasurement = async (entryId: number, field: MeasurementField) => {
-    const value = measurementInputs[`${entryId}-${field}`];
-    if (!value) return;
-
-    try {
-      const response = await fetch(`/api/reversal/${entryId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ [field]: parseFloat(value) }),
-      });
-      if (!response.ok) throw new Error("Failed to update measurement");
-      await loadCohorts();
-      setMeasurementInputs((prev) => ({ ...prev, [`${entryId}-${field}`]: "" }));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update");
-    }
-  };
-
-  const markCompleted = async (entryId: number) => {
-    try {
-      // Find the entry and calculate final P&L
-      let targetEntry: ReversalEntry | null = null;
-      for (const entries of Object.values(cohorts)) {
-        const found = entries.find((e) => e.id === entryId);
-        if (found) {
-          targetEntry = found;
-          break;
-        }
-      }
-
-      if (!targetEntry) return;
-
-      const pnl = calculateEntryPnL(targetEntry, settings);
-
-      await fetch(`/api/reversal/${entryId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          status: "COMPLETED",
-          final_pnl_usd: pnl?.pnl_usd ?? null,
-          final_pnl_pct: pnl?.pnl_pct ?? null,
-        }),
-      });
-      await loadCohorts();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to mark completed");
-    }
-  };
-
-  // Calculate cohort summary stats
-  const cohortStats = useMemo(() => {
-    const stats: Record<
-      string,
-      { total: number; completed: number; totalPnl: number; winners: number }
-    > = {};
-
-    for (const [date, entries] of Object.entries(cohorts)) {
-      let totalPnl = 0;
-      let completed = 0;
-      let winners = 0;
-
-      for (const entry of entries) {
-        if (entry.status === "COMPLETED" && entry.final_pnl_usd !== null) {
-          completed++;
-          totalPnl += entry.final_pnl_usd;
-          if (entry.final_pnl_usd > 0) winners++;
-        }
-      }
-
-      stats[date] = {
-        total: entries.length,
-        completed,
-        totalPnl,
-        winners,
-      };
-    }
-
-    return stats;
+    return { active, completed, totalPnl, winRate };
   }, [cohorts]);
 
-  const toggleSelection = (
-    symbol: string,
-    set: Set<string>,
-    setter: React.Dispatch<React.SetStateAction<Set<string>>>
-  ) => {
-    const newSet = new Set(set);
-    if (newSet.has(symbol)) {
-      newSet.delete(symbol);
-    } else {
-      newSet.add(symbol);
-    }
-    setter(newSet);
-  };
+  const activeGroups = useMemo(() => {
+    const sorted = Object.entries(cohorts)
+      .filter(([, entries]) => entries.some(e => e.status === 'ACTIVE'))
+      .sort(([a], [b]) => b.localeCompare(a));
+    return sorted;
+  }, [cohorts]);
 
-  const syncSurveillance = async () => {
-    setLoading(true);
-    try {
-      const response = await fetch("/api/surveillance/sync");
-      if (!response.ok) throw new Error("Sync failed");
-      await loadCohorts();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Sync failed");
-    } finally {
-      setLoading(false);
-    }
-  };
+  const historyGroups = useMemo(() => {
+    const sorted = Object.entries(cohorts)
+      .filter(([, entries]) => entries.every(e => e.status === 'COMPLETED'))
+      .sort(([a], [b]) => b.localeCompare(a));
+    return sorted;
+  }, [cohorts]);
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+    <div className="max-w-6xl mx-auto space-y-8 pb-20">
+      {/* World-Class Header */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b pb-6">
         <div>
-          <h1 className="text-xl font-semibold text-zinc-900">Mean Reversion Study</h1>
-          <p className="text-sm text-zinc-500">
-            Track top gainers (short) and losers (long) to test reversal hypothesis
-          </p>
+          <h1 className="text-3xl font-bold tracking-tight text-zinc-900 flex items-center gap-3">
+            <Activity className="text-emerald-500 h-8 w-8" />
+            Surveillance Command
+          </h1>
+          <p className="text-zinc-500 mt-1">10-Day Mean Reversion Monitoring System</p>
         </div>
-        <div className="flex gap-2">
-          <Button variant="outline" onClick={syncSurveillance} disabled={loading}>
-            {loading ? "Syncing..." : "Sync Surveillance"}
+        <div className="flex items-center gap-3">
+          <Button 
+            variant="outline" 
+            className="rounded-full px-6"
+            onClick={runSync} 
+            disabled={loading}
+          >
+            <RefreshCw className={`mr-2 h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+            Scan & Sync
           </Button>
-          <Button variant="secondary" onClick={() => setShowSettings(!showSettings)}>
-            Settings
-          </Button>
-          <Button onClick={fetchMovers} disabled={loading}>
-            {loading ? "Fetching..." : "Fetch Today's Movers"}
+          <Button variant="ghost" size="icon" className="rounded-full">
+            <Settings2 className="h-5 w-5 text-zinc-500" />
           </Button>
         </div>
       </div>
 
+      {/* High-Level KPIs */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <KpiCard 
+          title="Active Tickers" 
+          value={stats.active.length} 
+          icon={<Activity className="h-4 w-4 text-emerald-500" />} 
+          description="Under surveillance"
+        />
+        <KpiCard 
+          title="Total P&L" 
+          value={`$${stats.totalPnl.toFixed(2)}`} 
+          icon={<TrendingUp className="h-4 w-4 text-emerald-500" />} 
+          color={stats.totalPnl >= 0 ? "text-emerald-600" : "text-red-600"}
+          description="Realized returns"
+        />
+        <KpiCard 
+          title="Win Rate" 
+          value={`${stats.winRate.toFixed(1)}%`} 
+          icon={<CheckCircle2 className="h-4 w-4 text-blue-500" />} 
+          description="Based on history"
+        />
+        <KpiCard 
+          title="Observation Window" 
+          value="10 Days" 
+          icon={<Calendar className="h-4 w-4 text-zinc-500" />} 
+          description="30 data points/stock"
+        />
+      </div>
+
+      {/* Navigation Tabs */}
+      <div className="flex gap-1 bg-zinc-100 p-1 rounded-xl w-fit">
+        <button 
+          onClick={() => setView('active')}
+          className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'active' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
+        >
+          Live Surveillance
+        </button>
+        <button 
+          onClick={() => setView('history')}
+          className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'history' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
+        >
+          Historical Audit
+        </button>
+      </div>
+
       {error && (
-        <div className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-600">{error}</div>
-      )}
-
-      {/* Settings Panel */}
-      {showSettings && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Study Settings</CardTitle>
-            <CardDescription>Configure costs and position sizing</CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4 md:grid-cols-3">
-            <div className="space-y-1">
-              <label className="text-sm text-zinc-600">Position Size ($)</label>
-              <Input
-                type="number"
-                value={settings.position_size_usd}
-                onChange={(e) =>
-                  setSettings({ ...settings, position_size_usd: Number(e.target.value) })
-                }
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-sm text-zinc-600">Commission per Trade ($)</label>
-              <Input
-                type="number"
-                step="0.1"
-                value={settings.commission_per_trade_usd}
-                onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    commission_per_trade_usd: Number(e.target.value),
-                  })
-                }
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-sm text-zinc-600">Leverage Multiplier</label>
-              <Input
-                type="number"
-                step="0.5"
-                min="1"
-                max="5"
-                value={settings.leverage_multiplier}
-                onChange={(e) =>
-                  setSettings({ ...settings, leverage_multiplier: Number(e.target.value) })
-                }
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-sm text-zinc-600">Short Borrow Rate (APR %)</label>
-              <Input
-                type="number"
-                step="0.01"
-                value={(settings.short_borrow_rate_apr * 100).toFixed(1)}
-                onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    short_borrow_rate_apr: Number(e.target.value) / 100,
-                  })
-                }
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-sm text-zinc-600">Leverage Interest (APR %)</label>
-              <Input
-                type="number"
-                step="0.1"
-                value={(settings.leverage_interest_apr * 100).toFixed(1)}
-                onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    leverage_interest_apr: Number(e.target.value) / 100,
-                  })
-                }
-              />
-            </div>
-            <div className="flex items-end">
-              <Button onClick={saveSettings}>Save Settings</Button>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Movers Selection */}
-      {movers && (
-        <Card>
-          <CardHeader>
-            <CardTitle>{"Select Stocks for Today's Cohort"}</CardTitle>
-            <CardDescription>
-              Fetched at {new Date(movers.timestamp).toLocaleTimeString()}. Select up to 5
-              from each list.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="grid gap-6 md:grid-cols-2">
-              {/* Losers -> LONG */}
-              <div>
-                <h3 className="mb-2 text-sm font-medium text-red-600">
-                  Top Losers → Buy (LONG)
-                </h3>
-                <div className="space-y-1">
-                  {movers.losers.map((mover) => (
-                    <div
-                      key={mover.symbol}
-                      className={`flex cursor-pointer items-center justify-between rounded-md border p-2 text-sm transition-colors ${
-                        selectedLosers.has(mover.symbol)
-                          ? "border-emerald-300 bg-emerald-50"
-                          : "border-zinc-200 hover:bg-zinc-50"
-                      }`}
-                      onClick={() =>
-                        toggleSelection(mover.symbol, selectedLosers, setSelectedLosers)
-                      }
-                    >
-                      <div className="flex flex-col">
-                        <div className="flex items-center gap-2">
-                          <span className="font-medium">{mover.symbol}</span>
-                          {mover.consecutiveDays && mover.consecutiveDays >= 2 && (
-                            <Badge variant="outline" className="border-red-200 bg-red-50 text-[10px] text-red-700">
-                              {mover.consecutiveDays}D Trend
-                            </Badge>
-                          )}
-                        </div>
-                        <span className="text-xs text-zinc-500 truncate max-w-[150px]">{mover.name}</span>
-                      </div>
-                      <div className="text-right">
-                        <div className="font-mono">${mover.price.toFixed(2)}</div>
-                        <div className="flex flex-col items-end">
-                          <span className="text-xs text-red-600 font-medium">
-                            {mover.changePct.toFixed(2)}%
-                          </span>
-                          {mover.cumulativeChangePct && (
-                            <span className="text-[10px] text-zinc-400">
-                              Total: {mover.cumulativeChangePct.toFixed(1)}%
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* Gainers -> SHORT */}
-              <div>
-                <h3 className="mb-2 text-sm font-medium text-emerald-600">
-                  Top Gainers → Sell (SHORT)
-                </h3>
-                <div className="space-y-1">
-                  {movers.gainers.map((mover) => (
-                    <div
-                      key={mover.symbol}
-                      className={`flex cursor-pointer items-center justify-between rounded-md border p-2 text-sm transition-colors ${
-                        selectedGainers.has(mover.symbol)
-                          ? "border-red-300 bg-red-50"
-                          : "border-zinc-200 hover:bg-zinc-50"
-                      }`}
-                      onClick={() =>
-                        toggleSelection(mover.symbol, selectedGainers, setSelectedGainers)
-                      }
-                    >
-                      <div className="flex flex-col">
-                        <div className="flex items-center gap-2">
-                          <span className="font-medium">{mover.symbol}</span>
-                          {mover.consecutiveDays && mover.consecutiveDays >= 2 && (
-                            <Badge variant="outline" className="border-emerald-200 bg-emerald-50 text-[10px] text-emerald-700">
-                              {mover.consecutiveDays}D Trend
-                            </Badge>
-                          )}
-                        </div>
-                        <span className="text-xs text-zinc-500 truncate max-w-[150px]">{mover.name}</span>
-                      </div>
-                      <div className="text-right">
-                        <div className="font-mono">${mover.price.toFixed(2)}</div>
-                        <div className="flex flex-col items-end">
-                          <span className="text-xs text-emerald-600 font-medium">
-                            +{mover.changePct.toFixed(2)}%
-                          </span>
-                          {mover.cumulativeChangePct && (
-                            <span className="text-[10px] text-zinc-400">
-                              Total: +{mover.cumulativeChangePct.toFixed(1)}%
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-4 flex items-center justify-between border-t pt-4">
-              <div className="text-sm text-zinc-500">
-                Selected: {selectedLosers.size} longs + {selectedGainers.size} shorts ={" "}
-                {selectedLosers.size + selectedGainers.size} positions
-              </div>
-              <Button onClick={createCohort}>{"Create Today's Cohort"}</Button>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Active Cohorts */}
-      {Object.keys(cohorts).length > 0 && (
-        <div className="space-y-4">
-          <h2 className="text-lg font-medium text-zinc-900">Tracking Cohorts</h2>
-
-          {Object.entries(cohorts)
-            .sort(([a], [b]) => b.localeCompare(a))
-            .map(([date, entries]) => {
-              const stats = cohortStats[date];
-              return (
-                <Card key={date}>
-                  <CardHeader className="pb-2">
-                    <div className="flex items-center justify-between">
-                      <CardTitle className="text-base">Cohort: {date}</CardTitle>
-                      <div className="flex items-center gap-2">
-                        {stats && stats.completed > 0 && (
-                          <Badge
-                            className={
-                              stats.totalPnl >= 0
-                                ? "border-emerald-200 bg-emerald-100 text-emerald-700"
-                                : "border-red-200 bg-red-100 text-red-700"
-                            }
-                          >
-                            {stats.totalPnl >= 0 ? "+" : ""}${stats.totalPnl.toFixed(2)}
-                          </Badge>
-                        )}
-                        <Badge>
-                          {stats?.completed || 0}/{stats?.total || entries.length} done
-                        </Badge>
-                      </div>
-                    </div>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm">
-                        <thead>
-                          <tr className="border-b text-left text-xs text-zinc-500">
-                            <th className="py-2">Symbol</th>
-                            <th>Trend</th>
-                            <th>Direction</th>
-                            <th>Entry</th>
-                            <th>Progress (10 Days / 30 pts)</th>
-                            <th>P&L</th>
-                            <th></th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {entries.map((entry) => {
-                            const pnl = calculateEntryPnL(entry, settings);
-                            const points = [];
-                            for(let d=1; d<=10; d++) {
-                              points.push(entry[`d${d}_morning` as keyof ReversalEntry] ? 1 : 0);
-                              points.push(entry[`d${d}_midday` as keyof ReversalEntry] ? 1 : 0);
-                              points.push(entry[`d${d}_close` as keyof ReversalEntry] ? 1 : 0);
-                            }
-                            const completedPoints = points.reduce((a, b) => a + b, 0);
-
-                            return (
-                              <tr
-                                key={entry.id}
-                                className="border-b last:border-0 hover:bg-zinc-50"
-                              >
-                                <td className="py-2 font-medium">{entry.symbol}</td>
-                                <td>
-                                  {entry.consecutive_days ? (
-                                    <div className="flex flex-col">
-                                      <span className="text-xs font-medium">{entry.consecutive_days}D</span>
-                                      {entry.cumulative_change_pct && (
-                                        <span className="text-[10px] text-zinc-500">
-                                          {entry.cumulative_change_pct > 0 ? "+" : ""}{entry.cumulative_change_pct.toFixed(1)}%
-                                        </span>
-                                      )}
-                                    </div>
-                                  ) : (
-                                    <span className="text-zinc-300">—</span>
-                                  )}
-                                </td>
-                                <td>
-                                  <Badge
-                                    className={
-                                      entry.direction === "LONG"
-                                        ? "border-emerald-200 bg-emerald-100 text-emerald-700"
-                                        : "border-red-200 bg-red-100 text-red-700"
-                                    }
-                                  >
-                                    {entry.direction}
-                                  </Badge>
-                                </td>
-                                <td className="font-mono text-xs">
-                                  ${entry.entry_price.toFixed(2)}
-                                </td>
-                                <td>
-                                  <div className="flex flex-col gap-1">
-                                    <div className="flex gap-0.5">
-                                      {points.map((pt, i) => (
-                                        <div 
-                                          key={i} 
-                                          className={`h-1.5 w-1 rounded-full ${pt ? 'bg-emerald-500' : 'bg-zinc-200'}`}
-                                          title={`Point ${i+1}`}
-                                        />
-                                      ))}
-                                    </div>
-                                    <span className="text-[10px] text-zinc-400">
-                                      {completedPoints}/30 points tracked
-                                    </span>
-                                  </div>
-                                </td>
-                                <td className="px-1">
-                                  {pnl ? (
-                                    <span
-                                      className={`font-mono text-xs font-medium ${
-                                        pnl.pnl_usd >= 0
-                                          ? "text-emerald-600"
-                                          : "text-red-600"
-                                      }`}
-                                    >
-                                      {pnl.pnl_usd >= 0 ? "+" : ""}${pnl.pnl_usd.toFixed(2)}
-                                    </span>
-                                  ) : (
-                                    <span className="text-zinc-300">—</span>
-                                  )}
-                                </td>
-                                <td className="px-1 text-right">
-                                  {entry.status === "ACTIVE" ? (
-                                    <Button
-                                      variant="secondary"
-                                      className="h-6 px-2 text-xs"
-                                      onClick={() => markCompleted(entry.id)}
-                                    >
-                                      Close
-                                    </Button>
-                                  ) : (
-                                    <Badge className="border-zinc-200 bg-zinc-100 text-zinc-600">
-                                      Closed
-                                    </Badge>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  </CardContent>
-                </Card>
-              );
-            })}
+        <div className="bg-red-50 border border-red-100 text-red-600 px-4 py-3 rounded-xl flex items-center gap-3 animate-in fade-in slide-in-from-top-2">
+          <AlertCircle className="h-5 w-5" />
+          <span className="text-sm font-medium">{error}</span>
         </div>
       )}
 
-      {/* Empty state */}
-      {Object.keys(cohorts).length === 0 && !movers && (
-        <Card>
-          <CardContent className="py-12 text-center">
-            <div className="text-zinc-500">
-              {"No cohorts yet. Click \"Fetch Today's Movers\" to start tracking."}
+      {/* Main Content Feed */}
+      <div className="space-y-6">
+        {(view === 'active' ? activeGroups : historyGroups).map(([date, entries]) => (
+          <div key={date} className="space-y-3">
+            <div className="flex items-center gap-3 px-1">
+              <Badge variant="outline" className="bg-white text-zinc-500 font-mono">
+                {date}
+              </Badge>
+              <div className="h-px flex-1 bg-zinc-100" />
             </div>
-          </CardContent>
-        </Card>
-      )}
 
-      {/* Summary Stats */}
-      {Object.keys(cohorts).length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Overall Statistics</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid gap-4 md:grid-cols-4">
-              <div>
-                <div className="text-xs uppercase text-zinc-500">Total Cohorts</div>
-                <div className="text-lg font-medium">{Object.keys(cohorts).length}</div>
-              </div>
-              <div>
-                <div className="text-xs uppercase text-zinc-500">Total Positions</div>
-                <div className="text-lg font-medium">
-                  {Object.values(cohorts).reduce((sum, c) => sum + c.length, 0)}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs uppercase text-zinc-500">Completed</div>
-                <div className="text-lg font-medium">
-                  {Object.values(cohortStats).reduce((sum, s) => sum + s.completed, 0)}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs uppercase text-zinc-500">Total P&L</div>
-                <div
-                  className={`text-lg font-medium ${
-                    Object.values(cohortStats).reduce((sum, s) => sum + s.totalPnl, 0) >= 0
-                      ? "text-emerald-600"
-                      : "text-red-600"
-                  }`}
-                >
-                  $
-                  {Object.values(cohortStats)
-                    .reduce((sum, s) => sum + s.totalPnl, 0)
-                    .toFixed(2)}
-                </div>
-              </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {entries.map(entry => (
+                <SurveillanceCard key={entry.id} entry={entry} settings={settings} />
+              ))}
             </div>
-          </CardContent>
-        </Card>
-      )}
+          </div>
+        ))}
+
+        {(view === 'active' ? activeGroups : historyGroups).length === 0 && (
+          <div className="py-20 text-center border-2 border-dashed rounded-3xl bg-zinc-50/50">
+            <Activity className="h-12 w-12 text-zinc-300 mx-auto mb-4" />
+            <h3 className="text-zinc-900 font-medium">No {view} data found</h3>
+            <p className="text-zinc-500 text-sm mt-1">Run a Scan & Sync to identify new opportunities.</p>
+          </div>
+        )}
+      </div>
     </div>
+  );
+}
+
+function KpiCard({ title, value, icon, description, color = "text-zinc-900" }: any) {
+  return (
+    <Card className="border-none shadow-sm ring-1 ring-zinc-200/50">
+      <CardHeader className="flex flex-row items-center justify-between pb-2 space-y-0">
+        <CardTitle className="text-xs font-medium text-zinc-500 uppercase tracking-wider">{title}</CardTitle>
+        {icon}
+      </CardHeader>
+      <CardContent>
+        <div className={`text-2xl font-bold ${color}`}>{value}</div>
+        <p className="text-[10px] text-zinc-400 mt-1 uppercase font-medium">{description}</p>
+      </CardContent>
+    </Card>
+  );
+}
+
+function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings: any }) {
+  const pnl = calculateEntryPnL(entry, settings);
+  
+  const points = [];
+  for(let d=1; d<=10; d++) {
+    points.push(entry[`d${d}_morning` as keyof ReversalEntry] ? 1 : 0);
+    points.push(entry[`d${d}_midday` as keyof ReversalEntry] ? 1 : 0);
+    points.push(entry[`d${d}_close` as keyof ReversalEntry] ? 1 : 0);
+  }
+  const completedPoints = points.reduce((a, b) => a + b, 0);
+  const progressPercent = (completedPoints / 30) * 100;
+
+  return (
+    <Card className="overflow-hidden border-none shadow-sm ring-1 ring-zinc-200/50 hover:ring-zinc-300 transition-all">
+      <div className="p-5 flex items-start justify-between">
+        <div className="flex gap-4">
+          <div className={`p-3 rounded-2xl ${entry.direction === 'LONG' ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'}`}>
+            {entry.direction === 'LONG' ? <TrendingUp className="h-6 w-6" /> : <TrendingDown className="h-6 w-6" />}
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h3 className="text-lg font-bold text-zinc-900">{entry.symbol}</h3>
+              <Badge variant="outline" className="text-[10px] font-mono border-zinc-200">
+                {entry.consecutive_days}D Trend
+              </Badge>
+            </div>
+            <p className="text-xs text-zinc-400 font-medium uppercase tracking-tighter">
+              Trigger: {entry.day_change_pct.toFixed(2)}% move
+            </p>
+          </div>
+        </div>
+        
+        <div className="text-right">
+          <div className={`text-lg font-bold ${pnl && pnl.pnl_usd >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+            {pnl ? `${pnl.pnl_usd >= 0 ? '+' : ''}$${pnl.pnl_usd.toFixed(2)}` : '--'}
+          </div>
+          <div className="text-[10px] text-zinc-400 font-medium uppercase">
+            Current P&L
+          </div>
+        </div>
+      </div>
+
+      <div className="px-5 pb-5 space-y-4">
+        {/* Progress Grid */}
+        <div className="space-y-2">
+          <div className="flex justify-between items-end">
+            <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Surveillance Progress</span>
+            <span className="text-[10px] font-mono text-zinc-400">{completedPoints}/30 Points</span>
+          </div>
+          <div className="flex gap-0.5 h-1.5 w-full">
+            {points.map((pt, i) => (
+              <div 
+                key={i} 
+                className={`h-full flex-1 rounded-full transition-colors ${pt ? 'bg-emerald-400' : 'bg-zinc-100'}`}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* Trade Details */}
+        <div className="grid grid-cols-3 gap-2 bg-zinc-50 p-3 rounded-xl border border-zinc-100">
+          <div>
+            <p className="text-[9px] text-zinc-400 uppercase font-bold">Entry</p>
+            <p className="text-xs font-mono font-medium">${entry.entry_price.toFixed(2)}</p>
+          </div>
+          <div>
+            <p className="text-[9px] text-zinc-400 uppercase font-bold">Current</p>
+            <p className="text-xs font-mono font-medium">--</p>
+          </div>
+          <div>
+            <p className="text-[9px] text-zinc-400 uppercase font-bold">Trend Size</p>
+            <p className="text-xs font-mono font-medium">{entry.cumulative_change_pct?.toFixed(1)}%</p>
+          </div>
+        </div>
+      </div>
+    </Card>
   );
 }
