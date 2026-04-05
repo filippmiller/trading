@@ -68,7 +68,7 @@ function median(values: number[]) {
   return sorted[mid];
 }
 
-function calculateMAs(prices: PriceBar[], length: number) {
+export function calculateMAs(prices: PriceBar[], length: number) {
   const ma: Array<number | null> = Array(prices.length).fill(null);
   let sum = 0;
   for (let i = 0; i < prices.length; i += 1) {
@@ -81,7 +81,7 @@ function calculateMAs(prices: PriceBar[], length: number) {
   return ma;
 }
 
-function isSignalAllowedByRegime(spec: StrategySpec, close: number, ma: number | null, side: "LONG" | "SHORT") {
+export function isSignalAllowedByRegime(spec: StrategySpec, close: number, ma: number | null, side: "LONG" | "SHORT") {
   if (!spec.regime_filter || !ma) return true;
   if (close > ma && side === "SHORT") return false;
   if (close < ma && side === "LONG") return false;
@@ -112,14 +112,7 @@ function resolveStopTake(
         : day.low <= takePrice
       : false;
 
-  if (stopHit && takeHit) {
-    return {
-      exitIndex: -1,
-      exitPrice: stopPrice,
-      exitReason: "STOP_LOSS",
-    };
-  }
-
+  // When both hit on the same bar, conservatively assume stop was hit first
   if (stopHit) {
     return {
       exitIndex: -1,
@@ -359,8 +352,9 @@ export function runBacktest(prices: PriceBar[], spec: StrategySpec) {
 
     if (spec.template === "sar_fade_flip" && trade.exit_reason === "STOP_LOSS" && spec.flip_on_stop) {
       let flipCount = 0;
+      let lastFlipExitIndex = exit.exitIndex;
       while (flipCount < spec.flip_max_times) {
-        const flipEntryIndex = Math.min(exit.exitIndex, prices.length - 1);
+        const flipEntryIndex = Math.min(lastFlipExitIndex, prices.length - 1);
         const flipSide = signalSide === "LONG" ? "SHORT" : "LONG";
         if (!prices[flipEntryIndex]) break;
         const flipExit = simulateTrade(prices, flipEntryIndex, flipSide, spec);
@@ -370,13 +364,14 @@ export function runBacktest(prices: PriceBar[], spec: StrategySpec) {
         flipTrade.exit_reason = "SAR_FLIP";
         trades.push(flipTrade);
         updateStats(flipTrade);
-        i = flipExit.exitIndex + 1;
+        lastFlipExitIndex = flipExit.exitIndex;
         flipCount += 1;
         if (flipTrade.pnl_usd >= 0) break;
       }
+      i = lastFlipExitIndex + 1;
+    } else {
+      i = exit.exitIndex + 1;
     }
-
-    i = exit.exitIndex + 1;
   }
 
   const tradePnls = trades.map((trade) => trade.pnl_pct);

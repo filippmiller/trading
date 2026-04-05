@@ -10,7 +10,6 @@ import {
   ReversalEntry,
   ReversalSettings,
   calculateEntryPnL,
-  MEASUREMENT_LABELS,
   MEASUREMENT_FIELDS,
   MeasurementField,
 } from "@/lib/reversal";
@@ -21,6 +20,9 @@ type Mover = {
   price: number;
   change: number;
   changePct: number;
+  consecutiveDays?: number;
+  trendDirection?: "UP" | "DOWN";
+  cumulativeChangePct?: number;
 };
 
 type MoversData = {
@@ -87,9 +89,23 @@ export default function ReversalPage() {
       if (!response.ok) throw new Error("Failed to fetch movers");
       const data: MoversData = await response.json();
       setMovers(data);
-      // Auto-select top 5 of each
-      setSelectedGainers(new Set(data.gainers.slice(0, 5).map((m) => m.symbol)));
-      setSelectedLosers(new Set(data.losers.slice(0, 5).map((m) => m.symbol)));
+      // Auto-select those with 2+ consecutive days trend
+      setSelectedGainers(
+        new Set(
+          data.gainers
+            .filter((m) => (m.consecutiveDays || 0) >= 2)
+            .slice(0, 5)
+            .map((m) => m.symbol)
+        )
+      );
+      setSelectedLosers(
+        new Set(
+          data.losers
+            .filter((m) => (m.consecutiveDays || 0) >= 2)
+            .slice(0, 5)
+            .map((m) => m.symbol)
+        )
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to fetch movers");
     } finally {
@@ -120,6 +136,8 @@ export default function ReversalPage() {
       direction: "LONG" | "SHORT";
       day_change_pct: number;
       entry_price: number;
+      consecutive_days?: number;
+      cumulative_change_pct?: number;
     }> = [];
 
     // Losers -> LONG (buy expecting reversal up)
@@ -130,6 +148,8 @@ export default function ReversalPage() {
           direction: "LONG",
           day_change_pct: loser.changePct,
           entry_price: loser.price,
+          consecutive_days: loser.consecutiveDays,
+          cumulative_change_pct: loser.cumulativeChangePct,
         });
       }
     }
@@ -142,6 +162,8 @@ export default function ReversalPage() {
           direction: "SHORT",
           day_change_pct: gainer.changePct,
           entry_price: gainer.price,
+          consecutive_days: gainer.consecutiveDays,
+          cumulative_change_pct: gainer.cumulativeChangePct,
         });
       }
     }
@@ -261,6 +283,19 @@ export default function ReversalPage() {
     setter(newSet);
   };
 
+  const syncSurveillance = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch("/api/surveillance/sync");
+      if (!response.ok) throw new Error("Sync failed");
+      await loadCohorts();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Sync failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -272,6 +307,9 @@ export default function ReversalPage() {
           </p>
         </div>
         <div className="flex gap-2">
+          <Button variant="outline" onClick={syncSurveillance} disabled={loading}>
+            {loading ? "Syncing..." : "Sync Surveillance"}
+          </Button>
           <Button variant="secondary" onClick={() => setShowSettings(!showSettings)}>
             Settings
           </Button>
@@ -369,7 +407,7 @@ export default function ReversalPage() {
       {movers && (
         <Card>
           <CardHeader>
-            <CardTitle>Select Stocks for Today's Cohort</CardTitle>
+            <CardTitle>{"Select Stocks for Today's Cohort"}</CardTitle>
             <CardDescription>
               Fetched at {new Date(movers.timestamp).toLocaleTimeString()}. Select up to 5
               from each list.
@@ -383,7 +421,7 @@ export default function ReversalPage() {
                   Top Losers → Buy (LONG)
                 </h3>
                 <div className="space-y-1">
-                  {movers.losers.slice(0, 10).map((mover) => (
+                  {movers.losers.map((mover) => (
                     <div
                       key={mover.symbol}
                       className={`flex cursor-pointer items-center justify-between rounded-md border p-2 text-sm transition-colors ${
@@ -395,14 +433,28 @@ export default function ReversalPage() {
                         toggleSelection(mover.symbol, selectedLosers, setSelectedLosers)
                       }
                     >
-                      <div>
-                        <span className="font-medium">{mover.symbol}</span>
-                        <span className="ml-2 text-xs text-zinc-500">{mover.name}</span>
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">{mover.symbol}</span>
+                          {mover.consecutiveDays && mover.consecutiveDays >= 2 && (
+                            <Badge variant="outline" className="border-red-200 bg-red-50 text-[10px] text-red-700">
+                              {mover.consecutiveDays}D Trend
+                            </Badge>
+                          )}
+                        </div>
+                        <span className="text-xs text-zinc-500 truncate max-w-[150px]">{mover.name}</span>
                       </div>
                       <div className="text-right">
                         <div className="font-mono">${mover.price.toFixed(2)}</div>
-                        <div className="text-xs text-red-600">
-                          {mover.changePct.toFixed(2)}%
+                        <div className="flex flex-col items-end">
+                          <span className="text-xs text-red-600 font-medium">
+                            {mover.changePct.toFixed(2)}%
+                          </span>
+                          {mover.cumulativeChangePct && (
+                            <span className="text-[10px] text-zinc-400">
+                              Total: {mover.cumulativeChangePct.toFixed(1)}%
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -416,7 +468,7 @@ export default function ReversalPage() {
                   Top Gainers → Sell (SHORT)
                 </h3>
                 <div className="space-y-1">
-                  {movers.gainers.slice(0, 10).map((mover) => (
+                  {movers.gainers.map((mover) => (
                     <div
                       key={mover.symbol}
                       className={`flex cursor-pointer items-center justify-between rounded-md border p-2 text-sm transition-colors ${
@@ -428,14 +480,28 @@ export default function ReversalPage() {
                         toggleSelection(mover.symbol, selectedGainers, setSelectedGainers)
                       }
                     >
-                      <div>
-                        <span className="font-medium">{mover.symbol}</span>
-                        <span className="ml-2 text-xs text-zinc-500">{mover.name}</span>
+                      <div className="flex flex-col">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">{mover.symbol}</span>
+                          {mover.consecutiveDays && mover.consecutiveDays >= 2 && (
+                            <Badge variant="outline" className="border-emerald-200 bg-emerald-50 text-[10px] text-emerald-700">
+                              {mover.consecutiveDays}D Trend
+                            </Badge>
+                          )}
+                        </div>
+                        <span className="text-xs text-zinc-500 truncate max-w-[150px]">{mover.name}</span>
                       </div>
                       <div className="text-right">
                         <div className="font-mono">${mover.price.toFixed(2)}</div>
-                        <div className="text-xs text-emerald-600">
-                          +{mover.changePct.toFixed(2)}%
+                        <div className="flex flex-col items-end">
+                          <span className="text-xs text-emerald-600 font-medium">
+                            +{mover.changePct.toFixed(2)}%
+                          </span>
+                          {mover.cumulativeChangePct && (
+                            <span className="text-[10px] text-zinc-400">
+                              Total: +{mover.cumulativeChangePct.toFixed(1)}%
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -449,7 +515,7 @@ export default function ReversalPage() {
                 Selected: {selectedLosers.size} longs + {selectedGainers.size} shorts ={" "}
                 {selectedLosers.size + selectedGainers.size} positions
               </div>
-              <Button onClick={createCohort}>Create Today's Cohort</Button>
+              <Button onClick={createCohort}>{"Create Today's Cohort"}</Button>
             </div>
           </CardContent>
         </Card>
@@ -493,17 +559,10 @@ export default function ReversalPage() {
                         <thead>
                           <tr className="border-b text-left text-xs text-zinc-500">
                             <th className="py-2">Symbol</th>
+                            <th>Trend</th>
                             <th>Direction</th>
                             <th>Entry</th>
-                            <th>D1 AM</th>
-                            <th>D1 Mid</th>
-                            <th>D1 PM</th>
-                            <th>D2 AM</th>
-                            <th>D2 Mid</th>
-                            <th>D2 PM</th>
-                            <th>D3 AM</th>
-                            <th>D3 Mid</th>
-                            <th>D3 PM</th>
+                            <th>Progress (10 Days / 30 pts)</th>
                             <th>P&L</th>
                             <th></th>
                           </tr>
@@ -511,12 +570,34 @@ export default function ReversalPage() {
                         <tbody>
                           {entries.map((entry) => {
                             const pnl = calculateEntryPnL(entry, settings);
+                            const points = [];
+                            for(let d=1; d<=10; d++) {
+                              points.push(entry[`d${d}_morning` as keyof ReversalEntry] ? 1 : 0);
+                              points.push(entry[`d${d}_midday` as keyof ReversalEntry] ? 1 : 0);
+                              points.push(entry[`d${d}_close` as keyof ReversalEntry] ? 1 : 0);
+                            }
+                            const completedPoints = points.reduce((a, b) => a + b, 0);
+
                             return (
                               <tr
                                 key={entry.id}
                                 className="border-b last:border-0 hover:bg-zinc-50"
                               >
                                 <td className="py-2 font-medium">{entry.symbol}</td>
+                                <td>
+                                  {entry.consecutive_days ? (
+                                    <div className="flex flex-col">
+                                      <span className="text-xs font-medium">{entry.consecutive_days}D</span>
+                                      {entry.cumulative_change_pct && (
+                                        <span className="text-[10px] text-zinc-500">
+                                          {entry.cumulative_change_pct > 0 ? "+" : ""}{entry.cumulative_change_pct.toFixed(1)}%
+                                        </span>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <span className="text-zinc-300">—</span>
+                                  )}
+                                </td>
                                 <td>
                                   <Badge
                                     className={
@@ -528,43 +609,25 @@ export default function ReversalPage() {
                                     {entry.direction}
                                   </Badge>
                                 </td>
-                                <td className="font-mono">
+                                <td className="font-mono text-xs">
                                   ${entry.entry_price.toFixed(2)}
                                 </td>
-                                {MEASUREMENT_FIELDS.map((field) => (
-                                  <td key={field} className="px-1">
-                                    {entry[field] !== null ? (
-                                      <span className="font-mono text-xs">
-                                        ${entry[field]!.toFixed(2)}
-                                      </span>
-                                    ) : editingEntry === entry.id ? (
-                                      <div className="flex gap-1">
-                                        <Input
-                                          type="number"
-                                          step="0.01"
-                                          className="h-6 w-16 text-xs"
-                                          value={
-                                            measurementInputs[`${entry.id}-${field}`] || ""
-                                          }
-                                          onChange={(e) =>
-                                            setMeasurementInputs((prev) => ({
-                                              ...prev,
-                                              [`${entry.id}-${field}`]: e.target.value,
-                                            }))
-                                          }
-                                          onKeyDown={(e) => {
-                                            if (e.key === "Enter") {
-                                              updateMeasurement(entry.id, field);
-                                            }
-                                          }}
-                                          placeholder="$"
+                                <td>
+                                  <div className="flex flex-col gap-1">
+                                    <div className="flex gap-0.5">
+                                      {points.map((pt, i) => (
+                                        <div 
+                                          key={i} 
+                                          className={`h-1.5 w-1 rounded-full ${pt ? 'bg-emerald-500' : 'bg-zinc-200'}`}
+                                          title={`Point ${i+1}`}
                                         />
-                                      </div>
-                                    ) : (
-                                      <span className="text-zinc-300">—</span>
-                                    )}
-                                  </td>
-                                ))}
+                                      ))}
+                                    </div>
+                                    <span className="text-[10px] text-zinc-400">
+                                      {completedPoints}/30 points tracked
+                                    </span>
+                                  </div>
+                                </td>
                                 <td className="px-1">
                                   {pnl ? (
                                     <span
@@ -580,34 +643,15 @@ export default function ReversalPage() {
                                     <span className="text-zinc-300">—</span>
                                   )}
                                 </td>
-                                <td className="px-1">
+                                <td className="px-1 text-right">
                                   {entry.status === "ACTIVE" ? (
-                                    <div className="flex gap-1">
-                                      {editingEntry === entry.id ? (
-                                        <Button
-                                          variant="secondary"
-                                          className="h-6 px-2 text-xs"
-                                          onClick={() => setEditingEntry(null)}
-                                        >
-                                          Done
-                                        </Button>
-                                      ) : (
-                                        <Button
-                                          variant="secondary"
-                                          className="h-6 px-2 text-xs"
-                                          onClick={() => setEditingEntry(entry.id)}
-                                        >
-                                          Edit
-                                        </Button>
-                                      )}
-                                      <Button
-                                        variant="secondary"
-                                        className="h-6 px-2 text-xs"
-                                        onClick={() => markCompleted(entry.id)}
-                                      >
-                                        Close
-                                      </Button>
-                                    </div>
+                                    <Button
+                                      variant="secondary"
+                                      className="h-6 px-2 text-xs"
+                                      onClick={() => markCompleted(entry.id)}
+                                    >
+                                      Close
+                                    </Button>
                                   ) : (
                                     <Badge className="border-zinc-200 bg-zinc-100 text-zinc-600">
                                       Closed
@@ -632,7 +676,7 @@ export default function ReversalPage() {
         <Card>
           <CardContent className="py-12 text-center">
             <div className="text-zinc-500">
-              No cohorts yet. Click "Fetch Today's Movers" to start tracking.
+              {"No cohorts yet. Click \"Fetch Today's Movers\" to start tracking."}
             </div>
           </CardContent>
         </Card>

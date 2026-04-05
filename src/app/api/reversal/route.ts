@@ -51,6 +51,8 @@ export async function GET(req: Request) {
         direction: row.direction as "LONG" | "SHORT",
         day_change_pct: Number(row.day_change_pct),
         entry_price: Number(row.entry_price),
+        consecutive_days: row.consecutive_days ? Number(row.consecutive_days) : undefined,
+        cumulative_change_pct: row.cumulative_change_pct ? Number(row.cumulative_change_pct) : undefined,
         d1_morning: row.d1_morning ? Number(row.d1_morning) : null,
         d1_midday: row.d1_midday ? Number(row.d1_midday) : null,
         d1_close: row.d1_close ? Number(row.d1_close) : null,
@@ -83,20 +85,25 @@ export async function POST(req: Request) {
     const body = await req.json();
     const { cohort_date, entries } = body;
 
-    if (!cohort_date || !Array.isArray(entries) || entries.length === 0) {
-      return NextResponse.json(
-        { error: "cohort_date and entries array required." },
-        { status: 400 }
-      );
+    const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+    if (!cohort_date || !DATE_REGEX.test(cohort_date)) {
+      return NextResponse.json({ error: "cohort_date must be YYYY-MM-DD." }, { status: 400 });
+    }
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return NextResponse.json({ error: "entries array required." }, { status: 400 });
     }
 
-    // Validate entries
+    const VALID_DIRECTIONS = ["LONG", "SHORT"];
     for (const entry of entries) {
-      if (!entry.symbol || !entry.direction || entry.entry_price === undefined) {
-        return NextResponse.json(
-          { error: "Each entry needs symbol, direction, and entry_price." },
-          { status: 400 }
-        );
+      if (!entry.symbol || typeof entry.symbol !== "string") {
+        return NextResponse.json({ error: "Each entry needs a symbol string." }, { status: 400 });
+      }
+      if (!VALID_DIRECTIONS.includes(entry.direction)) {
+        return NextResponse.json({ error: "direction must be LONG or SHORT." }, { status: 400 });
+      }
+      const price = Number(entry.entry_price);
+      if (!isFinite(price) || price <= 0) {
+        return NextResponse.json({ error: "entry_price must be a positive number." }, { status: 400 });
       }
     }
 
@@ -104,18 +111,22 @@ export async function POST(req: Request) {
     const insertedIds: number[] = [];
     for (const entry of entries) {
       const [result] = await pool.execute<mysql.ResultSetHeader>(
-        `INSERT INTO reversal_entries (cohort_date, symbol, direction, day_change_pct, entry_price, status)
-         VALUES (?, ?, ?, ?, ?, 'ACTIVE')
+        `INSERT INTO reversal_entries (cohort_date, symbol, direction, day_change_pct, entry_price, consecutive_days, cumulative_change_pct, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
          ON DUPLICATE KEY UPDATE
            direction = VALUES(direction),
            day_change_pct = VALUES(day_change_pct),
-           entry_price = VALUES(entry_price)`,
+           entry_price = VALUES(entry_price),
+           consecutive_days = VALUES(consecutive_days),
+           cumulative_change_pct = VALUES(cumulative_change_pct)`,
         [
           cohort_date,
           entry.symbol.toUpperCase(),
           entry.direction,
           entry.day_change_pct || 0,
           entry.entry_price,
+          entry.consecutive_days ?? null,
+          entry.cumulative_change_pct ?? null,
         ]
       );
       insertedIds.push(result.insertId || 0);

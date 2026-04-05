@@ -125,8 +125,7 @@ export default function SignalsPage() {
 
           {!lastRefresh && !loading && (
             <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-4 text-center text-sm text-zinc-600">
-              Click "Refresh Signals" to scan for active trading signals across all
-              downloaded tickers and preset strategies.
+              {"Click \"Refresh Signals\" to scan for active trading signals across all downloaded tickers and preset strategies."}
             </div>
           )}
 

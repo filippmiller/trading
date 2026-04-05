@@ -1,4 +1,4 @@
-import { PriceBar } from "@/lib/backtest";
+import { PriceBar, calculateMAs, isSignalAllowedByRegime } from "@/lib/backtest";
 import { StrategySpec } from "@/lib/strategy";
 
 export type Signal = {
@@ -8,31 +8,6 @@ export type Signal = {
   template: string;
   symbol: string;
 };
-
-function calculateMAs(prices: PriceBar[], length: number): Array<number | null> {
-  const ma: Array<number | null> = Array(prices.length).fill(null);
-  let sum = 0;
-  for (let i = 0; i < prices.length; i++) {
-    sum += prices[i].close;
-    if (i >= length) sum -= prices[i - length].close;
-    if (i >= length - 1) {
-      ma[i] = sum / length;
-    }
-  }
-  return ma;
-}
-
-function isSignalAllowedByRegime(
-  spec: StrategySpec,
-  close: number,
-  ma: number | null,
-  side: "LONG" | "SHORT"
-): boolean {
-  if (!spec.regime_filter || !ma) return true;
-  if (close > ma && side === "SHORT") return false;
-  if (close < ma && side === "LONG") return false;
-  return true;
-}
 
 /**
  * Check if the latest bar would trigger an entry signal for the given strategy spec.

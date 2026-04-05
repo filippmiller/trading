@@ -70,8 +70,7 @@ export function StrategyChat({ currentSpec, onSpecUpdate }: Props) {
     <div className="space-y-3">
       <div className="text-sm font-medium text-zinc-700">Refine with AI</div>
       <div className="text-xs text-zinc-500">
-        Ask to modify the strategy: "increase stop loss to 1%", "add trailing stop",
-        "use 3-day streak instead of 2"
+        {"Ask to modify the strategy: \"increase stop loss to 1%\", \"add trailing stop\", \"use 3-day streak instead of 2\""}
       </div>
 
       {messages.length > 0 && (

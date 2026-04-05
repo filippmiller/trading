@@ -52,8 +52,7 @@ export function BacktestCritique({ runId }: Props) {
         )}
         {!critique && !loading && !error && (
           <div className="text-sm text-zinc-500">
-            Click the button above to generate an AI analysis of this backtest's performance,
-            including insights on win rate, drawdown patterns, and potential improvements.
+            {"Click the button above to generate an AI analysis of this backtest's performance, including insights on win rate, drawdown patterns, and potential improvements."}
           </div>
         )}
         {loading && (

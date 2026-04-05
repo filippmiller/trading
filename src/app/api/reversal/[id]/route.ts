@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { getPool, mysql } from "@/lib/db";
-import { MEASUREMENT_FIELDS, MeasurementField } from "@/lib/reversal";
+import { MEASUREMENT_FIELDS } from "@/lib/reversal";
 
 // PATCH - Update a reversal entry (add measurement prices)
 export async function PATCH(
@@ -23,16 +23,29 @@ export async function PATCH(
     const updates: string[] = [];
     const values: (number | string | null)[] = [];
 
-    // Handle measurement fields
+    // Handle measurement fields (MEASUREMENT_FIELDS is a hardcoded const, safe to interpolate)
     for (const field of MEASUREMENT_FIELDS) {
       if (body[field] !== undefined) {
-        updates.push(`${field} = ?`);
-        values.push(body[field] === null ? null : Number(body[field]));
+        if (body[field] !== null) {
+          const v = Number(body[field]);
+          if (isNaN(v) || v < 0) {
+            return NextResponse.json({ error: `${field} must be a non-negative number.` }, { status: 400 });
+          }
+          updates.push(`${field} = ?`);
+          values.push(v);
+        } else {
+          updates.push(`${field} = ?`);
+          values.push(null);
+        }
       }
     }
 
     // Handle status update
     if (body.status) {
+      const ALLOWED_STATUSES = ["ACTIVE", "COMPLETED"];
+      if (!ALLOWED_STATUSES.includes(body.status)) {
+        return NextResponse.json({ error: "Invalid status value." }, { status: 400 });
+      }
       updates.push("status = ?");
       values.push(body.status);
     }

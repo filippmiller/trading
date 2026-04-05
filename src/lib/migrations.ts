@@ -86,17 +86,40 @@ const schemaStatements = [
     INDEX IX_reversal_status (status),
     INDEX IX_reversal_cohort (cohort_date)
   ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS surveillance_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    finished_at DATETIME(6) NULL,
+    status VARCHAR(16) NOT NULL, -- 'RUNNING', 'SUCCESS', 'PARTIAL', 'FAILED'
+    stats_json LONGTEXT NULL, -- JSON with counts: enrolled, updated, failed
+    error_message LONGTEXT NULL
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS surveillance_failures (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    entry_id INT NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    field_name VARCHAR(32) NOT NULL, -- e.g. 'd3_morning'
+    error_message TEXT NULL,
+    retry_count INT DEFAULT 0,
+    last_attempt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR(16) DEFAULT 'PENDING', -- 'PENDING', 'FAILED', 'GAVE_UP'
+    INDEX IX_fail_entry (entry_id),
+    CONSTRAINT FK_fail_reversal FOREIGN KEY (entry_id) REFERENCES reversal_entries(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB;`,
 ];
 
+const ALLOWED_TABLES = new Set(["strategy_runs", "run_metrics", "reversal_entries"]);
+const COLUMN_REGEX = /^[a-z_][a-z0-9_]{0,63}$/;
+
 async function ensureColumn(table: string, column: string, definition: string) {
+  if (!ALLOWED_TABLES.has(table)) throw new Error(`ensureColumn: unknown table '${table}'`);
+  if (!COLUMN_REGEX.test(column)) throw new Error(`ensureColumn: invalid column '${column}'`);
   const pool = await getPool();
-  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT COUNT(*) as count FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
-    [table, column]
-  );
-  const count = Number(rows[0]?.count ?? 0);
-  if (count === 0) {
-    await pool.execute(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+  try {
+    await pool.execute(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
+  } catch (err: unknown) {
+    // 1060 = Duplicate column name — safe to ignore (handles concurrent requests)
+    if ((err as { errno?: number }).errno !== 1060) throw err;
   }
 }
 
@@ -106,11 +129,12 @@ export async function ensureSchema() {
     await pool.execute(statement);
   }
   await ensureColumn("strategy_runs", "preset_name", "preset_name VARCHAR(64) NULL");
-  await ensureColumn(
-    "run_metrics",
-    "martingale_step_escalations",
-    "martingale_step_escalations INT NOT NULL DEFAULT 0"
-  );
+  // Add 10-day tracking columns
+  for (let d = 1; d <= 10; d++) {
+    await ensureColumn("reversal_entries", `d${d}_morning`, "DECIMAL(18,6) NULL");
+    await ensureColumn("reversal_entries", `d${d}_midday`, "DECIMAL(18,6) NULL");
+    await ensureColumn("reversal_entries", `d${d}_close`, "DECIMAL(18,6) NULL");
+  }
 }
 
 export async function ensureDefaultSettings() {

@@ -19,6 +19,8 @@ export type ReversalEntry = {
   direction: "LONG" | "SHORT"; // LONG = was a loser (buy), SHORT = was a gainer (sell)
   day_change_pct: number; // How much it moved on the trigger day
   entry_price: number; // Price at entry (5 min before close)
+  consecutive_days?: number;
+  cumulative_change_pct?: number;
 
   // Measurement grid: 3 days × 3 times = 9 cells
   // Day 1 (next day after entry)
@@ -54,38 +56,21 @@ export function calculateEntryPnL(
   entry: ReversalEntry,
   settings: ReversalSettings
 ): { pnl_usd: number; pnl_pct: number; gross_pnl: number; costs: number } | null {
-  // Use the last available price as exit price
-  const exitPrice =
-    entry.d3_close ??
-    entry.d3_midday ??
-    entry.d3_morning ??
-    entry.d2_close ??
-    entry.d2_midday ??
-    entry.d2_morning ??
-    entry.d1_close ??
-    entry.d1_midday ??
-    entry.d1_morning;
+  // Use the last available price as exit price (scanning backwards from Day 10)
+  let exitPrice: number | null = null;
+  let daysHeld = 1;
 
-  if (!exitPrice) return null;
-
-  const positionValue = settings.position_size_usd * settings.leverage_multiplier;
-  const shares = positionValue / entry.entry_price;
-
-  // Gross P&L
-  let grossPnl: number;
-  if (entry.direction === "LONG") {
-    grossPnl = (exitPrice - entry.entry_price) * shares;
-  } else {
-    grossPnl = (entry.entry_price - exitPrice) * shares;
+  for (let d = 10; d >= 1; d--) {
+    const close = entry[`d${d}_close` as keyof ReversalEntry] as number | null;
+    const midday = entry[`d${d}_midday` as keyof ReversalEntry] as number | null;
+    const morning = entry[`d${d}_morning` as keyof ReversalEntry] as number | null;
+    
+    if (close !== null) { exitPrice = close; daysHeld = d; break; }
+    if (midday !== null) { exitPrice = midday; daysHeld = d; break; }
+    if (morning !== null) { exitPrice = morning; daysHeld = d; break; }
   }
 
-  // Costs
-  const commissions = settings.commission_per_trade_usd * 2; // Entry + exit
-
-  // Days held (estimate based on which measurements exist)
-  let daysHeld = 1;
-  if (entry.d2_morning !== null) daysHeld = 2;
-  if (entry.d3_morning !== null) daysHeld = 3;
+  if (exitPrice == null) return null;
 
   // Borrow cost for shorts
   let borrowCost = 0;

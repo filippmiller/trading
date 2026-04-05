@@ -19,14 +19,9 @@ function parseCsv(csv: string): PriceRow[] {
     if (!line) continue;
     const [date, open, high, low, close, volume] = line.split(",");
     if (!date || date === "Date") continue;
-    rows.push({
-      date,
-      open: Number(open),
-      high: Number(high),
-      low: Number(low),
-      close: Number(close),
-      volume: Number(volume),
-    });
+    const o = Number(open), h = Number(high), l = Number(low), c = Number(close), v = Number(volume);
+    if (isNaN(o) || isNaN(h) || isNaN(l) || isNaN(c) || isNaN(v) || c <= 0) continue;
+    rows.push({ date, open: o, high: h, low: l, close: c, volume: v });
   }
   return rows;
 }
@@ -93,9 +88,9 @@ export async function loadPrices(lookbackDays: number, symbol: string) {
   const normalized = normalizeSymbol(symbol);
   const pool = await getPool();
   const limit = Math.min(260, Math.max(1, Math.floor(lookbackDays)));
-  const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT date, open, high, low, close, volume FROM prices_daily WHERE symbol = ? ORDER BY date DESC LIMIT ${limit}`,
-    [normalized]
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT date, open, high, low, close, volume FROM prices_daily WHERE symbol = ? ORDER BY date DESC LIMIT ?",
+    [normalized, limit]
   );
   return rows
     .map((row) => ({
