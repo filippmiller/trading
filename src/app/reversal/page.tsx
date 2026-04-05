@@ -184,7 +184,7 @@ export default function ReversalDashboard() {
         {(view === 'active' ? activeGroups : historyGroups).map(([date, entries]) => (
           <div key={date} className="space-y-3">
             <div className="flex items-center gap-3 px-1">
-              <Badge variant="outline" className="bg-white text-zinc-500 font-mono">
+              <Badge className="bg-white text-zinc-500 font-mono border-zinc-200">
                 {date}
               </Badge>
               <div className="h-px flex-1 bg-zinc-100" />
@@ -247,7 +247,7 @@ function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings:
           <div>
             <div className="flex items-center gap-2">
               <h3 className="text-lg font-bold text-zinc-900">{entry.symbol}</h3>
-              <Badge variant="outline" className="text-[10px] font-mono border-zinc-200">
+              <Badge className="text-[10px] font-mono border-zinc-200 bg-white">
                 {entry.consecutive_days}D Trend
               </Badge>
             </div>

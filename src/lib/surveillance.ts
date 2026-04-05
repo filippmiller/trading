@@ -156,7 +156,6 @@ export async function syncActiveSurveillance() {
   );
 
   const [logResult] = await pool.execute<mysql.ResultSetHeader>(
-...
     "INSERT INTO surveillance_logs (status) VALUES ('RUNNING')"
   );
   const logId = logResult.insertId;

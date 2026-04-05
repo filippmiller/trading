@@ -71,6 +71,21 @@ export function calculateEntryPnL(
   }
 
   if (exitPrice == null) return null;
+  if (!entry.entry_price || entry.entry_price === 0) return null;
+
+  const positionValue = settings.position_size_usd * settings.leverage_multiplier;
+  const shares = positionValue / entry.entry_price;
+
+  // Gross P&L
+  let grossPnl: number;
+  if (entry.direction === "LONG") {
+    grossPnl = (exitPrice - entry.entry_price) * shares;
+  } else {
+    grossPnl = (entry.entry_price - exitPrice) * shares;
+  }
+
+  // Costs
+  const commissions = settings.commission_per_trade_usd * 2; // Entry + exit
 
   // Borrow cost for shorts
   let borrowCost = 0;
