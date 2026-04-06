@@ -128,7 +128,9 @@ export async function ensureSchema() {
   for (const statement of schemaStatements) {
     await pool.execute(statement);
   }
-  await ensureColumn("strategy_runs", "preset_name", "preset_name VARCHAR(64) NULL");
+  await ensureColumn("strategy_runs", "preset_name", "VARCHAR(64) NULL");
+  await ensureColumn("reversal_entries", "consecutive_days", "INT NULL");
+  await ensureColumn("reversal_entries", "cumulative_change_pct", "DECIMAL(10,4) NULL");
   // Add 10-day tracking columns
   for (let d = 1; d <= 10; d++) {
     await ensureColumn("reversal_entries", `d${d}_morning`, "DECIMAL(18,6) NULL");
