@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState, useMemo } from "react";
 import { 
   Activity, 
   ArrowUpCircle, 
@@ -38,6 +38,9 @@ export default function ReversalDashboard() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<'active' | 'history'>('active');
+  const [displayMode, setViewMode] = useState<'cards' | 'matrix'>('cards');
+
+  // ... (rest of loadData and runSync)
 
   useEffect(() => {
     loadData();
@@ -157,19 +160,36 @@ export default function ReversalDashboard() {
       </div>
 
       {/* Navigation Tabs */}
-      <div className="flex gap-1 bg-zinc-100 p-1 rounded-xl w-fit">
-        <button 
-          onClick={() => setView('active')}
-          className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'active' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
-        >
-          Live Surveillance
-        </button>
-        <button 
-          onClick={() => setView('history')}
-          className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'history' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
-        >
-          Historical Audit
-        </button>
+      <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
+        <div className="flex gap-1 bg-zinc-100 p-1 rounded-xl w-fit">
+          <button 
+            onClick={() => setView('active')}
+            className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'active' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
+          >
+            Live Surveillance
+          </button>
+          <button 
+            onClick={() => setView('history')}
+            className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'history' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
+          >
+            Historical Audit
+          </button>
+        </div>
+
+        <div className="flex gap-1 bg-zinc-100 p-1 rounded-xl w-fit">
+          <button 
+            onClick={() => setViewMode('cards')}
+            className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${displayMode === 'cards' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500'}`}
+          >
+            Card Feed
+          </button>
+          <button 
+            onClick={() => setViewMode('matrix')}
+            className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${displayMode === 'matrix' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500'}`}
+          >
+            Analytics Matrix
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -181,22 +201,29 @@ export default function ReversalDashboard() {
 
       {/* Main Content Feed */}
       <div className="space-y-6">
-        {(view === 'active' ? activeGroups : historyGroups).map(([date, entries]) => (
-          <div key={date} className="space-y-3">
-            <div className="flex items-center gap-3 px-1">
-              <Badge className="bg-white text-zinc-500 font-mono border-zinc-200">
-                {date}
-              </Badge>
-              <div className="h-px flex-1 bg-zinc-100" />
-            </div>
+        {displayMode === 'matrix' ? (
+          <SurveillanceMatrix 
+            entries={(view === 'active' ? activeGroups : historyGroups).flatMap(([, e]) => e)} 
+            settings={settings} 
+          />
+        ) : (
+          (view === 'active' ? activeGroups : historyGroups).map(([date, entries]) => (
+            <div key={date} className="space-y-3">
+              <div className="flex items-center gap-3 px-1">
+                <Badge className="bg-white text-zinc-500 font-mono border-zinc-200">
+                  {date}
+                </Badge>
+                <div className="h-px flex-1 bg-zinc-100" />
+              </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {entries.map(entry => (
-                <SurveillanceCard key={entry.id} entry={entry} settings={settings} />
-              ))}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {entries.map(entry => (
+                  <SurveillanceCard key={entry.id} entry={entry} settings={settings} />
+                ))}
+              </div>
             </div>
-          </div>
-        ))}
+          ))
+        )}
 
         {(view === 'active' ? activeGroups : historyGroups).length === 0 && (
           <div className="py-20 text-center border-2 border-dashed rounded-3xl bg-zinc-50/50">
@@ -235,7 +262,6 @@ function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings:
     points.push(entry[`d${d}_close` as keyof ReversalEntry] ? 1 : 0);
   }
   const completedPoints = points.reduce((a, b) => a + b, 0);
-  const progressPercent = (completedPoints / 30) * 100;
 
   return (
     <Card className="overflow-hidden border-none shadow-sm ring-1 ring-zinc-200/50 hover:ring-zinc-300 transition-all">
@@ -268,7 +294,6 @@ function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings:
       </div>
 
       <div className="px-5 pb-5 space-y-4">
-        {/* Progress Grid */}
         <div className="space-y-2">
           <div className="flex justify-between items-end">
             <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Surveillance Progress</span>
@@ -284,7 +309,6 @@ function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings:
           </div>
         </div>
 
-        {/* Trade Details */}
         <div className="grid grid-cols-3 gap-2 bg-zinc-50 p-3 rounded-xl border border-zinc-100">
           <div>
             <p className="text-[9px] text-zinc-400 uppercase font-bold">Entry</p>
@@ -301,5 +325,77 @@ function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings:
         </div>
       </div>
     </Card>
+  );
+}
+
+function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], settings: any }) {
+  return (
+    <Card className="border-none shadow-xl ring-1 ring-zinc-200/50 overflow-hidden">
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse">
+          <thead>
+            <tr className="bg-zinc-50 border-b border-zinc-100">
+              <th className="sticky left-0 z-10 bg-zinc-50 p-4 text-left text-[10px] font-bold text-zinc-400 uppercase tracking-widest border-r border-zinc-100">Ticker</th>
+              <th className="sticky left-[88px] z-10 bg-zinc-50 p-4 text-left text-[10px] font-bold text-zinc-400 uppercase tracking-widest border-r border-zinc-100">Entry</th>
+              {Array.from({ length: 10 }).map((_, d) => (
+                <th key={d} colSpan={3} className="p-2 text-center text-[10px] font-bold text-zinc-400 uppercase tracking-widest border-r border-zinc-100 last:border-r-0">
+                  Day {d + 1}
+                </th>
+              ))}
+            </tr>
+            <tr className="bg-zinc-50/50 border-b border-zinc-100">
+              <th className="sticky left-0 z-10 bg-zinc-50/50 border-r border-zinc-100" />
+              <th className="sticky left-[88px] z-10 bg-zinc-50/50 border-r border-zinc-100" />
+              {Array.from({ length: 10 }).map((_, d) => (
+                <React.Fragment key={d}>
+                  <th className="p-1 text-[8px] font-bold text-zinc-400">AM</th>
+                  <th className="p-1 text-[8px] font-bold text-zinc-400">MID</th>
+                  <th className="p-1 text-[8px] font-bold text-zinc-400 border-r border-zinc-100">PM</th>
+                </React.Fragment>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map((entry) => (
+              <tr key={entry.id} className="hover:bg-zinc-50/50 transition-colors border-b border-zinc-50 last:border-0">
+                <td className="sticky left-0 z-10 bg-white p-4 font-bold text-sm border-r border-zinc-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
+                  <div className="flex flex-col">
+                    <span>{entry.symbol}</span>
+                    <span className={`text-[8px] ${entry.direction === 'LONG' ? 'text-emerald-600' : 'text-rose-600'}`}>{entry.direction}</span>
+                  </div>
+                </td>
+                <td className="sticky left-[88px] z-10 bg-white p-4 font-mono text-xs border-r border-zinc-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
+                  ${entry.entry_price.toFixed(2)}
+                </td>
+                {Array.from({ length: 10 }).map((_, d) => (
+                  <React.Fragment key={d}>
+                    <MatrixCell entry={entry} field={`d${d+1}_morning`} />
+                    <MatrixCell entry={entry} field={`d${d+1}_midday`} />
+                    <MatrixCell entry={entry} field={`d${d+1}_close`} isLast />
+                  </React.Fragment>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  );
+}
+
+function MatrixCell({ entry, field, isLast }: { entry: ReversalEntry, field: string, isLast?: boolean }) {
+  const price = entry[field as keyof ReversalEntry] as number | null;
+  if (!price) return <td className={`p-2 text-center text-zinc-200 font-mono text-[10px] ${isLast ? 'border-r border-zinc-100' : ''}`}>—</td>;
+
+  const isProfit = entry.direction === 'LONG' ? price > entry.entry_price : price < entry.entry_price;
+  const change = ((price - entry.entry_price) / entry.entry_price) * 100 * (entry.direction === 'SHORT' ? -1 : 1);
+
+  return (
+    <td className={`p-2 text-center font-mono text-[10px] transition-all ${isProfit ? 'bg-emerald-50/50 text-emerald-700 font-bold' : 'bg-rose-50/50 text-rose-700'} ${isLast ? 'border-r border-zinc-100' : ''}`}>
+      <div className="flex flex-col">
+        <span>${price.toFixed(2)}</span>
+        <span className="text-[8px] opacity-70">{change > 0 ? '+' : ''}{change.toFixed(1)}%</span>
+      </div>
+    </td>
   );
 }
