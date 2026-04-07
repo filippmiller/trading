@@ -22,19 +22,17 @@ export type ReversalEntry = {
   consecutive_days?: number;
   cumulative_change_pct?: number;
 
-  // Measurement grid: 3 days × 3 times = 9 cells
-  // Day 1 (next day after entry)
-  d1_morning: number | null;
-  d1_midday: number | null;
-  d1_close: number | null;
-  // Day 2
-  d2_morning: number | null;
-  d2_midday: number | null;
-  d2_close: number | null;
-  // Day 3
-  d3_morning: number | null;
-  d3_midday: number | null;
-  d3_close: number | null;
+  // Measurement grid: 10 days × 3 times = 30 cells
+  d1_morning: number | null; d1_midday: number | null; d1_close: number | null;
+  d2_morning: number | null; d2_midday: number | null; d2_close: number | null;
+  d3_morning: number | null; d3_midday: number | null; d3_close: number | null;
+  d4_morning: number | null; d4_midday: number | null; d4_close: number | null;
+  d5_morning: number | null; d5_midday: number | null; d5_close: number | null;
+  d6_morning: number | null; d6_midday: number | null; d6_close: number | null;
+  d7_morning: number | null; d7_midday: number | null; d7_close: number | null;
+  d8_morning: number | null; d8_midday: number | null; d8_close: number | null;
+  d9_morning: number | null; d9_midday: number | null; d9_close: number | null;
+  d10_morning: number | null; d10_midday: number | null; d10_close: number | null;
 
   // Computed when all measurements are in
   final_pnl_usd: number | null;

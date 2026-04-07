@@ -37,8 +37,7 @@ export default function ReversalDashboard() {
   const [settings, setSettings] = useState<ReversalSettings>(DEFAULT_SETTINGS);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<'active' | 'history'>('active');
-  const [displayMode, setViewMode] = useState<'cards' | 'matrix'>('cards');
+  const [view, setView] = useState<'active' | 'history' | 'matrix'>('active');
 
   // ... (rest of loadData and runSync)
 
@@ -160,36 +159,25 @@ export default function ReversalDashboard() {
       </div>
 
       {/* Navigation Tabs */}
-      <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
-        <div className="flex gap-1 bg-zinc-100 p-1 rounded-xl w-fit">
-          <button 
-            onClick={() => setView('active')}
-            className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'active' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
-          >
-            Live Surveillance
-          </button>
-          <button 
-            onClick={() => setView('history')}
-            className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'history' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
-          >
-            Historical Audit
-          </button>
-        </div>
-
-        <div className="flex gap-1 bg-zinc-100 p-1 rounded-xl w-fit">
-          <button 
-            onClick={() => setViewMode('cards')}
-            className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${displayMode === 'cards' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500'}`}
-          >
-            Card Feed
-          </button>
-          <button 
-            onClick={() => setViewMode('matrix')}
-            className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${displayMode === 'matrix' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500'}`}
-          >
-            Analytics Matrix
-          </button>
-        </div>
+      <div className="flex gap-1 bg-zinc-100 p-1 rounded-xl w-fit">
+        <button
+          onClick={() => setView('active')}
+          className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'active' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
+        >
+          Live Surveillance
+        </button>
+        <button
+          onClick={() => setView('matrix')}
+          className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'matrix' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
+        >
+          Matrix
+        </button>
+        <button
+          onClick={() => setView('history')}
+          className={`px-6 py-2 rounded-lg text-sm font-medium transition-all ${view === 'history' ? 'bg-white shadow-sm text-zinc-900' : 'text-zinc-500 hover:text-zinc-700'}`}
+        >
+          Historical Audit
+        </button>
       </div>
 
       {error && (
@@ -199,38 +187,40 @@ export default function ReversalDashboard() {
         </div>
       )}
 
-      {/* Main Content Feed */}
+      {/* Main Content */}
       <div className="space-y-6">
-        {displayMode === 'matrix' ? (
-          <SurveillanceMatrix 
-            entries={(view === 'active' ? activeGroups : historyGroups).flatMap(([, e]) => e)} 
-            settings={settings} 
+        {view === 'matrix' ? (
+          <SurveillanceMatrix
+            entries={Object.values(cohorts).flat()}
+            settings={settings}
           />
         ) : (
-          (view === 'active' ? activeGroups : historyGroups).map(([date, entries]) => (
-            <div key={date} className="space-y-3">
-              <div className="flex items-center gap-3 px-1">
-                <Badge className="bg-white text-zinc-500 font-mono border-zinc-200">
-                  {date}
-                </Badge>
-                <div className="h-px flex-1 bg-zinc-100" />
-              </div>
+          <>
+            {(view === 'active' ? activeGroups : historyGroups).map(([date, entries]) => (
+              <div key={date} className="space-y-3">
+                <div className="flex items-center gap-3 px-1">
+                  <Badge className="bg-white text-zinc-500 font-mono border-zinc-200">
+                    {date}
+                  </Badge>
+                  <div className="h-px flex-1 bg-zinc-100" />
+                </div>
 
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {entries.map(entry => (
-                  <SurveillanceCard key={entry.id} entry={entry} settings={settings} />
-                ))}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  {entries.map(entry => (
+                    <SurveillanceCard key={entry.id} entry={entry} settings={settings} />
+                  ))}
+                </div>
               </div>
-            </div>
-          ))
-        )}
+            ))}
 
-        {(view === 'active' ? activeGroups : historyGroups).length === 0 && (
-          <div className="py-20 text-center border-2 border-dashed rounded-3xl bg-zinc-50/50">
-            <Activity className="h-12 w-12 text-zinc-300 mx-auto mb-4" />
-            <h3 className="text-zinc-900 font-medium">No {view} data found</h3>
-            <p className="text-zinc-500 text-sm mt-1">Run a Scan & Sync to identify new opportunities.</p>
-          </div>
+            {(view === 'active' ? activeGroups : historyGroups).length === 0 && (
+              <div className="py-20 text-center border-2 border-dashed rounded-3xl bg-zinc-50/50">
+                <Activity className="h-12 w-12 text-zinc-300 mx-auto mb-4" />
+                <h3 className="text-zinc-900 font-medium">No {view} data found</h3>
+                <p className="text-zinc-500 text-sm mt-1">Run a Scan & Sync to identify new opportunities.</p>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -329,52 +319,77 @@ function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings:
 }
 
 function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], settings: any }) {
+  // Group by cohort_date, newest first
+  const grouped = useMemo(() => {
+    const map: Record<string, ReversalEntry[]> = {};
+    for (const e of entries) {
+      const d = typeof e.cohort_date === 'string' ? e.cohort_date.slice(0, 10) : new Date(e.cohort_date).toISOString().slice(0, 10);
+      (map[d] ??= []).push(e);
+    }
+    return Object.entries(map).sort(([a], [b]) => b.localeCompare(a));
+  }, [entries]);
+
   return (
     <Card className="border-none shadow-xl ring-1 ring-zinc-200/50 overflow-hidden">
       <div className="overflow-x-auto">
-        <table className="w-full border-collapse">
-          <thead>
-            <tr className="bg-zinc-50 border-b border-zinc-100">
-              <th className="sticky left-0 z-10 bg-zinc-50 p-4 text-left text-[10px] font-bold text-zinc-400 uppercase tracking-widest border-r border-zinc-100">Ticker</th>
-              <th className="sticky left-[88px] z-10 bg-zinc-50 p-4 text-left text-[10px] font-bold text-zinc-400 uppercase tracking-widest border-r border-zinc-100">Entry</th>
+        <table className="border-collapse text-xs" style={{ minWidth: '1800px' }}>
+          <thead className="sticky top-0 z-20">
+            <tr className="bg-zinc-800 text-zinc-300">
+              <th className="sticky left-0 z-30 bg-zinc-800 px-3 py-2 text-left text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[120px]">Ticker</th>
+              <th className="px-2 py-2 text-right text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[70px]">Entry</th>
+              <th className="px-2 py-2 text-right text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[50px]">Chg%</th>
               {Array.from({ length: 10 }).map((_, d) => (
-                <th key={d} colSpan={3} className="p-2 text-center text-[10px] font-bold text-zinc-400 uppercase tracking-widest border-r border-zinc-100 last:border-r-0">
-                  Day {d + 1}
+                <th key={d} colSpan={3} className={`px-1 py-2 text-center text-[10px] font-bold uppercase tracking-widest ${d < 9 ? 'border-r border-zinc-700' : ''}`}>
+                  D{d + 1}
                 </th>
               ))}
             </tr>
-            <tr className="bg-zinc-50/50 border-b border-zinc-100">
-              <th className="sticky left-0 z-10 bg-zinc-50/50 border-r border-zinc-100" />
-              <th className="sticky left-[88px] z-10 bg-zinc-50/50 border-r border-zinc-100" />
+            <tr className="bg-zinc-700 text-zinc-400">
+              <th className="sticky left-0 z-30 bg-zinc-700 border-r border-zinc-600" />
+              <th className="border-r border-zinc-600" />
+              <th className="border-r border-zinc-600" />
               {Array.from({ length: 10 }).map((_, d) => (
                 <React.Fragment key={d}>
-                  <th className="p-1 text-[8px] font-bold text-zinc-400">AM</th>
-                  <th className="p-1 text-[8px] font-bold text-zinc-400">MID</th>
-                  <th className="p-1 text-[8px] font-bold text-zinc-400 border-r border-zinc-100">PM</th>
+                  <th className="px-1 py-1 text-[8px] font-bold min-w-[42px]">M</th>
+                  <th className="px-1 py-1 text-[8px] font-bold min-w-[42px]">D</th>
+                  <th className={`px-1 py-1 text-[8px] font-bold min-w-[42px] ${d < 9 ? 'border-r border-zinc-600' : ''}`}>E</th>
                 </React.Fragment>
               ))}
             </tr>
           </thead>
           <tbody>
-            {entries.map((entry) => (
-              <tr key={entry.id} className="hover:bg-zinc-50/50 transition-colors border-b border-zinc-50 last:border-0">
-                <td className="sticky left-0 z-10 bg-white p-4 font-bold text-sm border-r border-zinc-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
-                  <div className="flex flex-col">
-                    <span>{entry.symbol}</span>
-                    <span className={`text-[8px] ${entry.direction === 'LONG' ? 'text-emerald-600' : 'text-rose-600'}`}>{entry.direction}</span>
-                  </div>
-                </td>
-                <td className="sticky left-[88px] z-10 bg-white p-4 font-mono text-xs border-r border-zinc-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
-                  ${entry.entry_price.toFixed(2)}
-                </td>
-                {Array.from({ length: 10 }).map((_, d) => (
-                  <React.Fragment key={d}>
-                    <MatrixCell entry={entry} field={`d${d+1}_morning`} />
-                    <MatrixCell entry={entry} field={`d${d+1}_midday`} />
-                    <MatrixCell entry={entry} field={`d${d+1}_close`} isLast />
-                  </React.Fragment>
+            {grouped.map(([date, group]) => (
+              <React.Fragment key={date}>
+                <tr className="bg-zinc-100">
+                  <td colSpan={33} className="sticky left-0 px-3 py-1.5 text-[10px] font-bold text-zinc-500 uppercase tracking-widest font-mono">
+                    Cohort {date}
+                    <span className="ml-2 text-zinc-400 font-normal">{group.length} tickers</span>
+                  </td>
+                </tr>
+                {group.map((entry) => (
+                  <tr key={entry.id} className="hover:bg-amber-50/30 transition-colors border-b border-zinc-100">
+                    <td className="sticky left-0 z-10 bg-white px-3 py-2 font-bold border-r border-zinc-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`inline-block w-1.5 h-1.5 rounded-full ${entry.direction === 'LONG' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                        <span>{entry.symbol}</span>
+                      </div>
+                    </td>
+                    <td className="px-2 py-2 font-mono text-right border-r border-zinc-100">
+                      ${entry.entry_price.toFixed(2)}
+                    </td>
+                    <td className={`px-2 py-2 font-mono text-right font-bold border-r border-zinc-100 ${entry.day_change_pct > 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                      {entry.day_change_pct > 0 ? '+' : ''}{entry.day_change_pct.toFixed(1)}%
+                    </td>
+                    {Array.from({ length: 10 }).map((_, d) => (
+                      <React.Fragment key={d}>
+                        <MatrixCell entry={entry} field={`d${d+1}_morning`} />
+                        <MatrixCell entry={entry} field={`d${d+1}_midday`} />
+                        <MatrixCell entry={entry} field={`d${d+1}_close`} isLast={d < 9} />
+                      </React.Fragment>
+                    ))}
+                  </tr>
                 ))}
-              </tr>
+              </React.Fragment>
             ))}
           </tbody>
         </table>
@@ -385,17 +400,28 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
 
 function MatrixCell({ entry, field, isLast }: { entry: ReversalEntry, field: string, isLast?: boolean }) {
   const price = entry[field as keyof ReversalEntry] as number | null;
-  if (!price) return <td className={`p-2 text-center text-zinc-200 font-mono text-[10px] ${isLast ? 'border-r border-zinc-100' : ''}`}>—</td>;
+  const border = isLast ? 'border-r border-zinc-100' : '';
 
-  const isProfit = entry.direction === 'LONG' ? price > entry.entry_price : price < entry.entry_price;
-  const change = ((price - entry.entry_price) / entry.entry_price) * 100 * (entry.direction === 'SHORT' ? -1 : 1);
+  if (!price) return <td className={`px-1 py-1.5 text-center text-zinc-200 font-mono text-[9px] ${border}`}>·</td>;
+
+  // % change from entry price, adjusted for direction
+  const rawChange = ((price - entry.entry_price) / entry.entry_price) * 100;
+  const directedChange = entry.direction === 'SHORT' ? -rawChange : rawChange;
+
+  // Color intensity scales with magnitude
+  const intensity = Math.min(Math.abs(directedChange) / 5, 1);
+  const isProfit = directedChange > 0;
+  const bg = isProfit
+    ? `rgba(16, 185, 129, ${0.08 + intensity * 0.25})`
+    : `rgba(239, 68, 68, ${0.08 + intensity * 0.25})`;
 
   return (
-    <td className={`p-2 text-center font-mono text-[10px] transition-all ${isProfit ? 'bg-emerald-50/50 text-emerald-700 font-bold' : 'bg-rose-50/50 text-rose-700'} ${isLast ? 'border-r border-zinc-100' : ''}`}>
-      <div className="flex flex-col">
-        <span>${price.toFixed(2)}</span>
-        <span className="text-[8px] opacity-70">{change > 0 ? '+' : ''}{change.toFixed(1)}%</span>
-      </div>
+    <td
+      className={`px-1 py-1.5 text-center font-mono text-[9px] font-medium ${border}`}
+      style={{ backgroundColor: bg }}
+      title={`$${price.toFixed(2)} (${rawChange > 0 ? '+' : ''}${rawChange.toFixed(2)}% raw)`}
+    >
+      {directedChange > 0 ? '+' : ''}{directedChange.toFixed(1)}
     </td>
   );
 }

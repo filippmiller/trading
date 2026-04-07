@@ -14,7 +14,7 @@ export async function GET() {
     // 1. Sync prices for existing 10-day active positions
     await syncActiveSurveillance();
 
-    // 2. Auto-enroll today's 3-day trenders
+    // 2. Enroll today's top 10 gainers + top 10 losers
     await autoEnrollTrenders();
 
     return NextResponse.json({ success: true, message: "Surveillance sync complete." });
@@ -31,10 +31,10 @@ async function autoEnrollTrenders() {
   // Call the library function directly instead of fetch
   const { gainers, losers } = await fetchAndAnalyzeMovers();
 
-  // Filter for 2+ days - Intake 10 gainers + 10 losers
+  // Top 10 gainers + top 10 losers every day — no filtering
   const enrollment = [
-    ...gainers.filter((m: any) => (m.consecutiveDays || 0) >= 2).slice(0, 10),
-    ...losers.filter((m: any) => (m.consecutiveDays || 0) >= 2).slice(0, 10)
+    ...gainers.slice(0, 10),
+    ...losers.slice(0, 10)
   ];
 
   for (const item of enrollment) {
