@@ -103,7 +103,7 @@ export default function ReversalDashboard() {
   }, [cohorts]);
 
   return (
-    <div className="max-w-6xl mx-auto space-y-8 pb-20">
+    <div className={`mx-auto space-y-8 pb-20 ${view === 'matrix' ? 'max-w-full px-2' : 'max-w-6xl'}`}>
       {/* World-Class Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b pb-6">
         <div>
@@ -318,6 +318,17 @@ function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings:
   );
 }
 
+/** Compute trading days offset from a date (skips weekends) */
+function addBusinessDays(dateStr: string, days: number): string {
+  const d = new Date(dateStr + 'T12:00:00Z');
+  let added = 0;
+  while (added < days) {
+    d.setDate(d.getDate() + 1);
+    if (d.getDay() !== 0 && d.getDay() !== 6) added++;
+  }
+  return d.toISOString().slice(5, 10); // MM-DD format
+}
+
 function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], settings: any }) {
   // Group by cohort_date, newest first
   const grouped = useMemo(() => {
@@ -326,21 +337,36 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
       const d = typeof e.cohort_date === 'string' ? e.cohort_date.slice(0, 10) : new Date(e.cohort_date).toISOString().slice(0, 10);
       (map[d] ??= []).push(e);
     }
+    // Sort entries within each cohort by absolute trigger change (biggest movers first)
+    for (const arr of Object.values(map)) {
+      arr.sort((a, b) => Math.abs(b.day_change_pct) - Math.abs(a.day_change_pct));
+    }
     return Object.entries(map).sort(([a], [b]) => b.localeCompare(a));
   }, [entries]);
 
+  // Use the first cohort date for header dates (they shift per cohort, but header is generic)
+  const refDate = grouped[0]?.[0] || new Date().toISOString().slice(0, 10);
+
   return (
     <Card className="border-none shadow-xl ring-1 ring-zinc-200/50 overflow-hidden">
-      <div className="overflow-x-auto">
+      <div className="text-[9px] text-zinc-400 px-3 py-1.5 bg-zinc-50 border-b border-zinc-100 flex gap-4">
+        <span>Values = <b className="text-zinc-600">% change from entry price</b> (positive = profitable for the direction)</span>
+        <span>M = <b className="text-zinc-600">Morning open +5min</b></span>
+        <span>D = <b className="text-zinc-600">Midday</b></span>
+        <span>E = <b className="text-zinc-600">Evening close</b></span>
+        <span className="inline-block w-3 h-3 rounded" style={{ backgroundColor: 'rgba(16,185,129,0.25)' }} /> = profit
+        <span className="inline-block w-3 h-3 rounded" style={{ backgroundColor: 'rgba(239,68,68,0.25)' }} /> = loss
+      </div>
+      <div className="overflow-auto" style={{ maxHeight: 'calc(100vh - 160px)' }}>
         <table className="border-collapse text-xs" style={{ minWidth: '1800px' }}>
           <thead className="sticky top-0 z-20">
             <tr className="bg-zinc-800 text-zinc-300">
               <th className="sticky left-0 z-30 bg-zinc-800 px-3 py-2 text-left text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[120px]">Ticker</th>
-              <th className="px-2 py-2 text-right text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[70px]">Entry</th>
-              <th className="px-2 py-2 text-right text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[50px]">Chg%</th>
+              <th className="px-2 py-2 text-right text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[70px]">Entry $</th>
+              <th className="px-2 py-2 text-right text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[55px]">Trigger</th>
               {Array.from({ length: 10 }).map((_, d) => (
-                <th key={d} colSpan={3} className={`px-1 py-2 text-center text-[10px] font-bold uppercase tracking-widest ${d < 9 ? 'border-r border-zinc-700' : ''}`}>
-                  D{d + 1}
+                <th key={d} colSpan={3} className={`px-1 py-1 text-center text-[10px] font-bold uppercase tracking-widest ${d < 9 ? 'border-r border-zinc-700' : ''}`}>
+                  <div>Day {d + 1}</div>
                 </th>
               ))}
             </tr>
@@ -361,10 +387,17 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
             {grouped.map(([date, group]) => (
               <React.Fragment key={date}>
                 <tr className="bg-zinc-100">
-                  <td colSpan={33} className="sticky left-0 px-3 py-1.5 text-[10px] font-bold text-zinc-500 uppercase tracking-widest font-mono">
-                    Cohort {date}
+                  <td className="sticky left-0 z-10 bg-zinc-100 px-3 py-1.5 text-[10px] font-bold text-zinc-500 uppercase tracking-widest font-mono border-r border-zinc-200">
+                    {date}
                     <span className="ml-2 text-zinc-400 font-normal">{group.length} tickers</span>
                   </td>
+                  <td className="border-r border-zinc-200" />
+                  <td className="border-r border-zinc-200" />
+                  {Array.from({ length: 10 }).map((_, d) => (
+                    <td key={d} colSpan={3} className={`text-center text-[9px] font-mono text-zinc-400 ${d < 9 ? 'border-r border-zinc-200' : ''}`}>
+                      {addBusinessDays(date, d + 1)}
+                    </td>
+                  ))}
                 </tr>
                 {group.map((entry) => (
                   <tr key={entry.id} className="hover:bg-amber-50/30 transition-colors border-b border-zinc-100">
@@ -372,6 +405,7 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
                       <div className="flex items-center gap-1.5">
                         <span className={`inline-block w-1.5 h-1.5 rounded-full ${entry.direction === 'LONG' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
                         <span>{entry.symbol}</span>
+                        <span className="text-[8px] text-zinc-400 font-normal">{entry.direction === 'LONG' ? 'buy' : 'short'}</span>
                       </div>
                     </td>
                     <td className="px-2 py-2 font-mono text-right border-r border-zinc-100">
@@ -382,9 +416,9 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
                     </td>
                     {Array.from({ length: 10 }).map((_, d) => (
                       <React.Fragment key={d}>
-                        <MatrixCell entry={entry} field={`d${d+1}_morning`} />
-                        <MatrixCell entry={entry} field={`d${d+1}_midday`} />
-                        <MatrixCell entry={entry} field={`d${d+1}_close`} isLast={d < 9} />
+                        <MatrixCell entry={entry} field={`d${d+1}_morning`} dayLabel={`Day ${d+1} Morning`} />
+                        <MatrixCell entry={entry} field={`d${d+1}_midday`} dayLabel={`Day ${d+1} Midday`} />
+                        <MatrixCell entry={entry} field={`d${d+1}_close`} dayLabel={`Day ${d+1} Close`} isLast={d < 9} />
                       </React.Fragment>
                     ))}
                   </tr>
@@ -398,7 +432,7 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
   );
 }
 
-function MatrixCell({ entry, field, isLast }: { entry: ReversalEntry, field: string, isLast?: boolean }) {
+function MatrixCell({ entry, field, isLast, dayLabel }: { entry: ReversalEntry, field: string, isLast?: boolean, dayLabel: string }) {
   const price = entry[field as keyof ReversalEntry] as number | null;
   const border = isLast ? 'border-r border-zinc-100' : '';
 
@@ -415,13 +449,21 @@ function MatrixCell({ entry, field, isLast }: { entry: ReversalEntry, field: str
     ? `rgba(16, 185, 129, ${0.08 + intensity * 0.25})`
     : `rgba(239, 68, 68, ${0.08 + intensity * 0.25})`;
 
+  const tooltip = [
+    `${entry.symbol} ${entry.direction} — ${dayLabel}`,
+    `Price: $${price.toFixed(2)}`,
+    `vs Entry $${entry.entry_price.toFixed(2)}: ${rawChange > 0 ? '+' : ''}${rawChange.toFixed(2)}%`,
+    `P&L direction-adjusted: ${directedChange > 0 ? '+' : ''}${directedChange.toFixed(2)}%`,
+    directedChange > 0 ? '✓ Profitable' : '✗ Losing',
+  ].join('\n');
+
   return (
     <td
-      className={`px-1 py-1.5 text-center font-mono text-[9px] font-medium ${border}`}
+      className={`px-1 py-1.5 text-center font-mono text-[9px] font-medium cursor-default ${border}`}
       style={{ backgroundColor: bg }}
-      title={`$${price.toFixed(2)} (${rawChange > 0 ? '+' : ''}${rawChange.toFixed(2)}% raw)`}
+      title={tooltip}
     >
-      {directedChange > 0 ? '+' : ''}{directedChange.toFixed(1)}
+      {directedChange > 0 ? '+' : ''}{directedChange.toFixed(1)}%
     </td>
   );
 }
