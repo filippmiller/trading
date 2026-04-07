@@ -9,6 +9,32 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-07 10:16] — Fix Surveillance Worker: Yahoo Finance Fallback for Stooq Block
+
+**Area:** Trading/Surveillance, Trading/Data
+**Type:** bugfix
+
+### Files Changed
+- `src/lib/data.ts` — Added Yahoo Finance chart API fallback in `fetchDailyBars()` when Stooq fails/blocks
+- `src/app/api/surveillance/sync/route.ts` — Added missing `ensureSchema()` call
+
+### Functions/Symbols Modified
+- `fetchDailyBars()` — modified (Stooq-first with Yahoo fallback)
+- `GET()` in sync route — modified (added ensureSchema)
+
+### Database Tables
+- `reversal_entries` — 2 new entries enrolled (PAYP, SEDG)
+- `surveillance_logs` — 2 SUCCESS entries logged
+- `prices_daily` — 20 AAPL rows from data refresh verification
+
+### Summary
+Verified the surveillance sync worker end-to-end. Discovered Stooq API blocks automated requests, silently breaking the trend analysis pipeline — movers were fetched from Yahoo but `enhanceWithTrend` failed on every Stooq call, leaving `consecutiveDays` undefined, and the `>= 2` filter removed all candidates. Added Yahoo Finance chart API as fallback in `fetchDailyBars()`. Also fixed missing `ensureSchema()` in the sync route. After fix: 10 gainers + 10 losers with trend data, 2 entries auto-enrolled.
+
+### Session Notes
+-> `.claude/sessions/2026-04-07-101608.md`
+
+---
+
 ## [2026-04-02 07:40] — Critic Review: 15 Bug Fixes Across Trading Platform
 
 **Area:** Trading/Core, Trading/Reversal, Trading/API

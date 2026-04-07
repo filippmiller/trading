@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getPool } from "@/lib/db";
 import { syncActiveSurveillance, fetchAndAnalyzeMovers } from "@/lib/surveillance";
+import { ensureSchema } from "@/lib/migrations";
 
 /**
  * GET /api/surveillance/sync
@@ -8,6 +9,8 @@ import { syncActiveSurveillance, fetchAndAnalyzeMovers } from "@/lib/surveillanc
  */
 export async function GET() {
   try {
+    await ensureSchema();
+
     // 1. Sync prices for existing 10-day active positions
     await syncActiveSurveillance();
 
@@ -28,17 +31,21 @@ async function autoEnrollTrenders() {
   // Call the library function directly instead of fetch
   const { gainers, losers } = await fetchAndAnalyzeMovers();
 
-  // Filter for 2+ days
+  // Filter for 2+ days - Intake 10 gainers + 10 losers
   const enrollment = [
-    ...gainers.filter((m: any) => (m.consecutiveDays || 0) >= 2).slice(0, 5),
-    ...losers.filter((m: any) => (m.consecutiveDays || 0) >= 2).slice(0, 5)
+    ...gainers.filter((m: any) => (m.consecutiveDays || 0) >= 2).slice(0, 10),
+    ...losers.filter((m: any) => (m.consecutiveDays || 0) >= 2).slice(0, 10)
   ];
 
   for (const item of enrollment) {
     const direction = item.changePct > 0 ? 'SHORT' : 'LONG';
     await pool.execute(
-      `INSERT IGNORE INTO reversal_entries (cohort_date, symbol, direction, day_change_pct, entry_price, consecutive_days, cumulative_change_pct, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')`,
+      `INSERT INTO reversal_entries (cohort_date, symbol, direction, day_change_pct, entry_price, consecutive_days, cumulative_change_pct, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+       ON DUPLICATE KEY UPDATE 
+         entry_price = VALUES(entry_price),
+         day_change_pct = VALUES(day_change_pct),
+         cumulative_change_pct = VALUES(cumulative_change_pct)`,
       [today, item.symbol, direction, item.changePct, item.price, item.consecutiveDays, item.cumulativeChangePct]
     );
   }
