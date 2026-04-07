@@ -358,7 +358,7 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
         <span className="inline-block w-3 h-3 rounded" style={{ backgroundColor: 'rgba(239,68,68,0.25)' }} /> = loss
       </div>
       <div className="overflow-auto" style={{ maxHeight: 'calc(100vh - 160px)' }}>
-        <table className="border-collapse text-xs" style={{ minWidth: '1800px' }}>
+        <table className="border-collapse text-xs" style={{ minWidth: '2400px' }}>
           <thead className="sticky top-0 z-20">
             <tr className="bg-zinc-800 text-zinc-300">
               <th className="sticky left-0 z-30 bg-zinc-800 px-3 py-2 text-left text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[120px]">Ticker</th>
@@ -376,9 +376,9 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
               <th className="border-r border-zinc-600" />
               {Array.from({ length: 10 }).map((_, d) => (
                 <React.Fragment key={d}>
-                  <th className="px-1 py-1 text-[8px] font-bold min-w-[42px]">M</th>
-                  <th className="px-1 py-1 text-[8px] font-bold min-w-[42px]">D</th>
-                  <th className={`px-1 py-1 text-[8px] font-bold min-w-[42px] ${d < 9 ? 'border-r border-zinc-600' : ''}`}>E</th>
+                  <th className="px-1 py-1 text-[8px] font-bold min-w-[56px]">M</th>
+                  <th className="px-1 py-1 text-[8px] font-bold min-w-[56px]">D</th>
+                  <th className={`px-1 py-1 text-[8px] font-bold min-w-[56px] ${d < 9 ? 'border-r border-zinc-600' : ''}`}>E</th>
                 </React.Fragment>
               ))}
             </tr>
@@ -434,9 +434,9 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
 
 function MatrixCell({ entry, field, isLast, dayLabel }: { entry: ReversalEntry, field: string, isLast?: boolean, dayLabel: string }) {
   const price = entry[field as keyof ReversalEntry] as number | null;
-  const border = isLast ? 'border-r border-zinc-100' : '';
+  const border = isLast ? 'border-r border-zinc-200' : '';
 
-  if (!price) return <td className={`px-1 py-1.5 text-center text-zinc-200 font-mono text-[9px] ${border}`}>·</td>;
+  if (!price) return <td className={`px-1 py-2 text-center text-zinc-200 font-mono text-[9px] ${border}`}>·</td>;
 
   // % change from entry price, adjusted for direction
   const rawChange = ((price - entry.entry_price) / entry.entry_price) * 100;
@@ -452,18 +452,22 @@ function MatrixCell({ entry, field, isLast, dayLabel }: { entry: ReversalEntry, 
   const tooltip = [
     `${entry.symbol} ${entry.direction} — ${dayLabel}`,
     `Price: $${price.toFixed(2)}`,
-    `vs Entry $${entry.entry_price.toFixed(2)}: ${rawChange > 0 ? '+' : ''}${rawChange.toFixed(2)}%`,
-    `P&L direction-adjusted: ${directedChange > 0 ? '+' : ''}${directedChange.toFixed(2)}%`,
+    `Entry: $${entry.entry_price.toFixed(2)}`,
+    `Change: ${rawChange > 0 ? '+' : ''}${rawChange.toFixed(2)}%`,
+    `P&L (direction-adjusted): ${directedChange > 0 ? '+' : ''}${directedChange.toFixed(2)}%`,
     directedChange > 0 ? '✓ Profitable' : '✗ Losing',
   ].join('\n');
 
   return (
     <td
-      className={`px-1 py-1.5 text-center font-mono text-[9px] font-medium cursor-default ${border}`}
+      className={`px-1 py-1 text-center font-mono cursor-default ${border}`}
       style={{ backgroundColor: bg }}
       title={tooltip}
     >
-      {directedChange > 0 ? '+' : ''}{directedChange.toFixed(1)}%
+      <div className="text-[10px] font-semibold text-zinc-700">${price.toFixed(0)}</div>
+      <div className={`text-[8px] ${isProfit ? 'text-emerald-700' : 'text-rose-700'}`}>
+        {directedChange > 0 ? '+' : ''}{directedChange.toFixed(1)}%
+      </div>
     </td>
   );
 }
