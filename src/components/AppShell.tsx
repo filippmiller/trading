@@ -3,17 +3,18 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { 
-  Activity, 
-  LayoutDashboard, 
-  Zap, 
-  BarChart3, 
-  Mic2, 
-  PlayCircle, 
-  Settings, 
+  Activity,
+  LayoutDashboard,
+  Zap,
+  BarChart3,
+  Mic2,
+  PlayCircle,
+  Settings,
   LineChart,
   Search,
   Menu,
-  X
+  X,
+  DollarSign
 } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
@@ -26,6 +27,7 @@ const navigation = [
   { name: "Price Surveillance", href: "/prices", icon: LineChart },
   { name: "Voice Intelligence", href: "/voice", icon: Mic2 },
   { name: "Simulation Runs", href: "/runs", icon: PlayCircle },
+  { name: "Paper Trading", href: "/paper", icon: DollarSign, badge: "New" },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
