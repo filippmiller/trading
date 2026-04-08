@@ -1,0 +1,10 @@
+{
+  "name": "trading-surveillance-cron",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "mysql2": "^3.16.3",
+    "node-cron": "^4.2.1",
+    "tsx": "^4.21.0"
+  }
+}

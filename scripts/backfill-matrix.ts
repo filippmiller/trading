@@ -35,7 +35,8 @@ async function getSP500Tickers(): Promise<string[]> {
 type DailyBar = { date: string; open: number; close: number; volume: number };
 
 async function fetchDailyBars(symbol: string): Promise<DailyBar[]> {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1mo&interval=1d`;
+  const range = process.env.BACKFILL_RANGE || '1mo';
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=1d`;
   const res = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
   });

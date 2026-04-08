@@ -26,7 +26,7 @@ export async function GET() {
 
 async function autoEnrollTrenders() {
   const pool = await getPool();
-  const today = new Date().toISOString().split('T')[0];
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
 
   // Call the library function directly instead of fetch
   const { gainers, losers } = await fetchAndAnalyzeMovers();

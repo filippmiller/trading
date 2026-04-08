@@ -1,10 +1,16 @@
 import { getPool, mysql } from "@/lib/db";
-import { ReversalEntry } from "@/lib/reversal";
 
 /**
  * Utility to sleep between API calls to avoid rate limiting
  */
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+
+/** Returns today's date as YYYY-MM-DD in ET timezone */
+function todayET(): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
+}
 
 /**
  * Fetches intraday prices for specific times from Yahoo Finance.
@@ -101,7 +107,7 @@ export async function fetchAndAnalyzeMovers() {
 
 async function fetchMoversFromYahoo(type: "gainers" | "losers" | "most_actives"): Promise<Mover[]> {
   const url = `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_${type}&count=25`;
-  const response = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const response = await fetch(url, { headers: { "User-Agent": UA } });
   if (!response.ok) throw new Error(`Yahoo API error: ${response.status}`);
   const data = await response.json();
   const quotes = data?.finance?.result?.[0]?.quotes ?? [];
@@ -180,7 +186,7 @@ export async function syncActiveSurveillance() {
         if (obsDate.getDay() === 0 || obsDate.getDay() === 6) continue;
 
         const dateStr = obsDate.toISOString().split('T')[0];
-        const nowStr = new Date().toISOString().split('T')[0];
+        const nowStr = todayET();
         if (dateStr > nowStr) continue; 
 
         for (const timeType of ['morning', 'midday', 'close'] as const) {

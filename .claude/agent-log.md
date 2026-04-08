@@ -9,6 +9,44 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-07 17:21] — Full Pipeline: Yahoo Fallback, Matrix Tab, 3-Month Backfill, Strategy Analysis, Paper Trading
+
+**Area:** Trading/Surveillance, Trading/Matrix, Trading/Analysis, Trading/PaperTrading
+**Type:** feature
+
+### Files Changed
+- `src/lib/data.ts` — Yahoo Finance fallback in fetchDailyBars()
+- `src/app/api/surveillance/sync/route.ts` — ensureSchema, removed streak filter, 10+10 enrollment
+- `src/lib/reversal.ts` — Extended ReversalEntry d1-d3 → d1-d10 (30 fields)
+- `src/app/api/reversal/route.ts` — API returns d4-d10 via loop
+- `src/app/reversal/page.tsx` — Matrix tab: legend, dates, tooltips, prices+%, full-width, sorting by magnitude
+- `scripts/backfill-matrix.ts` — New: S&P 500 backfill with configurable range (1mo/3mo)
+- `src/app/api/paper/route.ts` — New: paper trading API with live Yahoo prices
+- `src/app/paper/page.tsx` — New: paper trading UI with live P&L and sell button
+- `src/components/AppShell.tsx` — Added Paper Trading to sidebar nav
+
+### Functions/Symbols Modified
+- `fetchDailyBars()` — modified (Yahoo fallback)
+- `autoEnrollTrenders()` — modified (no filter, top 10 each)
+- `ReversalEntry` — modified (d4-d10 added)
+- `SurveillanceMatrix()` — rewritten (dates, legend, prices, sorting)
+- `MatrixCell()` — rewritten (price + % + tooltip)
+- `addBusinessDays()` — new
+- `PaperTradingPage()` — new
+- Paper API `GET()`/`POST()` — new
+
+### Database Tables
+- `reversal_entries` — 1,200 entries backfilled (3 months, 60 trading days, S&P 500)
+- `paper_trades` — new table, 5 initial trades (AXTI, PAYP, FIGS, SEDG, SOC)
+
+### Summary
+Major session covering the full surveillance pipeline. Fixed Stooq blocking with Yahoo fallback. Built Matrix tab showing 10-day price follow-up for top daily movers with actual dollar prices, % change, dates, and tooltips. Backfilled 3 months of S&P 500 data (1,200 entries, 21,800 price points). Ran comprehensive strategy analysis — found one consistently profitable strategy: BUY >7% losers, hold 3 days (62% win rate, +1.9% avg return over 224 trades). Built paper trading page with live prices and sell button; recorded 5 initial trades. Extensive discussion with user about mean reversion vs momentum, martingale risks, and consecutive down-day distributions.
+
+### Session Notes
+-> `.claude/sessions/2026-04-07-172149.md`
+
+---
+
 ## [2026-04-07 10:16] — Fix Surveillance Worker: Yahoo Finance Fallback for Stooq Block
 
 **Area:** Trading/Surveillance, Trading/Data
