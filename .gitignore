@@ -45,3 +45,40 @@ next-env.d.ts
 # surveillance logs
 /logs/
 ecosystem.config.cjs
+
+# Playwright MCP session artifacts (local-only test snapshots)
+.playwright-mcp/
+
+# Ad-hoc audit screenshots (created by debug sessions, not part of the app)
+audit-*.png
+audit-*.md
+audit-*.json
+audit-data.js
+verify-*.png
+matrix-*.png
+final-*.png
+final-*.jpeg
+*-signup.png
+*-dashboard.png
+prod-*.png
+open-*.js
+soi-*-snapshot.md
+
+# Ad-hoc debug scripts (temporary, not source of truth)
+current-matrix.png
+finnhub-dashboard.png
+google-oauth.png
+paper-trading.png
+reversal-*.png
+fmp-*.png
+twelvedata-*.png
+yahoo-test.json
+system-audit.js
+
+# More ad-hoc session artifacts
+alpaca-*.png
+e2e-prod.js
+e2e-production-proof.png
+final-demo.js
+paper-simulator-*.png
+tradier-*.png
