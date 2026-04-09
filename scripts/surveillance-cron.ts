@@ -4,7 +4,7 @@
  *
  * Runs automatically and:
  * 1. Enrolls today's top 10 gainers + 10 losers at market open (9:45 AM ET)
- * 2. Fetches intraday prices 3x/day: morning (9:40 ET), midday (12:35 ET), close (16:05 ET)
+ * 2. Fetches intraday prices 3x/day: morning (9:45 ET), midday (12:35 ET), close (16:05 ET)
  * 3. Backfills any missing prices for active entries
  *
  * Usage: npx tsx scripts/surveillance-cron.ts
@@ -239,8 +239,8 @@ async function jobEnrollMovers() {
       fetchMoversFromYahoo("losers"),
     ]);
 
-    let gainers = gainersResult.status === "fulfilled" ? gainersResult.value.slice(0, 10) : [];
-    let losers = losersResult.status === "fulfilled" ? losersResult.value.slice(0, 10) : [];
+    const gainers = gainersResult.status === "fulfilled" ? gainersResult.value.slice(0, 10) : [];
+    const losers = losersResult.status === "fulfilled" ? losersResult.value.slice(0, 10) : [];
     const enrollment = [...gainers, ...losers];
 
     if (enrollment.length === 0) {
@@ -291,12 +291,9 @@ async function jobSyncPrices() {
     );
     logId = logResult.insertId;
 
-    // Auto-close entries older than 14 calendar days (using ET date, not UTC)
-    const cutoffDate = new Date(todayET());
-    cutoffDate.setDate(cutoffDate.getDate() - 14);
+    // Auto-close entries older than 14 calendar days
     await db.execute(
-      "UPDATE reversal_entries SET status = 'COMPLETED' WHERE status = 'ACTIVE' AND cohort_date < ?",
-      [cutoffDate.toISOString().split("T")[0]]
+      "UPDATE reversal_entries SET status = 'COMPLETED' WHERE status = 'ACTIVE' AND cohort_date < DATE_SUB(CURRENT_DATE, INTERVAL 14 DAY)"
     );
 
     const [entries] = await db.execute<mysql.RowDataPacket[]>(

@@ -42,9 +42,10 @@ async function autoEnrollTrenders() {
     await pool.execute(
       `INSERT INTO reversal_entries (cohort_date, symbol, direction, day_change_pct, entry_price, consecutive_days, cumulative_change_pct, status)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
-       ON DUPLICATE KEY UPDATE 
+       ON DUPLICATE KEY UPDATE
          entry_price = VALUES(entry_price),
          day_change_pct = VALUES(day_change_pct),
+         consecutive_days = VALUES(consecutive_days),
          cumulative_change_pct = VALUES(cumulative_change_pct)`,
       [today, item.symbol, direction, item.changePct, item.price, item.consecutiveDays, item.cumulativeChangePct]
     );

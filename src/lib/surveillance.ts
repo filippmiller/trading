@@ -1,4 +1,5 @@
 import { getPool, mysql } from "@/lib/db";
+import { fetchDailyBars } from "@/lib/data";
 
 /**
  * Utility to sleep between API calls to avoid rate limiting
@@ -6,6 +7,16 @@ import { getPool, mysql } from "@/lib/db";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+
+const SYMBOL_RE = /^[A-Z0-9.\-]{1,16}$/;
+
+// Column name allowlist to prevent SQL injection
+const VALID_COLUMNS = new Set<string>();
+for (let d = 1; d <= 10; d++) {
+  for (const t of ["morning", "midday", "close"]) {
+    VALID_COLUMNS.add(`d${d}_${t}`);
+  }
+}
 
 /** Returns today's date as YYYY-MM-DD in ET timezone */
 function todayET(): string {
@@ -23,7 +34,7 @@ export async function fetchIntradayPrice(symbol: string, dateStr: string, timeTy
     const start = Math.floor(targetDate.getTime() / 1000) - 86400; 
     const end = Math.floor(targetDate.getTime() / 1000) + 86400;
 
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?period1=${start}&period2=${end}&interval=5m`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${start}&period2=${end}&interval=5m`;
     const response = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
@@ -73,8 +84,6 @@ export async function fetchIntradayPrice(symbol: string, dateStr: string, timeTy
     return null;
   }
 }
-import { fetchDailyBars } from "@/lib/data";
-
 export type Mover = {
   symbol: string;
   name: string;
@@ -111,13 +120,15 @@ async function fetchMoversFromYahoo(type: "gainers" | "losers" | "most_actives")
   if (!response.ok) throw new Error(`Yahoo API error: ${response.status}`);
   const data = await response.json();
   const quotes = data?.finance?.result?.[0]?.quotes ?? [];
-  return quotes.map((q: any) => ({
-    symbol: q.symbol,
-    name: q.shortName || q.longName || q.symbol,
-    price: Number(q.regularMarketPrice ?? 0),
-    change: Number(q.regularMarketChange ?? 0),
-    changePct: Number(q.regularMarketChangePercent ?? 0),
-  }));
+  return quotes
+    .filter((q: Record<string, unknown>) => typeof q.symbol === "string" && SYMBOL_RE.test(q.symbol as string))
+    .map((q: Record<string, unknown>) => ({
+      symbol: q.symbol as string,
+      name: (q.shortName || q.longName || q.symbol) as string,
+      price: isFinite(Number(q.regularMarketPrice)) ? Number(q.regularMarketPrice) : 0,
+      change: isFinite(Number(q.regularMarketChange)) ? Number(q.regularMarketChange) : 0,
+      changePct: isFinite(Number(q.regularMarketChangePercent)) ? Number(q.regularMarketChangePercent) : 0,
+    }));
 }
 
 async function enhanceWithTrend(mover: Mover): Promise<Mover> {
@@ -140,13 +151,13 @@ async function enhanceWithTrend(mover: Mover): Promise<Mover> {
       else if (dayDirection === trendDirection) consecutiveDays++;
       else break;
     }
-    if (consecutiveDays > 0) {
+    if (consecutiveDays > 0 && bars.length > consecutiveDays) {
       const startPrice = bars[bars.length - 1 - consecutiveDays].close;
       const endPrice = bars[bars.length - 1].close;
-      cumulativeChangePct = ((endPrice - startPrice) / startPrice) * 100;
+      if (startPrice > 0) cumulativeChangePct = ((endPrice - startPrice) / startPrice) * 100;
     }
     return { ...mover, consecutiveDays, trendDirection, cumulativeChangePct, history: history.reverse() };
-  } catch (err) { return mover; }
+  } catch { return mover; }
 }
 
 /**
@@ -178,19 +189,23 @@ export async function syncActiveSurveillance() {
     for (const row of entries) {
       const entryDate = new Date(row.cohort_date);
       const updates: string[] = [];
-      const params: any[] = [];
+      const params: (number | string)[] = [];
 
-      for (let d = 1; d <= 10; d++) {
-        const obsDate = new Date(entryDate);
-        obsDate.setDate(entryDate.getDate() + d);
+      // Walk trading days (skip weekends), matching cron logic
+      let tradingDay = 0;
+      const obsDate = new Date(entryDate);
+      while (tradingDay < 10) {
+        obsDate.setDate(obsDate.getDate() + 1);
         if (obsDate.getDay() === 0 || obsDate.getDay() === 6) continue;
+        tradingDay++;
 
         const dateStr = obsDate.toISOString().split('T')[0];
         const nowStr = todayET();
-        if (dateStr > nowStr) continue; 
+        if (dateStr > nowStr) break;
 
         for (const timeType of ['morning', 'midday', 'close'] as const) {
-          const colName = `d${d}_${timeType}`;
+          const colName = `d${tradingDay}_${timeType}`;
+          if (!VALID_COLUMNS.has(colName)) continue;
           if (row[colName] === null) {
             
             const [dlqRows] = await pool.execute<mysql.RowDataPacket[]>(
@@ -206,7 +221,7 @@ export async function syncActiveSurveillance() {
             await sleep(500); 
             const price = await fetchIntradayPrice(row.symbol, dateStr, timeType);
             
-            if (price) {
+            if (price != null) {
               updates.push(`${colName} = ?`);
               params.push(price);
               updatedCount++;
@@ -246,10 +261,11 @@ export async function syncActiveSurveillance() {
       [stats, logId]
     );
 
-  } catch (err: any) {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     await pool.execute(
       "UPDATE surveillance_logs SET finished_at = CURRENT_TIMESTAMP(6), status = 'FAILED', error_message = ? WHERE id = ?",
-      [err.message, logId]
+      [msg, logId]
     );
     throw err;
   }

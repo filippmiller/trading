@@ -131,6 +131,12 @@ export async function ensureSchema() {
   await ensureColumn("strategy_runs", "preset_name", "VARCHAR(64) NULL");
   await ensureColumn("reversal_entries", "consecutive_days", "INT NULL");
   await ensureColumn("reversal_entries", "cumulative_change_pct", "DECIMAL(10,4) NULL");
+  // Ensure unique constraint on surveillance_failures (matches init-db.sql)
+  try {
+    await pool.execute("ALTER TABLE surveillance_failures ADD UNIQUE KEY UX_fail_entry_field (entry_id, field_name)");
+  } catch (err: unknown) {
+    if ((err as { errno?: number }).errno !== 1061) throw err; // 1061 = duplicate key name
+  }
   // Add 10-day tracking columns
   for (let d = 1; d <= 10; d++) {
     await ensureColumn("reversal_entries", `d${d}_morning`, "DECIMAL(18,6) NULL");

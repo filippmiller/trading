@@ -195,9 +195,9 @@ async function backfillDatabase(
         const bar = futureBars[d];
         // Fill morning with open, evening with close
         const dayNum = d + 1;
-        updates.push(`d${dayNum}_morning = ?`);
+        updates.push(`d${dayNum}_morning = COALESCE(d${dayNum}_morning, ?)`);
         params.push(bar.open);
-        updates.push(`d${dayNum}_close = ?`);
+        updates.push(`d${dayNum}_close = COALESCE(d${dayNum}_close, ?)`);
         params.push(bar.close);
         totalPricesFilled += 2;
       }
