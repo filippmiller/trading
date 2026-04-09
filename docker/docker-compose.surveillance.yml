@@ -41,6 +41,7 @@ services:
       MYSQL_DB: ${MYSQL_DATABASE:-trading}
       TZ: America/New_York
       RATE_LIMIT_MS: "500"
+      TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
     deploy:
       resources:
         limits:

@@ -126,7 +126,54 @@ async function enhanceWithTrend(mover: Mover): Promise<Mover> {
   }
 }
 
-async function fetchIntradayPrice(
+function targetTimeFor(timeType: "morning" | "midday" | "close"): { h: number; m: number } {
+  if (timeType === "midday") return { h: 12, m: 30 };
+  if (timeType === "close") return { h: 15, m: 55 };
+  return { h: 9, m: 35 };
+}
+
+const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY ?? "";
+
+/** Primary source: Twelve Data. Returns closest 5-min close price to target ET time. */
+async function fetchIntradayPriceTwelveData(
+  symbol: string,
+  dateStr: string,
+  timeType: "morning" | "midday" | "close"
+): Promise<number | null> {
+  if (!TWELVEDATA_API_KEY) return null;
+  try {
+    const { h: targetHour, m: targetMin } = targetTimeFor(timeType);
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=5min&start_date=${dateStr}%2009:30:00&end_date=${dateStr}%2016:00:00&timezone=America/New_York&apikey=${TWELVEDATA_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.status === "error") return null;
+    const values: Array<{ datetime: string; close: string }> = data?.values ?? [];
+    if (!values.length) return null;
+
+    let closestPrice: number | null = null;
+    let minDiff = Infinity;
+    for (const v of values) {
+      const close = Number(v.close);
+      if (!isFinite(close)) continue;
+      // datetime format: "YYYY-MM-DD HH:MM:SS" in America/New_York
+      const [, clock] = v.datetime.split(" ");
+      if (!clock) continue;
+      const [h, m] = clock.split(":").map(Number);
+      const diff = Math.abs((h * 60 + m) - (targetHour * 60 + targetMin));
+      if (diff < minDiff && diff <= 15) {
+        minDiff = diff;
+        closestPrice = close;
+      }
+    }
+    return closestPrice;
+  } catch {
+    return null;
+  }
+}
+
+/** Fallback source: Yahoo Finance 5-minute chart (only works for recent ~7 days). */
+async function fetchIntradayPriceYahoo(
   symbol: string,
   dateStr: string,
   timeType: "morning" | "midday" | "close"
@@ -145,9 +192,7 @@ async function fetchIntradayPrice(
     const prices: (number | null)[] = result?.indicators?.quote?.[0]?.close || [];
     if (!timestamps.length) return null;
 
-    let targetHour = 9, targetMin = 35;
-    if (timeType === "midday") { targetHour = 12; targetMin = 30; }
-    if (timeType === "close") { targetHour = 15; targetMin = 55; }
+    const { h: targetHour, m: targetMin } = targetTimeFor(timeType);
 
     let closestPrice: number | null = null;
     let minDiff = Infinity;
@@ -174,6 +219,17 @@ async function fetchIntradayPrice(
   } catch {
     return null;
   }
+}
+
+/** Fetches intraday price for a symbol at a specific time. Tries Twelve Data first, Yahoo as fallback. */
+async function fetchIntradayPrice(
+  symbol: string,
+  dateStr: string,
+  timeType: "morning" | "midday" | "close"
+): Promise<number | null> {
+  const tdPrice = await fetchIntradayPriceTwelveData(symbol, dateStr, timeType);
+  if (tdPrice != null) return tdPrice;
+  return fetchIntradayPriceYahoo(symbol, dateStr, timeType);
 }
 
 // Column name allowlist to prevent SQL injection
