@@ -42,11 +42,12 @@ services:
       TZ: America/New_York
       RATE_LIMIT_MS: "500"
       TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
+      NODE_OPTIONS: "--max-old-space-size=768"
     deploy:
       resources:
         limits:
-          cpus: "0.5"
-          memory: 256M
+          cpus: "1.0"
+          memory: 1G
 
 volumes:
   trading-mysql-data:

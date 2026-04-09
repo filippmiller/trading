@@ -134,56 +134,21 @@ function targetTimeFor(timeType: "morning" | "midday" | "close"): { h: number; m
 
 const TWELVEDATA_API_KEY = process.env.TWELVEDATA_API_KEY ?? "";
 
-/** Primary source: Twelve Data. Returns closest 5-min close price to target ET time. */
-async function fetchIntradayPriceTwelveData(
-  symbol: string,
-  dateStr: string,
-  timeType: "morning" | "midday" | "close"
-): Promise<number | null> {
-  if (!TWELVEDATA_API_KEY) return null;
+/** One 5-min bar with ET-localized date + time key. */
+type Bar5m = { date: string; minutes: number; close: number };
+
+/** Per-symbol cache of 60-day 5-min bars, scoped to a single sync run. */
+type SymbolBarCache = Map<string, Bar5m[]>;
+
+/**
+ * Fetch 60 days of 5-min bars from Yahoo in a single call.
+ *
+ * Optimization: only keep bars near target times (9:30-9:45, 12:25-12:40, 15:50-16:05 ET).
+ * Reduces per-symbol memory from ~4700 bars to ~10 bars per trading day × 60 days = ~600 bars.
+ */
+async function fetchYahoo60d(symbol: string): Promise<Bar5m[] | null> {
   try {
-    const { h: targetHour, m: targetMin } = targetTimeFor(timeType);
-    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=5min&start_date=${dateStr}%2009:30:00&end_date=${dateStr}%2016:00:00&timezone=America/New_York&apikey=${TWELVEDATA_API_KEY}`;
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (data?.status === "error") return null;
-    const values: Array<{ datetime: string; close: string }> = data?.values ?? [];
-    if (!values.length) return null;
-
-    let closestPrice: number | null = null;
-    let minDiff = Infinity;
-    for (const v of values) {
-      const close = Number(v.close);
-      if (!isFinite(close)) continue;
-      // datetime format: "YYYY-MM-DD HH:MM:SS" in America/New_York
-      const [, clock] = v.datetime.split(" ");
-      if (!clock) continue;
-      const [h, m] = clock.split(":").map(Number);
-      const diff = Math.abs((h * 60 + m) - (targetHour * 60 + targetMin));
-      if (diff < minDiff && diff <= 15) {
-        minDiff = diff;
-        closestPrice = close;
-      }
-    }
-    return closestPrice;
-  } catch {
-    return null;
-  }
-}
-
-/** Fallback source: Yahoo Finance 5-minute chart (only works for recent ~7 days). */
-async function fetchIntradayPriceYahoo(
-  symbol: string,
-  dateStr: string,
-  timeType: "morning" | "midday" | "close"
-): Promise<number | null> {
-  try {
-    const targetDate = new Date(`${dateStr}T12:00:00Z`);
-    const start = Math.floor(targetDate.getTime() / 1000) - 86400;
-    const end = Math.floor(targetDate.getTime() / 1000) + 86400;
-
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${start}&period2=${end}&interval=5m`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=60d`;
     const res = await fetch(url, { headers: { "User-Agent": UA } });
     if (!res.ok) return null;
     const data = await res.json();
@@ -192,44 +157,135 @@ async function fetchIntradayPriceYahoo(
     const prices: (number | null)[] = result?.indicators?.quote?.[0]?.close || [];
     if (!timestamps.length) return null;
 
-    const { h: targetHour, m: targetMin } = targetTimeFor(timeType);
+    // Target time windows (ET minutes since midnight): ±15 min around each target
+    const windows = [
+      { min: 9 * 60 + 20, max: 9 * 60 + 50 },   // morning 9:35 ± 15
+      { min: 12 * 60 + 15, max: 12 * 60 + 45 }, // midday 12:30 ± 15
+      { min: 15 * 60 + 40, max: 16 * 60 + 10 }, // close 15:55 ± 15
+    ];
+    const inWindow = (mins: number) => windows.some(w => mins >= w.min && mins <= w.max);
 
-    let closestPrice: number | null = null;
-    let minDiff = Infinity;
-
+    const bars: Bar5m[] = [];
     for (let i = 0; i < timestamps.length; i++) {
       const px = prices[i];
       if (px == null || !isFinite(px)) continue;
-
       const d = new Date(timestamps[i] * 1000);
+      const nyDate = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d);
       const nyTime = d.toLocaleString("en-US", { timeZone: "America/New_York", hour12: false });
-      const [nyDate, nyClock] = nyTime.split(", ");
-      const [h, m] = nyClock.split(":").map(Number);
-      const [targetY, targetM, targetD] = dateStr.split("-").map(Number);
-      const [mNY, dNY, yNY] = nyDate.split("/").map(Number);
-      if (yNY !== targetY || mNY !== targetM || dNY !== targetD) continue;
-
-      const diff = Math.abs((h * 60 + m) - (targetHour * 60 + targetMin));
-      if (diff < minDiff && diff <= 15) {
-        minDiff = diff;
-        closestPrice = px;
-      }
+      const [, clock] = nyTime.split(", ");
+      const [h, m] = clock.split(":").map(Number);
+      const mins = h * 60 + m;
+      if (!inWindow(mins)) continue; // Drop bars outside target windows to save memory
+      bars.push({ date: nyDate, minutes: mins, close: px });
     }
-    return closestPrice;
+    return bars;
   } catch {
     return null;
   }
 }
 
-/** Fetches intraday price for a symbol at a specific time. Tries Twelve Data first, Yahoo as fallback. */
+// Circuit breaker: once Twelve Data returns quota exhausted (429 or error),
+// stop calling it for the rest of this sync run to avoid wasting time on 1-3s error responses.
+let twelveDataDisabled = false;
+
+/** Fetch 5-min bars for a single date from Twelve Data. */
+async function fetchTwelveDataDay(symbol: string, dateStr: string): Promise<Bar5m[] | null> {
+  if (!TWELVEDATA_API_KEY) return null;
+  if (twelveDataDisabled) return null;
+  try {
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=5min&start_date=${dateStr}%2009:30:00&end_date=${dateStr}%2016:00:00&timezone=America/New_York&apikey=${TWELVEDATA_API_KEY}`;
+    const res = await fetch(url);
+    if (res.status === 429) {
+      twelveDataDisabled = true;
+      log("  NOTE: Twelve Data quota exhausted, disabling for remainder of sync");
+      return null;
+    }
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.code === 429 || (data?.status === "error" && typeof data?.message === "string" && data.message.includes("API credits"))) {
+      twelveDataDisabled = true;
+      log("  NOTE: Twelve Data quota exhausted, disabling for remainder of sync");
+      return null;
+    }
+    if (data?.status === "error") return null;
+    const values: Array<{ datetime: string; close: string }> = data?.values ?? [];
+    if (!values.length) return null;
+
+    const bars: Bar5m[] = [];
+    for (const v of values) {
+      const close = Number(v.close);
+      if (!isFinite(close)) continue;
+      const [date, clock] = v.datetime.split(" ");
+      if (!clock) continue;
+      const [h, m] = clock.split(":").map(Number);
+      bars.push({ date, minutes: h * 60 + m, close });
+    }
+    return bars;
+  } catch {
+    return null;
+  }
+}
+
+/** Look up closest bar to a target time (within 15 minutes) for a specific date. */
+function lookupBar(bars: Bar5m[], dateStr: string, timeType: "morning" | "midday" | "close"): number | null {
+  const { h, m } = targetTimeFor(timeType);
+  const targetMinutes = h * 60 + m;
+  let closestPrice: number | null = null;
+  let minDiff = Infinity;
+  for (const bar of bars) {
+    if (bar.date !== dateStr) continue;
+    const diff = Math.abs(bar.minutes - targetMinutes);
+    if (diff < minDiff && diff <= 15) {
+      minDiff = diff;
+      closestPrice = bar.close;
+    }
+  }
+  return closestPrice;
+}
+
+/**
+ * Get a symbol's 60-day bar cache, populating from Yahoo on first access.
+ * Subsequent lookups (different dates, different time slots) reuse the cached data.
+ */
+async function getSymbolBars(cache: SymbolBarCache, symbol: string): Promise<Bar5m[] | null> {
+  if (cache.has(symbol)) return cache.get(symbol) ?? null;
+  const bars = await fetchYahoo60d(symbol);
+  cache.set(symbol, bars ?? []);
+  return bars;
+}
+
+/**
+ * Fetches intraday price for a symbol at a specific time.
+ *
+ * Strategy:
+ * 1. Use cached Yahoo 60-day bars if already fetched for this symbol
+ * 2. If not cached, fetch 60 days once (single API call per symbol per sync)
+ * 3. Fall back to Twelve Data ONLY if Yahoo completely failed for this symbol
+ *    (empty bars). If Yahoo succeeded but bars don't cover target time,
+ *    Twelve Data won't have it either — don't waste the call.
+ *
+ * Yahoo free tier gives us ~60 trading days of 5-min bars per call.
+ */
 async function fetchIntradayPrice(
+  cache: SymbolBarCache,
   symbol: string,
   dateStr: string,
   timeType: "morning" | "midday" | "close"
 ): Promise<number | null> {
-  const tdPrice = await fetchIntradayPriceTwelveData(symbol, dateStr, timeType);
-  if (tdPrice != null) return tdPrice;
-  return fetchIntradayPriceYahoo(symbol, dateStr, timeType);
+  const bars = await getSymbolBars(cache, symbol);
+
+  // Yahoo succeeded: look up from cache (may be null if target date not covered)
+  if (bars && bars.length > 0) {
+    return lookupBar(bars, dateStr, timeType);
+  }
+
+  // Yahoo completely failed for this symbol → try Twelve Data
+  const tdBars = await fetchTwelveDataDay(symbol, dateStr);
+  if (tdBars && tdBars.length > 0) {
+    return lookupBar(tdBars, dateStr, timeType);
+  }
+
+  return null;
 }
 
 // Column name allowlist to prevent SQL injection
@@ -357,6 +413,14 @@ async function jobSyncPrices() {
   try {
     log("Syncing prices for active entries...");
 
+    // Reset Twelve Data circuit breaker for this sync run
+    twelveDataDisabled = false;
+
+    // Mark any orphaned RUNNING logs as FAILED (e.g., container killed mid-sync)
+    await db.execute(
+      "UPDATE surveillance_logs SET status = 'FAILED', error_message = 'Orphaned — container restart', finished_at = CURRENT_TIMESTAMP(6) WHERE status = 'RUNNING' AND started_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE)"
+    );
+
     // Insert RUNNING log entry
     const [logResult] = await db.execute<mysql.ResultSetHeader>(
       "INSERT INTO surveillance_logs (status) VALUES ('RUNNING')"
@@ -371,6 +435,10 @@ async function jobSyncPrices() {
     const [entries] = await db.execute<mysql.RowDataPacket[]>(
       "SELECT * FROM reversal_entries WHERE status = 'ACTIVE' ORDER BY cohort_date DESC LIMIT 500"
     );
+
+    // Per-sync cache of 60-day 5-min bars per symbol.
+    // Dramatically reduces API calls: 1 Yahoo call per symbol covers all 30 d1-d10 slots.
+    const barCache: SymbolBarCache = new Map();
 
     for (const row of entries) {
       const entryDate = new Date(row.cohort_date);
@@ -399,8 +467,11 @@ async function jobSyncPrices() {
           );
           if (dlqRows.length > 0) { skipped++; continue; }
 
-          await sleep(RATE_LIMIT_MS);
-          const price = await fetchIntradayPrice(row.symbol, dateStr, timeType);
+          // Rate limit only on cache miss (first call per symbol).
+          // Cache hits are free and instant.
+          const isCacheMiss = !barCache.has(row.symbol);
+          if (isCacheMiss) await sleep(RATE_LIMIT_MS);
+          const price = await fetchIntradayPrice(barCache, row.symbol, dateStr, timeType);
 
           if (price != null) {
             await db.execute(
