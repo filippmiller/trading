@@ -6,8 +6,15 @@ import { ensureSchema } from "@/lib/migrations";
 /**
  * GET /api/surveillance/sync
  * Manually trigger the sync of prices and auto-enroll new trenders.
+ * Requires SYNC_SECRET header or query param to prevent abuse.
  */
-export async function GET() {
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const secret = request.headers.get("x-sync-secret") || url.searchParams.get("secret");
+  if (process.env.SYNC_SECRET && secret !== process.env.SYNC_SECRET) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     await ensureSchema();
 

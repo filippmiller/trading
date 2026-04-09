@@ -201,10 +201,26 @@ function todayET(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
 }
 
-/** Returns true if today (ET) is a weekday */
+// US market holidays (NYSE/NASDAQ closures) — update annually
+const MARKET_HOLIDAYS = new Set([
+  // 2026
+  "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+  "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+  // 2027
+  "2027-01-01", "2027-01-18", "2027-02-15", "2027-04-16", "2027-05-31",
+  "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+]);
+
+/** Returns true if the given date string is a market holiday */
+function isMarketHoliday(dateStr: string): boolean {
+  return MARKET_HOLIDAYS.has(dateStr);
+}
+
+/** Returns true if today (ET) is a trading day (weekday + not a holiday) */
 function isTradingDay(): boolean {
   const dow = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short" }).format(new Date());
-  return !["Sat", "Sun"].includes(dow);
+  if (["Sat", "Sun"].includes(dow)) return false;
+  return !isMarketHoliday(todayET());
 }
 
 function isTimePast(timeType: "morning" | "midday" | "close"): boolean {
@@ -297,21 +313,21 @@ async function jobSyncPrices() {
     );
 
     const [entries] = await db.execute<mysql.RowDataPacket[]>(
-      "SELECT * FROM reversal_entries WHERE status = 'ACTIVE'"
+      "SELECT * FROM reversal_entries WHERE status = 'ACTIVE' ORDER BY cohort_date DESC LIMIT 500"
     );
 
     for (const row of entries) {
       const entryDate = new Date(row.cohort_date);
 
-      // Iterate trading days (skip weekends), map to d1..d10 columns
+      // Iterate trading days (skip weekends + holidays), map to d1..d10 columns
       let tradingDay = 0;
       const obsDate = new Date(entryDate);
       while (tradingDay < 10) {
         obsDate.setDate(obsDate.getDate() + 1);
         if (obsDate.getDay() === 0 || obsDate.getDay() === 6) continue;
-        tradingDay++;
-
         const dateStr = obsDate.toISOString().split("T")[0];
+        if (isMarketHoliday(dateStr)) continue;
+        tradingDay++;
         const nowStr = todayET();
         if (dateStr > nowStr) break; // future dates — stop for this entry
 

@@ -10,6 +10,14 @@ const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
 const SYMBOL_RE = /^[A-Z0-9.\-]{1,16}$/;
 
+// US market holidays — update annually
+const MARKET_HOLIDAYS = new Set([
+  "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+  "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+  "2027-01-01", "2027-01-18", "2027-02-15", "2027-04-16", "2027-05-31",
+  "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+]);
+
 // Column name allowlist to prevent SQL injection
 const VALID_COLUMNS = new Set<string>();
 for (let d = 1; d <= 10; d++) {
@@ -183,7 +191,7 @@ export async function syncActiveSurveillance() {
 
   try {
     const [entries] = await pool.execute<mysql.RowDataPacket[]>(
-      "SELECT * FROM reversal_entries WHERE status = 'ACTIVE'"
+      "SELECT * FROM reversal_entries WHERE status = 'ACTIVE' ORDER BY cohort_date DESC LIMIT 500"
     );
 
     for (const row of entries) {
@@ -191,15 +199,15 @@ export async function syncActiveSurveillance() {
       const updates: string[] = [];
       const params: (number | string)[] = [];
 
-      // Walk trading days (skip weekends), matching cron logic
+      // Walk trading days (skip weekends + holidays), matching cron logic
       let tradingDay = 0;
       const obsDate = new Date(entryDate);
       while (tradingDay < 10) {
         obsDate.setDate(obsDate.getDate() + 1);
         if (obsDate.getDay() === 0 || obsDate.getDay() === 6) continue;
-        tradingDay++;
-
         const dateStr = obsDate.toISOString().split('T')[0];
+        if (MARKET_HOLIDAYS.has(dateStr)) continue;
+        tradingDay++;
         const nowStr = todayET();
         if (dateStr > nowStr) break;
 
