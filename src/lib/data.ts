@@ -28,18 +28,46 @@ function parseCsv(csv: string): PriceRow[] {
 
 export async function fetchDailyBars(symbol: string) {
   const normalized = normalizeSymbol(symbol);
-  const stooqSymbol = toStooqSymbol(normalized);
-  const response = await fetch(
-    `https://stooq.com/q/d/l/?s=${encodeURIComponent(stooqSymbol)}&i=d`,
-    {
-      cache: "no-store",
+
+  // Try Stooq first, fall back to Yahoo Finance chart API
+  try {
+    const stooqSymbol = toStooqSymbol(normalized);
+    const response = await fetch(
+      `https://stooq.com/q/d/l/?s=${encodeURIComponent(stooqSymbol)}&i=d`,
+      { cache: "no-store" }
+    );
+    if (response.ok) {
+      const csv = await response.text();
+      const rows = parseCsv(csv);
+      if (rows.length) return rows;
     }
-  );
+  } catch { /* fall through to Yahoo */ }
+
+  // Yahoo Finance fallback
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(normalized)}?range=1mo&interval=1d`;
+  const response = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+    cache: "no-store",
+  });
   if (!response.ok) {
-    throw new Error(`Failed to fetch ${normalized} data from Stooq.`);
+    throw new Error(`Failed to fetch ${normalized} daily bars.`);
   }
-  const csv = await response.text();
-  const rows = parseCsv(csv);
+  const data = await response.json();
+  const result = data?.chart?.result?.[0];
+  const timestamps = result?.timestamp || [];
+  const quote = result?.indicators?.quote?.[0] || {};
+
+  const rows: PriceRow[] = [];
+  for (let i = 0; i < timestamps.length; i++) {
+    const o = Number(quote.open?.[i]), h = Number(quote.high?.[i]);
+    const l = Number(quote.low?.[i]), c = Number(quote.close?.[i]);
+    const v = Number(quote.volume?.[i] ?? 0);
+    if (isNaN(c) || c <= 0) continue;
+    rows.push({
+      date: new Date(timestamps[i] * 1000).toISOString().slice(0, 10),
+      open: o, high: h, low: l, close: c, volume: v,
+    });
+  }
   if (!rows.length) {
     throw new Error(`No data returned for ${normalized}.`);
   }

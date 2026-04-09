@@ -44,7 +44,7 @@ export async function GET(req: Request) {
       if (!cohorts[date]) {
         cohorts[date] = [];
       }
-      cohorts[date].push({
+      const entry: any = {
         id: row.id,
         cohort_date: date,
         symbol: row.symbol,
@@ -53,20 +53,18 @@ export async function GET(req: Request) {
         entry_price: Number(row.entry_price),
         consecutive_days: row.consecutive_days ? Number(row.consecutive_days) : undefined,
         cumulative_change_pct: row.cumulative_change_pct ? Number(row.cumulative_change_pct) : undefined,
-        d1_morning: row.d1_morning ? Number(row.d1_morning) : null,
-        d1_midday: row.d1_midday ? Number(row.d1_midday) : null,
-        d1_close: row.d1_close ? Number(row.d1_close) : null,
-        d2_morning: row.d2_morning ? Number(row.d2_morning) : null,
-        d2_midday: row.d2_midday ? Number(row.d2_midday) : null,
-        d2_close: row.d2_close ? Number(row.d2_close) : null,
-        d3_morning: row.d3_morning ? Number(row.d3_morning) : null,
-        d3_midday: row.d3_midday ? Number(row.d3_midday) : null,
-        d3_close: row.d3_close ? Number(row.d3_close) : null,
         final_pnl_usd: row.final_pnl_usd ? Number(row.final_pnl_usd) : null,
         final_pnl_pct: row.final_pnl_pct ? Number(row.final_pnl_pct) : null,
         status: row.status as "ACTIVE" | "COMPLETED",
         created_at: row.created_at,
-      });
+      };
+      for (let d = 1; d <= 10; d++) {
+        for (const t of ['morning', 'midday', 'close']) {
+          const col = `d${d}_${t}`;
+          entry[col] = row[col] != null ? Number(row[col]) : null;
+        }
+      }
+      cohorts[date].push(entry as ReversalEntry);
     }
 
     return NextResponse.json({ cohorts });

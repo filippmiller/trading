@@ -1,0 +1,17 @@
+FROM node:22-slim
+
+WORKDIR /app
+
+# Only install what the cron script needs (mysql2, node-cron, tsx)
+COPY docker/package.cron.json package.json
+RUN npm install --production
+
+# Copy the cron script
+COPY scripts/surveillance-cron.ts scripts/
+COPY tsconfig.json ./
+
+# Run as non-root
+RUN addgroup --system cron && adduser --system --ingroup cron cronuser
+USER cronuser
+
+CMD ["node", "--import", "tsx", "scripts/surveillance-cron.ts"]

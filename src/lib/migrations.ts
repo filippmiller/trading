@@ -106,9 +106,67 @@ const schemaStatements = [
     INDEX IX_fail_entry (entry_id),
     CONSTRAINT FK_fail_reversal FOREIGN KEY (entry_id) REFERENCES reversal_entries(id) ON DELETE CASCADE
   ) ENGINE=InnoDB;`,
+  // ── Paper Trading Simulator ─────────────────────────────────────────────
+  `CREATE TABLE IF NOT EXISTS paper_accounts (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(64) NOT NULL DEFAULT 'Default',
+    initial_cash DECIMAL(18,6) NOT NULL DEFAULT 100000,
+    cash DECIMAL(18,6) NOT NULL DEFAULT 100000,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY UX_paper_account_name (name)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS paper_trades (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    account_id INT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    quantity DECIMAL(18,6) NOT NULL DEFAULT 0,
+    buy_price DECIMAL(18,6) NOT NULL,
+    buy_date DATE NOT NULL,
+    sell_date DATE NULL,
+    sell_price DECIMAL(18,6) NULL,
+    investment_usd DECIMAL(18,6) NOT NULL DEFAULT 100,
+    pnl_usd DECIMAL(18,6) NULL,
+    pnl_pct DECIMAL(18,6) NULL,
+    strategy VARCHAR(64) NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'OPEN',
+    notes TEXT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX IX_paper_trades_account (account_id),
+    INDEX IX_paper_trades_status (status)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS paper_orders (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    account_id INT NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    side VARCHAR(8) NOT NULL, -- 'BUY' or 'SELL'
+    order_type VARCHAR(16) NOT NULL, -- 'MARKET', 'LIMIT', 'STOP'
+    quantity DECIMAL(18,6) NULL, -- for sell orders tied to an existing trade
+    investment_usd DECIMAL(18,6) NULL, -- for buy orders (dollar-based sizing)
+    limit_price DECIMAL(18,6) NULL,
+    stop_price DECIMAL(18,6) NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'PENDING', -- 'PENDING', 'FILLED', 'CANCELLED', 'REJECTED'
+    filled_price DECIMAL(18,6) NULL,
+    filled_at DATETIME(6) NULL,
+    trade_id INT NULL, -- linked paper_trade on fill
+    rejection_reason VARCHAR(255) NULL,
+    notes TEXT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX IX_paper_orders_account (account_id),
+    INDEX IX_paper_orders_status (status),
+    INDEX IX_paper_orders_symbol (symbol)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS paper_equity_snapshots (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    account_id INT NOT NULL,
+    snapshot_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    cash DECIMAL(18,6) NOT NULL,
+    positions_value DECIMAL(18,6) NOT NULL,
+    equity DECIMAL(18,6) NOT NULL,
+    INDEX IX_paper_equity_account_time (account_id, snapshot_at)
+  ) ENGINE=InnoDB;`,
 ];
 
-const ALLOWED_TABLES = new Set(["strategy_runs", "run_metrics", "reversal_entries"]);
+const ALLOWED_TABLES = new Set(["strategy_runs", "run_metrics", "reversal_entries", "paper_trades"]);
 const COLUMN_REGEX = /^[a-z_][a-z0-9_]{0,63}$/;
 
 async function ensureColumn(table: string, column: string, definition: string) {
@@ -131,11 +189,35 @@ export async function ensureSchema() {
   await ensureColumn("strategy_runs", "preset_name", "VARCHAR(64) NULL");
   await ensureColumn("reversal_entries", "consecutive_days", "INT NULL");
   await ensureColumn("reversal_entries", "cumulative_change_pct", "DECIMAL(10,4) NULL");
+  // Ensure unique constraint on surveillance_failures (matches init-db.sql)
+  try {
+    await pool.execute("ALTER TABLE surveillance_failures ADD UNIQUE KEY UX_fail_entry_field (entry_id, field_name)");
+  } catch (err: unknown) {
+    if ((err as { errno?: number }).errno !== 1061) throw err; // 1061 = duplicate key name
+  }
   // Add 10-day tracking columns
   for (let d = 1; d <= 10; d++) {
     await ensureColumn("reversal_entries", `d${d}_morning`, "DECIMAL(18,6) NULL");
     await ensureColumn("reversal_entries", `d${d}_midday`, "DECIMAL(18,6) NULL");
     await ensureColumn("reversal_entries", `d${d}_close`, "DECIMAL(18,6) NULL");
+  }
+  // Add account_id and quantity to existing paper_trades rows (created before the simulator)
+  await ensureColumn("paper_trades", "account_id", "INT NULL");
+  await ensureColumn("paper_trades", "quantity", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+
+  // Seed default paper account
+  await pool.execute(
+    "INSERT IGNORE INTO paper_accounts (name, initial_cash, cash) VALUES ('Default', 100000, 100000)"
+  );
+  // Backfill account_id on existing trades
+  const [defaultAccount] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT id FROM paper_accounts WHERE name = 'Default' LIMIT 1"
+  );
+  if (defaultAccount.length > 0) {
+    await pool.execute(
+      "UPDATE paper_trades SET account_id = ? WHERE account_id IS NULL",
+      [defaultAccount[0].id]
+    );
   }
 }
 

@@ -1,0 +1,53 @@
+services:
+  mysql:
+    image: mysql:8.0
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-trading}
+    volumes:
+      - trading-mysql-data:/var/lib/mysql
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "127.0.0.1:3320:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  surveillance-cron:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cron
+    container_name: trading-surveillance-cron
+    restart: always
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DB: ${MYSQL_DATABASE:-trading}
+      TZ: America/New_York
+      RATE_LIMIT_MS: "500"
+      TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
+      NODE_OPTIONS: "--max-old-space-size=768"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+volumes:
+  trading-mysql-data:
