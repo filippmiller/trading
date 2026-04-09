@@ -348,7 +348,7 @@ function isTimePast(timeType: "morning" | "midday" | "close"): boolean {
 
 // ─── Core Jobs ──────────────────────────────────────────────────────────────
 
-/** Enroll today's top 10 gainers + 10 losers */
+/** Enroll today's top 10 gainers + 10 losers. Idempotent — skips if already enrolled today. */
 async function jobEnrollMovers() {
   if (enrollRunning) { log("  SKIP: enrollment already running"); return; }
   enrollRunning = true;
@@ -360,6 +360,21 @@ async function jobEnrollMovers() {
 
     const db = getPool();
     const today = todayET();
+
+    // Idempotency: if we've already enrolled today's cohort, skip.
+    // Prevents duplicate enrollments from container restarts, manual API triggers,
+    // or scheduled re-runs — Yahoo's top movers change throughout the day, so
+    // running again would add new symbols to the same cohort.
+    const [existing] = await db.execute<mysql.RowDataPacket[]>(
+      "SELECT COUNT(*) as cnt FROM reversal_entries WHERE cohort_date = ?",
+      [today]
+    );
+    const existingCount = Number(existing[0]?.cnt ?? 0);
+    if (existingCount > 0) {
+      log(`  SKIP: already enrolled ${existingCount} tickers for ${today}`);
+      return;
+    }
+
     log(`Enrolling movers for ${today}...`);
 
     const [gainersResult, losersResult] = await Promise.allSettled([

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getPool } from "@/lib/db";
+import { getPool, mysql } from "@/lib/db";
 import { syncActiveSurveillance, fetchAndAnalyzeMovers } from "@/lib/surveillance";
 import { ensureSchema } from "@/lib/migrations";
 
@@ -34,6 +34,17 @@ export async function GET(request: Request) {
 async function autoEnrollTrenders() {
   const pool = await getPool();
   const today = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
+
+  // Idempotency: skip if today's cohort is already enrolled.
+  // Yahoo's top movers change throughout the day, so re-running would add new
+  // symbols to the same cohort, ballooning it past 20.
+  const [existing] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT COUNT(*) as cnt FROM reversal_entries WHERE cohort_date = ?",
+    [today]
+  );
+  if (Number(existing[0]?.cnt ?? 0) > 0) {
+    return; // already enrolled
+  }
 
   // Call the library function directly instead of fetch
   const { gainers, losers } = await fetchAndAnalyzeMovers();
