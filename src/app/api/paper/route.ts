@@ -1,101 +1,126 @@
 import { NextResponse } from "next/server";
 import { getPool, mysql } from "@/lib/db";
+import { ensureSchema } from "@/lib/migrations";
+import {
+  fetchLivePrices,
+  getDefaultAccount,
+  computeAccountEquity,
+  fillPendingOrders,
+} from "@/lib/paper";
 
-// GET - fetch all paper trades with live prices
+/**
+ * GET /api/paper
+ * Returns account summary, open positions with live P&L, closed trades, and pending orders.
+ * Also runs the order-matching engine to fill any triggered pending orders.
+ */
 export async function GET() {
   try {
+    await ensureSchema();
     const pool = await getPool();
-    const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-      "SELECT * FROM paper_trades ORDER BY status ASC, created_at DESC"
+    const account = await getDefaultAccount();
+
+    // Fill any pending limit/stop orders that are triggered by current prices
+    const filled = await fillPendingOrders();
+
+    // Fetch trades
+    const [tradeRows] = await pool.execute<mysql.RowDataPacket[]>(
+      "SELECT * FROM paper_trades WHERE account_id = ? ORDER BY status ASC, created_at DESC",
+      [account.id]
     );
 
-    // Fetch live prices for OPEN trades
-    const openTrades = rows.filter(r => r.status === 'OPEN');
-    const liveData: Record<string, { price: number; change: number }> = {};
+    // Live prices for open positions
+    const openTrades = tradeRows.filter(r => r.status === "OPEN");
+    const prices = openTrades.length > 0
+      ? await fetchLivePrices(openTrades.map(r => r.symbol))
+      : {};
 
-    for (const trade of openTrades) {
-      if (liveData[trade.symbol]) continue;
-      try {
-        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${trade.symbol}?range=1d&interval=5m`;
-        const res = await fetch(url, {
-          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
-        });
-        if (res.ok) {
-          const data = await res.json();
-          const result = data?.chart?.result?.[0];
-          const meta = result?.meta;
-          if (meta?.regularMarketPrice) {
-            liveData[trade.symbol] = {
-              price: meta.regularMarketPrice,
-              change: meta.regularMarketPrice - (meta.chartPreviousClose || meta.previousClose || 0),
-            };
-          }
-        }
-      } catch { /* skip */ }
-    }
-
-    const trades = rows.map(r => {
-      const live = liveData[r.symbol];
+    const trades = tradeRows.map(r => {
       const buyPrice = Number(r.buy_price);
-      const currentPrice = live?.price || (r.sell_price ? Number(r.sell_price) : null);
-      const pnlPct = currentPrice ? ((currentPrice - buyPrice) / buyPrice) * 100 : null;
-      const pnlUsd = currentPrice ? (pnlPct! / 100) * Number(r.investment_usd) : null;
+      const investment = Number(r.investment_usd);
+      const quantity = Number(r.quantity) || (investment / buyPrice);
+      const live = prices[r.symbol];
+      const currentPrice = r.status === "OPEN"
+        ? (live ?? null)
+        : (r.sell_price ? Number(r.sell_price) : null);
+
+      let pnlPct: number | null = null;
+      let pnlUsd: number | null = null;
+      if (currentPrice != null) {
+        pnlPct = ((currentPrice - buyPrice) / buyPrice) * 100;
+        pnlUsd = quantity * (currentPrice - buyPrice);
+      } else if (r.status === "CLOSED" && r.pnl_usd != null) {
+        pnlUsd = Number(r.pnl_usd);
+        pnlPct = Number(r.pnl_pct);
+      }
 
       return {
         id: r.id,
         symbol: r.symbol,
+        quantity,
         buy_price: buyPrice,
         buy_date: r.buy_date,
         sell_date: r.sell_date,
         sell_price: r.sell_price ? Number(r.sell_price) : null,
-        investment_usd: Number(r.investment_usd),
+        investment_usd: investment,
         current_price: currentPrice,
         live_pnl_usd: pnlUsd,
         live_pnl_pct: pnlPct,
         strategy: r.strategy,
         status: r.status,
         notes: r.notes,
+        created_at: r.created_at,
       };
     });
 
-    const totalInvested = trades.filter(t => t.status === 'OPEN').reduce((s, t) => s + t.investment_usd, 0);
-    const totalPnl = trades.filter(t => t.status === 'OPEN' && t.live_pnl_usd).reduce((s, t) => s + t.live_pnl_usd!, 0);
-
-    return NextResponse.json({ trades, totalInvested, totalPnl });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
-}
-
-// POST - sell a paper trade (close position)
-export async function POST(req: Request) {
-  try {
-    const pool = await getPool();
-    const { id, sell_price } = await req.json();
-
-    if (!id || !sell_price) {
-      return NextResponse.json({ error: "id and sell_price required" }, { status: 400 });
-    }
-
-    const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-      "SELECT * FROM paper_trades WHERE id = ? AND status = 'OPEN'", [id]
+    // Pending orders
+    const [orderRows] = await pool.execute<mysql.RowDataPacket[]>(
+      "SELECT * FROM paper_orders WHERE account_id = ? AND status = 'PENDING' ORDER BY created_at DESC",
+      [account.id]
     );
-    if (!rows.length) {
-      return NextResponse.json({ error: "Trade not found or already closed" }, { status: 404 });
-    }
+    const pendingOrders = orderRows.map(o => ({
+      id: o.id,
+      symbol: o.symbol,
+      side: o.side,
+      order_type: o.order_type,
+      investment_usd: o.investment_usd ? Number(o.investment_usd) : null,
+      limit_price: o.limit_price ? Number(o.limit_price) : null,
+      stop_price: o.stop_price ? Number(o.stop_price) : null,
+      created_at: o.created_at,
+      notes: o.notes,
+    }));
 
-    const trade = rows[0];
-    const buyPrice = Number(trade.buy_price);
-    const pnlPct = ((sell_price - buyPrice) / buyPrice) * 100;
-    const pnlUsd = (pnlPct / 100) * Number(trade.investment_usd);
+    // Account metrics
+    const equity = await computeAccountEquity(account.id);
+    const totalReturn = account.initial_cash > 0
+      ? ((equity.equity - account.initial_cash) / account.initial_cash) * 100
+      : 0;
 
-    await pool.execute(
-      "UPDATE paper_trades SET status = 'CLOSED', sell_price = ?, sell_date = CURRENT_DATE, pnl_usd = ?, pnl_pct = ? WHERE id = ?",
-      [sell_price, pnlUsd, pnlPct, id]
-    );
+    // Closed trade stats
+    const closedTrades = tradeRows.filter(r => r.status === "CLOSED");
+    const wins = closedTrades.filter(r => Number(r.pnl_usd) > 0).length;
+    const winRate = closedTrades.length > 0 ? (wins / closedTrades.length) * 100 : 0;
+    const realizedPnl = closedTrades.reduce((s, r) => s + Number(r.pnl_usd || 0), 0);
 
-    return NextResponse.json({ success: true, pnl_usd: pnlUsd, pnl_pct: pnlPct });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return NextResponse.json({
+      account: {
+        id: account.id,
+        name: account.name,
+        initial_cash: account.initial_cash,
+        cash: equity.cash,
+        positions_value: equity.positions_value,
+        equity: equity.equity,
+        open_positions: equity.open_positions,
+        total_return_pct: totalReturn,
+        realized_pnl_usd: realizedPnl,
+        win_rate_pct: winRate,
+        closed_trades: closedTrades.length,
+      },
+      trades,
+      pendingOrders,
+      filledOnThisRequest: filled,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

@@ -9,6 +9,98 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-09 07:10] — Unify VPS MySQL, Critic Review, Yahoo 60-Day Rewrite, Data Provider Research
+
+**Area:** Trading/Surveillance, Trading/Infrastructure, Trading/Data
+**Type:** feature + bugfix + research
+
+### Files Changed
+- `docker/init-db.sql` — Added 5 web app tables (prices_daily, strategy_runs, trades, run_metrics, app_settings)
+- `scripts/tunnel-db.sh` — New: SSH tunnel for local dev → VPS MySQL
+- `src/lib/surveillance.ts` — Critical trading-day loop fix, VALID_COLUMNS, MARKET_HOLIDAYS, LIMIT 500
+- `src/app/api/surveillance/sync/route.ts` — SYNC_SECRET auth, consecutive_days in upsert
+- `src/lib/migrations.ts` — UNIQUE KEY on surveillance_failures(entry_id, field_name)
+- `scripts/surveillance-cron.ts` — MARKET_HOLIDAYS, Twelve Data integration, Yahoo 60-day rewrite with symbol caching, circuit breaker, orphan cleanup
+- `scripts/deploy-surveillance.sh` — Removed hardcoded password, quoted $VPS
+- `scripts/backfill-matrix.ts` — COALESCE to preserve live prices
+- `docker/docker-compose.surveillance.yml` — TWELVEDATA_API_KEY env var, memory 256M→1G, CPU 0.5→1.0, NODE_OPTIONS heap size
+- `.env.local` — Added TWELVEDATA_API_KEY, FINNHUB_API_KEY, FMP_API_KEY
+
+### Functions/Symbols Modified
+- `syncActiveSurveillance()` — Trading day loop fix (critical bug)
+- `fetchMoversFromYahoo()` — Symbol validation, typing
+- `enhanceWithTrend()` — Division-by-zero guard
+- `fetchIntradayPrice()` in cron — Complete rewrite: cache-based, Yahoo 60-day primary
+- `fetchYahoo60d()` — New: single fetch per symbol, window-filtered
+- `fetchTwelveDataDay()` — New: fallback with circuit breaker
+- `getSymbolBars()` — New: per-symbol cache accessor
+- `lookupBar()` — New: instant in-memory lookup
+- `isTradingDay()` — Added holiday check
+- `jobSyncPrices()` — Orphan cleanup, circuit breaker reset, cache per sync run
+
+### Database Tables
+- `prices_daily`, `strategy_runs`, `trades`, `run_metrics`, `app_settings` — Created on VPS MySQL
+- `reversal_entries` — 466 entries backfilled (1 month, S&P 500), then 380 marked COMPLETED, 86 remain ACTIVE
+- `surveillance_failures` — UNIQUE KEY added, cleared for COMPLETED entries
+- `surveillance_logs` — Multiple sync runs, orphan cleanup added
+
+### Summary
+Started by investigating the surveillance cron built April 7-8. Discovered the VPS cron and local web app used separate MySQL databases. Unified them (VPS as single source of truth), created SSH tunnel script, backfilled 1 month of S&P 500 data directly into VPS. Ran 5-agent critic review, found and fixed 12 issues (critical trading-day loop bug, SQL injection defense, input validation, schema alignment, auth guard, market holidays, LIMIT 500, deploy hardening). Deployed and verified with Playwright showing 226 active tickers in matrix.
+
+Researched alternative intraday data providers to replace Yahoo. Signed up for 3 services: Twelve Data, Finnhub, FMP. Discovered that **only Twelve Data includes historical 5-min bars in its free tier** — Finnhub and FMP both stripped this from free tiers in 2024-2025. Integrated Twelve Data as fallback, but hit 800/day quota after one sync attempt (massive backlog from backfilled midday cells).
+
+Then discovered Yahoo's unadvertised `?interval=5m&range=60d` endpoint returns **60 trading days of 5-min bars in a single call** (4,681 bars for AAPL). Rewrote fetchIntradayPrice with symbol-level caching: 1 Yahoo call per unique symbol per sync, then instant in-memory lookups for all d1-d10 cells. Added memory optimization (filter to target time windows only), bumped container memory 256M→1G with NODE_OPTIONS heap, and added a Twelve Data circuit breaker. Verified: sync completes in 4:25 for 86 active entries.
+
+Also researched paper trading APIs. Earlier research falsely claimed Alpaca paper-only worked from Canada; verified directly by visiting signup form and confirmed **Canada is blocked at the country dropdown** (list includes Comoros, Congo, China, Cyprus, Chile, Colombia, Ecuador — but NOT Canada). The app already has paper trading built-in via `paper_trades` table and `/api/paper/route.ts` — decided to extend that rather than chase external APIs.
+
+### Data Provider Research (documented here for future reference)
+
+**Tested and confirmed working for historical 5-min bars on free tier:**
+
+| Provider | Historical Intraday | Limit | Notes |
+|----------|:-------------------:|:-----:|-------|
+| **Yahoo Finance** (unofficial) | **60 trading days** | Rate-limited (no hard cap) | Best free source. Single call returns all 60 days. Use `?interval=5m&range=60d`. |
+| **Twelve Data** | 1+ month | 800 credits/day | Second best. 1 credit per symbol per call. Resets at UTC midnight. Grow plan $66/mo = unlimited. |
+
+**Tested and confirmed DOES NOT work for historical intraday on free tier (2026):**
+
+| Provider | Signed Up? | Historical Intraday Free? | What IS Free |
+|----------|:---:|:---:|---|
+| **Finnhub** | Yes (key: `d7bmg59r01qo9pqu6pcgd7bmg59r01qo9pqu6pd0`) | No — `/stock/candle` returns `"You don't have access to this resource"` | Real-time quote only, 60 calls/min |
+| **FMP** | Yes (key: `WPaPEeBQd8mMXe8d7rjnDzupF9wGWY61`) | No — `/stable/historical-chart/5min` returns "Restricted Endpoint" | Real-time quote + EOD daily, 250 calls/day |
+| **Alpha Vantage** | No | No — `TIME_SERIES_INTRADAY` with `month=` is premium-only | 25 calls/day daily-only |
+| **Polygon.io** | No | No — EOD aggregates only on Stocks Basic free | Confirmed by staff forum post |
+| **EODHD** | No | No — EOD only free, intraday at $29.99/mo | — |
+| **Marketstack** | No | No — sub-15min intervals require Professional $99/mo | — |
+| **Tiingo** | No | IEX intraday with 2000-bar rolling window (~7 days) | Not useful for >1 week history |
+
+**Paper trading APIs (Canada accessible, with or without KYC):**
+
+| Service | Paper Trading | Canada OK | Signup Friction |
+|---------|:---:|:---:|---|
+| **Alpaca Paper-Only** | Yes, full API | **NO — Canada blocked at signup dropdown** (confirmed 2026-04-09) | N/A |
+| **Tradier Sandbox** | Yes, 15-min delayed | Yes (dev sandbox) | Email only |
+| **IBKR Paper** | Yes (US securities only from Canada) | Yes | Full KYC + fund live account first |
+| **Moomoo OpenAPI** | Yes | Yes (Moomoo CA entity) | Mobile app + account |
+| **TradeStation SIM** | Yes | Maybe via International | Full account |
+| **Questrade API** | Practice account exists but API order execution blocked for retail | Yes | — |
+| **Wealthsimple** | No official API | — | — |
+| **Twelve Data / Finnhub / FMP / Yahoo** | **NO — all data-only providers, no order execution** | — | — |
+
+**Key insight**: None of the data providers (Twelve Data, Finnhub, FMP, Yahoo) offer paper trading APIs. Paper trading requires a broker API. Alpaca was the obvious choice but Canada is blocked. The app already has built-in paper trading via `paper_trades` table and `/api/paper/route.ts` — extending that is the right path forward.
+
+### Commits
+- `4e230f1` — fix(surveillance): unify VPS MySQL as single source of truth
+- `aff6c91` — fix: resolve 12 issues from 5-agent critic review
+- `3a28222` — fix: resolve remaining review issues
+- `2547526` — feat(cron): integrate Twelve Data as primary intraday source
+- `3208de3` — feat(cron): Yahoo 60-day range as primary with symbol-level caching
+
+### Session Notes
+-> `.claude/sessions/2026-04-09-071000.md`
+
+---
+
 ## [2026-04-07 17:21] — Full Pipeline: Yahoo Fallback, Matrix Tab, 3-Month Backfill, Strategy Analysis, Paper Trading
 
 **Area:** Trading/Surveillance, Trading/Matrix, Trading/Analysis, Trading/PaperTrading
