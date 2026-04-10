@@ -37,19 +37,32 @@ export default function StrategiesPage() {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<"ranking" | "grouped">("ranking");
 
-  const loadData = useCallback(async () => {
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/strategies");
+        const data = await res.json();
+        if (!cancelled) {
+          setStrategies(data.strategies || []);
+          setGrouped(data.grouped || {});
+          setLoading(false);
+        }
+      } catch {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const loadData = async () => {
     try {
       const res = await fetch("/api/strategies");
       const data = await res.json();
       setStrategies(data.strategies || []);
       setGrouped(data.grouped || {});
     } catch { /* ignore */ }
-    setLoading(false);
-  }, []);
-
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
+  };
 
   // Sort by total P&L descending
   const ranked = [...strategies].sort((a, b) => b.stats.total_pnl_usd - a.stats.total_pnl_usd);
