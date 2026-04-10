@@ -9,6 +9,85 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-10 04:30] — Strategy Scenario Engine: 24 Parallel Strategies + Backtest Results
+
+**Area:** Trading/Strategy, Trading/Paper
+**Type:** feature
+
+### Files Changed
+- `src/lib/strategy-engine.ts` — **New** — Config-driven entry/exit evaluation, P&L computation, 8 strategy templates × 3 leverages
+- `src/lib/migrations.ts` — Added paper_strategies, paper_signals, paper_position_prices tables
+- `scripts/seed-strategies.ts` — **New** — Seeds 24 strategies with dedicated $100k accounts
+- `scripts/backtest-strategies.ts` — **New** — Runs all strategies against 420 historical entries, outputs ranking table
+
+### Functions/Symbols Modified
+- `matchesEntry()`, `evaluateExit()`, `computePnL()` — new in strategy-engine.ts
+- `STRATEGY_TEMPLATES`, `LEVERAGE_TIERS`, `generateAllStrategies()` — new
+- Types: `EntryConfig`, `SizingConfig`, `ExitConfig`, `StrategyConfig`, `ReversalCandidate`, `PositionState`, `ExitDecision`
+
+### Database Tables
+- `paper_strategies` — Created + seeded with 24 entries (8 templates × 3 leverage tiers)
+- `paper_signals` — Created, populated by backtest with BACKTEST_WIN/BACKTEST_LOSS records
+- `paper_position_prices` — Created (for future high-frequency position tracking)
+
+### Summary
+Built the Strategy Scenario Engine — a config-driven framework for running 24 trading strategies in parallel. Each strategy has its own $100k account and JSON config defining entry criteria, position sizing, and exit rules. Ran backtest against 420 historical reversal entries (21 cohort days). Key finding: **only 2 strategies are profitable** — Baseline 3D (hold 3 days, +$284 at 1x, +$2,901 at 10x, 54.3% win rate) and Big Drop (≥10% drops, +$430 at 1x, +$4,855 at 10x, 50% win rate). ALL trailing stop strategies LOSE money on mean reversion because the price dips first before recovering. Simple time-based exit outperforms all complex exit rules.
+
+### Session Notes
+→ `.claude/sessions/2026-04-10-022000.md`
+
+---
+
+## [2026-04-10 02:20] — Full Session: Yahoo 60-Day Rewrite, 3 Data Provider Signups, Paper Trading Simulator, Idempotent Enrollment Fix
+
+**Area:** Trading/Surveillance, Trading/Paper, Trading/Infrastructure, Trading/Data
+**Type:** feature + bugfix + research
+
+### Files Changed
+- `docker/init-db.sql` — Added 5 web app tables (prices_daily, strategy_runs, trades, run_metrics, app_settings)
+- `scripts/tunnel-db.sh` — **New** — SSH tunnel for local dev → VPS MySQL
+- `src/lib/surveillance.ts` — Critical trading-day loop fix, VALID_COLUMNS, SYMBOL_RE, MARKET_HOLIDAYS, encodeURIComponent, isFinite, LIMIT 500
+- `src/app/api/surveillance/sync/route.ts` — SYNC_SECRET auth, consecutive_days upsert, **idempotent enrollment check**
+- `src/lib/migrations.ts` — UNIQUE KEY on surveillance_failures; **new paper_accounts, paper_orders, paper_equity_snapshots**; extended paper_trades with account_id + quantity
+- `scripts/surveillance-cron.ts` — MARKET_HOLIDAYS, holiday skip, LIMIT 500, SQL DATE_SUB, **Twelve Data integration with circuit breaker, Yahoo 60-day rewrite with symbol-level caching, orphan cleanup, idempotent jobEnrollMovers**
+- `scripts/deploy-surveillance.sh` — Removed hardcoded password, quoted $VPS
+- `scripts/backfill-matrix.ts` — COALESCE to preserve live prices
+- `docker/docker-compose.surveillance.yml` — TWELVEDATA_API_KEY env var, memory 256M→1G, CPU 0.5→1.0, NODE_OPTIONS heap
+- `.env.local` — Added TWELVEDATA_API_KEY, FINNHUB_API_KEY, FMP_API_KEY
+- `src/lib/paper.ts` — **New** — Paper trading library with order matching engine
+- `src/app/api/paper/route.ts` — Rewrote GET to return account + trades + orders, runs matching engine
+- `src/app/api/paper/order/route.ts` — **New** — POST place orders (BUY/SELL × MARKET/LIMIT/STOP), DELETE cancel
+- `src/app/api/paper/account/route.ts` — **New** — GET account state, POST reset
+- `src/app/paper/page.tsx` — Rewrote UI with account KPIs, buy form, pending orders, positions, history, reset
+- `tsconfig.json` — Excluded scripts/surveillance-cron.ts from Next build (uses node-cron from separate package)
+
+### Functions/Symbols Modified
+- `fetchIntradayPrice()` in cron — **rewrote** as cache-based Yahoo 60-day primary with Twelve Data fallback
+- `fetchYahoo60d()`, `fetchTwelveDataDay()`, `getSymbolBars()`, `lookupBar()`, `targetTimeFor()`, `Bar5m` type, `SymbolBarCache` type — new in cron
+- `fetchLivePrice()`, `fetchLivePrices()`, `getDefaultAccount()`, `computeAccountEquity()`, `fillPendingOrders()`, `fillOrder()` — new in `src/lib/paper.ts`
+- `syncActiveSurveillance()` — trading day loop fix, holiday skip, LIMIT 500, VALID_COLUMNS
+- `jobEnrollMovers()` in cron — added idempotency check (COUNT before enroll)
+- `autoEnrollTrenders()` in sync/route.ts — added idempotency check
+- `fetchMoversFromYahoo()` — SYMBOL_RE validation, isFinite guards, typing
+- `jobSyncPrices()` — per-sync cache map, Twelve Data circuit breaker, orphan cleanup, holiday skip
+- `PaperTradingPage()` — rewrote
+
+### Database Tables
+- `paper_accounts`, `paper_orders`, `paper_equity_snapshots` — **Created** (new simulator schema)
+- `paper_trades` — Extended with account_id + quantity
+- `prices_daily`, `strategy_runs`, `trades`, `run_metrics`, `app_settings` — Created on VPS
+- `reversal_entries` — Backfilled 466 → marked 380 COMPLETED → deleted 46 April 8 dupes → 40 ACTIVE remain
+- `surveillance_failures` — Added UNIQUE KEY, cleaned orphans
+- `surveillance_logs` — Orphan RUNNING cleanup query added
+
+### Summary
+Major multi-phase session. Unified VPS MySQL as single source of truth (cron + web app were on separate DBs). Ran 5-agent critic review and fixed 12 issues including a critical calendar-day vs trading-day loop bug. Signed up for 3 data providers via Playwright (Twelve Data works, Finnhub and FMP both gate historical intraday behind paid tiers). Discovered Yahoo's unadvertised `?interval=5m&range=60d` endpoint and rewrote fetchIntradayPrice with symbol-level caching (30× fewer API calls, 1G container memory). Built full paper trading simulator (accounts, orders, cash, matching engine) after verifying via Playwright that Alpaca and Tradier both block Canadians. Fixed enrollment idempotency bug that caused April 8 cohort to balloon to 66 tickers (each container restart fetched different Yahoo top 10). All verified: cron is running, filled 59/60 April 8 cohort d1 prices (98.3%, 1 gap is Yahoo data quirk), idempotency working ("SKIP: already enrolled" logged), paper trading buy/sell flow works end-to-end.
+
+### Session Notes
+→ `.claude/sessions/2026-04-10-022000.md`
+
+---
+
 ## [2026-04-09 07:10] — Unify VPS MySQL, Critic Review, Yahoo 60-Day Rewrite, Data Provider Research
 
 **Area:** Trading/Surveillance, Trading/Infrastructure, Trading/Data
