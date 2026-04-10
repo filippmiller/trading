@@ -328,7 +328,7 @@ export default function PaperTradingPage() {
                   </div>
                   <button
                     onClick={() => handleSell(trade)}
-                    disabled={selling === trade.id || !trade.current_price}
+                    disabled={selling === trade.id}
                     className={`ml-4 px-5 py-2 rounded-lg font-bold text-sm transition-all ${
                       trade.live_pnl_pct && trade.live_pnl_pct > 0
                         ? "bg-emerald-500 hover:bg-emerald-600 text-white"
