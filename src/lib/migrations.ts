@@ -164,6 +164,55 @@ const schemaStatements = [
     equity DECIMAL(18,6) NOT NULL,
     INDEX IX_paper_equity_account_time (account_id, snapshot_at)
   ) ENGINE=InnoDB;`,
+  // ── Scenario Engine ──────────────────────────────────────────────────────
+  `CREATE TABLE IF NOT EXISTS paper_strategies (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    account_id INT NULL,
+    name VARCHAR(128) NOT NULL,
+    strategy_type VARCHAR(32) NOT NULL DEFAULT 'TRADING',
+    leverage INT NOT NULL DEFAULT 1,
+    enabled TINYINT NOT NULL DEFAULT 1,
+    config_json LONGTEXT NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    UNIQUE KEY UX_strategy_name (name),
+    INDEX IX_strategy_enabled (enabled)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS paper_signals (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    strategy_id INT NOT NULL,
+    reversal_entry_id INT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    generated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+    entry_price DECIMAL(18,6) NULL,
+    entry_at DATETIME(6) NULL,
+    exit_price DECIMAL(18,6) NULL,
+    exit_at DATETIME(6) NULL,
+    exit_reason VARCHAR(32) NULL,
+    investment_usd DECIMAL(18,6) NOT NULL DEFAULT 1000,
+    leverage INT NOT NULL DEFAULT 1,
+    effective_exposure DECIMAL(18,6) NULL,
+    max_price DECIMAL(18,6) NULL,
+    min_price DECIMAL(18,6) NULL,
+    max_pnl_pct DECIMAL(10,4) NULL,
+    min_pnl_pct DECIMAL(10,4) NULL,
+    pnl_usd DECIMAL(18,6) NULL,
+    pnl_pct DECIMAL(18,6) NULL,
+    holding_minutes INT NULL,
+    trailing_stop_price DECIMAL(18,6) NULL,
+    trailing_active TINYINT NOT NULL DEFAULT 0,
+    INDEX IX_signal_strategy (strategy_id),
+    INDEX IX_signal_status (status),
+    INDEX IX_signal_symbol (symbol),
+    INDEX IX_signal_reversal (reversal_entry_id)
+  ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS paper_position_prices (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    signal_id INT NOT NULL,
+    price DECIMAL(18,6) NOT NULL,
+    fetched_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX IX_pos_price_signal (signal_id, fetched_at)
+  ) ENGINE=InnoDB;`,
 ];
 
 const ALLOWED_TABLES = new Set(["strategy_runs", "run_metrics", "reversal_entries", "paper_trades"]);
