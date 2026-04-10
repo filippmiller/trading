@@ -526,6 +526,144 @@ async function jobSyncPrices() {
   }
 }
 
+// ─── Strategy Auto-Trader ──────────────────────────────────────────────────
+
+/**
+ * Execute all enabled trading strategies against today's newly enrolled reversal entries.
+ * Runs after enrollment at 9:50 AM ET.
+ *
+ * For each strategy:
+ *   1. Load config from paper_strategies
+ *   2. Query today's reversal_entries matching config.entry criteria
+ *   3. Check concurrent position cap and daily cap
+ *   4. Create paper_signals as EXECUTED (auto-trade, no manual approval)
+ *   5. Deduct investment from strategy's dedicated account
+ */
+async function jobExecuteStrategies() {
+  if (!isTradingDay()) return;
+
+  const db = getPool();
+  const today = todayET();
+
+  // Load all enabled TRADING strategies
+  const [strategies] = await db.execute<mysql.RowDataPacket[]>(
+    "SELECT s.*, a.cash FROM paper_strategies s LEFT JOIN paper_accounts a ON s.account_id = a.id WHERE s.enabled = 1 AND s.strategy_type = 'TRADING'"
+  );
+
+  if (strategies.length === 0) { log("  Strategies: none enabled"); return; }
+
+  // Load today's reversal entries
+  const [entries] = await db.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM reversal_entries WHERE cohort_date = ?",
+    [today]
+  );
+
+  if (entries.length === 0) { log("  Strategies: no entries for today"); return; }
+
+  let totalSignals = 0;
+
+  for (const strat of strategies) {
+    const config = JSON.parse(strat.config_json);
+    const entry = config.entry || {};
+    const sizing = config.sizing || {};
+    const leverage = Number(strat.leverage || 1);
+    const investmentPerTrade = Number(sizing.amount_usd || 1000);
+    const maxConcurrent = Number(sizing.max_concurrent || 15);
+    const maxNewPerDay = Number(sizing.max_new_per_day || 3);
+    const cash = Number(strat.cash || 0);
+
+    // Count existing open positions for this strategy
+    const [openCount] = await db.execute<mysql.RowDataPacket[]>(
+      "SELECT COUNT(*) as cnt FROM paper_signals WHERE strategy_id = ? AND status = 'EXECUTED' AND exit_at IS NULL",
+      [strat.id]
+    );
+    let currentOpen = Number(openCount[0].cnt);
+
+    // Count signals already created today for this strategy
+    const [todayCount] = await db.execute<mysql.RowDataPacket[]>(
+      "SELECT COUNT(*) as cnt FROM paper_signals WHERE strategy_id = ? AND DATE(generated_at) = ?",
+      [strat.id, today]
+    );
+    let todayNew = Number(todayCount[0].cnt);
+
+    let stratSignals = 0;
+
+    for (const e of entries) {
+      // Cap checks
+      if (currentOpen >= maxConcurrent) break;
+      if (todayNew >= maxNewPerDay) break;
+      if (cash < investmentPerTrade) break;
+
+      // Direction filter
+      if (entry.direction === "LONG" && e.direction !== "LONG") continue;
+      if (entry.direction === "SHORT" && e.direction !== "SHORT") continue;
+
+      const pct = Number(e.day_change_pct);
+
+      // Drop magnitude for LONG
+      if (e.direction === "LONG") {
+        if (entry.min_drop_pct != null && pct > entry.min_drop_pct) continue;
+        if (entry.max_drop_pct != null && pct < entry.max_drop_pct) continue;
+      }
+
+      // Rise magnitude for SHORT
+      if (e.direction === "SHORT") {
+        if (entry.min_rise_pct != null && pct < entry.min_rise_pct) continue;
+        if (entry.max_rise_pct != null && pct > entry.max_rise_pct) continue;
+      }
+
+      // Consecutive days filter
+      if (entry.max_consecutive_days != null && e.consecutive_days != null) {
+        if (Number(e.consecutive_days) > entry.max_consecutive_days) continue;
+      }
+
+      // Min price filter
+      if (entry.min_price != null && Number(e.entry_price) < entry.min_price) continue;
+
+      // Check for duplicate signal (same strategy + same reversal entry)
+      const [dupCheck] = await db.execute<mysql.RowDataPacket[]>(
+        "SELECT 1 FROM paper_signals WHERE strategy_id = ? AND reversal_entry_id = ?",
+        [strat.id, e.id]
+      );
+      if (dupCheck.length > 0) continue;
+
+      // Create signal
+      const entryPrice = Number(e.entry_price);
+      await db.execute(
+        `INSERT INTO paper_signals
+         (strategy_id, reversal_entry_id, symbol, status,
+          entry_price, entry_at, investment_usd, leverage, effective_exposure,
+          max_price, min_price, max_pnl_pct, min_pnl_pct)
+         VALUES (?, ?, ?, 'EXECUTED',
+                 ?, CURRENT_TIMESTAMP(6), ?, ?, ?,
+                 ?, ?, 0, 0)`,
+        [
+          strat.id, e.id, e.symbol,
+          entryPrice, investmentPerTrade, leverage, investmentPerTrade * leverage,
+          entryPrice, entryPrice,
+        ]
+      );
+
+      // Deduct from strategy account
+      await db.execute(
+        "UPDATE paper_accounts SET cash = cash - ? WHERE id = ?",
+        [investmentPerTrade, strat.account_id]
+      );
+
+      currentOpen++;
+      todayNew++;
+      stratSignals++;
+      totalSignals++;
+    }
+
+    if (stratSignals > 0) {
+      log(`    ${strat.name}: ${stratSignals} signals (${currentOpen} open, $${(cash - stratSignals * investmentPerTrade).toFixed(0)} cash remaining)`);
+    }
+  }
+
+  log(`  Strategies: ${totalSignals} total signals across ${strategies.length} strategies`);
+}
+
 // ─── Paper Position Monitor ────────────────────────────────────────────────
 
 /**
@@ -799,6 +937,11 @@ cron.schedule("45 9 * * 1-5", async () => {
   try { await runFullSync(); } catch (err) { log(`ERROR morning sync: ${err}`); }
 }, CRON_OPTIONS);
 
+cron.schedule("50 9 * * 1-5", async () => {
+  log("=== STRATEGIES: Auto-trade ===");
+  try { await jobExecuteStrategies(); } catch (err) { log(`ERROR executing strategies: ${err}`); }
+}, CRON_OPTIONS);
+
 cron.schedule("35 12 * * 1-5", async () => {
   log("=== MIDDAY: Sync prices ===");
   try { await jobSyncPrices(); } catch (err) { log(`ERROR midday sync: ${err}`); }
@@ -826,6 +969,7 @@ log("========================================");
 log("Surveillance Cron Scheduler started");
 log("Schedule (ET, Mon-Fri):");
 log("  09:45 — Enroll movers + morning prices");
+log("  09:50 — Execute trading strategies");
 log("  12:35 — Midday prices");
 log("  16:05 — Close prices");
 log("  18:00 — Evening catchup");
@@ -833,8 +977,15 @@ log("  */15  — Position monitor (9:00-16:59)");
 log("========================================");
 
 log("Running immediate catchup sync...");
-runFullSync().then(() => {
-  log("Startup sync complete. Waiting for scheduled jobs...");
+runFullSync().then(async () => {
+  log("Startup sync complete.");
+  // Run strategies on startup too (in case container restarted after 9:50)
+  try {
+    await jobExecuteStrategies();
+  } catch (err) {
+    log(`Startup strategy error: ${err}`);
+  }
+  log("Waiting for scheduled jobs...");
 }).catch(err => {
   log(`Startup sync error: ${err}`);
 });
