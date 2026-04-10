@@ -9,6 +9,39 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-10 08:00] — Strategy Dashboard, Auto-Trade Cron, Position Monitor, Sell Button Fix
+
+**Area:** Trading/Strategy, Trading/Paper, Trading/Cron
+**Type:** feature + bugfix
+
+### Files Changed
+- `src/app/api/strategies/route.ts` — **New** — GET endpoint, 2 aggregated queries, no ensureSchema
+- `src/app/strategies/page.tsx` — **New** — Top 3 podium + 24-strategy ranking table + grouped view toggle
+- `scripts/surveillance-cron.ts` — Added jobExecuteStrategies (9:50 AM auto-trade), jobMonitorPositions (every 15 min), updated schedule + startup
+- `src/app/paper/page.tsx` — Fixed sell button disabled when Yahoo price unavailable
+- `src/lib/paper.ts` — fetchLivePrices concurrency limit (batch 5), non-recursive getDefaultAccount, variable rename
+- `src/lib/strategy-engine.ts` — Trailing stop watermark fix, computePnL zero guard
+
+### Functions/Symbols Modified
+- `jobExecuteStrategies()` — new in cron (matches entries against strategy configs, creates signals, deducts cash)
+- `jobMonitorPositions()` — new in cron (fetches prices every 15 min, records history, checks exits, fills orders)
+- `fetchLivePrices()` — modified (batch concurrency limit)
+- `getDefaultAccount()` — modified (non-recursive)
+- `evaluateExit()` — modified (Math.max trailing stop)
+- `computePnL()` — modified (zero guard)
+
+### Database Tables
+- `paper_signals` — 69 live signals auto-created by jobExecuteStrategies on first run
+- `paper_position_prices` — will be populated every 15 min during market hours
+
+### Summary
+Built the strategy comparison dashboard (Phase 4) showing all 24 strategies ranked by P&L with backtest data — Big Drop (10x) at #1 with +$4,855, Baseline 3D (10x) at #2 with +$2,901. Built the auto-trade cron job (Phase 5) that executes all enabled strategies at 9:50 AM ET — verified: 69 live signals created across 21 trading strategies on first run. Added 15-minute position monitor for live price tracking, stop loss triggers, and limit order fills. Fixed sell button being disabled when Yahoo price unavailable. Applied 5 code review fixes (concurrency, recursion, watermark, zero guard, shadowing). All verified on VPS: cron running, strategies executing, 60 active tickers across 3 cohorts.
+
+### Session Notes
+→ `.claude/sessions/2026-04-10-080000.md`
+
+---
+
 ## [2026-04-10 05:00] — Code Review + Critic: 5 Fixes Applied, Clean Pass
 
 **Area:** Trading/Strategy, Trading/Paper
