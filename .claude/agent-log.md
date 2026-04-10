@@ -9,6 +9,34 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-10 05:00] — Code Review + Critic: 5 Fixes Applied, Clean Pass
+
+**Area:** Trading/Strategy, Trading/Paper
+**Type:** bugfix
+
+### Files Changed
+- `src/lib/paper.ts` — Concurrency limit on fetchLivePrices (batch of 5), non-recursive getDefaultAccount, renamed shadowed tradeRows variable
+- `src/lib/strategy-engine.ts` — Trailing stop high watermark fix using Math.max, division-by-zero guard in computePnL
+- `scripts/backtest-strategies.ts` — let→const lint fix
+
+### Functions/Symbols Modified
+- `fetchLivePrices()` — modified (concurrency limit: batches of 5)
+- `getDefaultAccount()` — modified (non-recursive, throws on failure)
+- `evaluateExit()` — modified (trailing stop uses Math.max for effective high)
+- `computePnL()` — modified (entryPrice <= 0 guard)
+- `fillOrder()` — modified (renamed shadowed tradeRows → openTradeRows)
+
+### Database Tables
+- N/A
+
+### Summary
+Ran /review on all session work, found and fixed 5 issues: unbounded parallel Yahoo fetches (now batched at 5), recursive getDefaultAccount without guard (now non-recursive with throw), trailing stop not considering current price as potential new high (now uses Math.max), division-by-zero in computePnL (now guards entryPrice <= 0), and variable shadowing in fillOrder SELL branch (renamed). Ran /critic after — clean pass, 0 new issues. All verified: TSC 0 errors, lint 0 issues on session files, Next.js build passes.
+
+### Session Notes
+→ `.claude/sessions/2026-04-10-050000.md`
+
+---
+
 ## [2026-04-10 04:30] — Strategy Scenario Engine: 24 Parallel Strategies + Backtest Results
 
 **Area:** Trading/Strategy, Trading/Paper
