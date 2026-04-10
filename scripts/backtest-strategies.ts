@@ -87,7 +87,7 @@ async function main() {
 
     let trades = 0, wins = 0, losses = 0;
     let totalPnlUsd = 0;
-    let pnlPcts: number[] = [];
+    const pnlPcts: number[] = [];
     let equity = 100000;
     let peakEquity = equity;
     let maxDrawdownPct = 0;
