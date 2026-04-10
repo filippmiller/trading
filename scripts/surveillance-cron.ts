@@ -526,6 +526,257 @@ async function jobSyncPrices() {
   }
 }
 
+// ─── Paper Position Monitor ────────────────────────────────────────────────
+
+/**
+ * Monitor open paper positions + pending orders every 15 minutes during market hours.
+ * - Fetches live prices for all open positions and pending orders
+ * - Records prices in paper_position_prices for charting
+ * - Fills triggered limit/stop orders
+ * - Checks exit conditions (hard stop, trailing stop, take profit, time exit)
+ * - Updates max/min watermarks on paper_signals
+ */
+async function jobMonitorPositions() {
+  if (!isTradingDay()) return;
+
+  const db = getPool();
+
+  // 1. Fetch all open signals (from paper_signals WHERE status = 'EXECUTED' AND exit_at IS NULL)
+  const [openSignals] = await db.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_signals WHERE status = 'EXECUTED' AND exit_at IS NULL"
+  );
+
+  // 2. Fetch all pending orders
+  const [pendingOrders] = await db.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_orders WHERE status = 'PENDING'"
+  );
+
+  // 3. Collect unique symbols
+  const symbols = new Set<string>();
+  for (const s of openSignals) symbols.add(s.symbol);
+  for (const o of pendingOrders) symbols.add(o.symbol);
+
+  if (symbols.size === 0) {
+    log("  Monitor: 0 positions, 0 pending orders — nothing to do");
+    return;
+  }
+
+  // 4. Fetch live prices (batched, rate-limited)
+  const prices: Record<string, number> = {};
+  const symbolArr = [...symbols];
+  for (let i = 0; i < symbolArr.length; i += 5) {
+    const batch = symbolArr.slice(i, i + 5);
+    await Promise.all(batch.map(async (sym) => {
+      try {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`;
+        const res = await fetch(url, { headers: { "User-Agent": UA } });
+        if (!res.ok) return;
+        const data = await res.json();
+        const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+        if (typeof price === "number" && isFinite(price) && price > 0) {
+          prices[sym] = price;
+        }
+      } catch { /* skip */ }
+    }));
+    if (i + 5 < symbolArr.length) await sleep(300);
+  }
+
+  let pricesRecorded = 0, ordersFilled = 0, positionsClosed = 0;
+
+  // 5. Record prices + update watermarks for open signals
+  for (const sig of openSignals) {
+    const price = prices[sig.symbol];
+    if (price == null) continue;
+
+    // Record price point
+    await db.execute(
+      "INSERT INTO paper_position_prices (signal_id, price) VALUES (?, ?)",
+      [sig.id, price]
+    );
+    pricesRecorded++;
+
+    // Update max/min watermarks
+    const maxPrice = Math.max(Number(sig.max_price || 0), price);
+    const minPrice = sig.min_price ? Math.min(Number(sig.min_price), price) : price;
+    const entryPrice = Number(sig.entry_price);
+    const pnlPct = entryPrice > 0 ? ((price - entryPrice) / entryPrice) * 100 : 0;
+    const leverage = Number(sig.leverage || 1);
+    const leveragedPnl = pnlPct * leverage;
+    const maxPnl = Math.max(Number(sig.max_pnl_pct || -999), leveragedPnl);
+    const minPnl = Math.min(Number(sig.min_pnl_pct || 999), leveragedPnl);
+
+    await db.execute(
+      `UPDATE paper_signals SET max_price = ?, min_price = ?, max_pnl_pct = ?, min_pnl_pct = ? WHERE id = ?`,
+      [maxPrice, minPrice, maxPnl, minPnl, sig.id]
+    );
+
+    // Check exit conditions from strategy config
+    const [stratRows] = await db.execute<mysql.RowDataPacket[]>(
+      "SELECT config_json, leverage FROM paper_strategies WHERE id = ?",
+      [sig.strategy_id]
+    );
+    if (stratRows.length === 0) continue;
+
+    const config = JSON.parse(stratRows[0].config_json);
+    const exits = config.exits || {};
+
+    let exitReason: string | null = null;
+
+    // Hard stop
+    if (exits.hard_stop_pct != null && pnlPct <= exits.hard_stop_pct) {
+      exitReason = "HARD_STOP";
+    }
+
+    // Leverage liquidation
+    if (leverage > 1 && leveragedPnl <= -90) {
+      exitReason = "LIQUIDATED";
+    }
+
+    // Take profit
+    if (exits.take_profit_pct != null && pnlPct >= exits.take_profit_pct) {
+      exitReason = "TAKE_PROFIT";
+    }
+
+    // Trailing stop
+    if (exits.trailing_stop_pct != null) {
+      const activateAt = exits.trailing_activates_at_profit_pct ?? 0;
+      let trailActive = sig.trailing_active === 1;
+      let trailStop = sig.trailing_stop_price ? Number(sig.trailing_stop_price) : null;
+
+      if (!trailActive && pnlPct >= activateAt) {
+        trailActive = true;
+        trailStop = price * (1 - exits.trailing_stop_pct / 100);
+      }
+      if (trailActive) {
+        const newStop = maxPrice * (1 - exits.trailing_stop_pct / 100);
+        if (trailStop == null || newStop > trailStop) trailStop = newStop;
+        if (price <= trailStop) exitReason = "TRAIL_STOP";
+      }
+
+      // Persist trailing state
+      await db.execute(
+        "UPDATE paper_signals SET trailing_active = ?, trailing_stop_price = ? WHERE id = ?",
+        [trailActive ? 1 : 0, trailStop, sig.id]
+      );
+    }
+
+    // Time exit (trading days)
+    if (exits.time_exit_days != null && sig.entry_at) {
+      const entryMs = new Date(sig.entry_at).getTime();
+      const holdDays = (Date.now() - entryMs) / (1000 * 60 * 60 * 24);
+      const tradingDays = Math.floor(holdDays * 5 / 7);
+      if (tradingDays >= exits.time_exit_days) exitReason = "TIME";
+    }
+
+    // Execute exit
+    if (exitReason) {
+      const investment = Number(sig.investment_usd);
+      const rawPct = ((price - entryPrice) / entryPrice) * 100;
+      const leveragedPctFinal = Math.max(rawPct * leverage, -100);
+      const pnlUsd = investment * (leveragedPctFinal / 100);
+      const holdMinutes = sig.entry_at
+        ? Math.round((Date.now() - new Date(sig.entry_at).getTime()) / 60000)
+        : null;
+
+      await db.execute(
+        `UPDATE paper_signals SET
+           status = CASE WHEN ? > 0 THEN 'WIN' ELSE 'LOSS' END,
+           exit_price = ?, exit_at = CURRENT_TIMESTAMP(6), exit_reason = ?,
+           pnl_usd = ?, pnl_pct = ?, holding_minutes = ?
+         WHERE id = ?`,
+        [pnlUsd, price, exitReason, pnlUsd, leveragedPctFinal, holdMinutes, sig.id]
+      );
+
+      // Return cash to strategy account
+      const proceeds = investment + pnlUsd;
+      if (proceeds > 0) {
+        await db.execute(
+          "UPDATE paper_accounts SET cash = cash + ? WHERE id = (SELECT account_id FROM paper_strategies WHERE id = ?)",
+          [proceeds, sig.strategy_id]
+        );
+      }
+
+      positionsClosed++;
+      log(`    EXIT ${sig.symbol} [${exitReason}] P&L: ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${leveragedPctFinal.toFixed(1)}%)`);
+    }
+  }
+
+  // 6. Fill triggered pending orders (limit/stop)
+  for (const order of pendingOrders) {
+    const price = prices[order.symbol];
+    if (price == null) continue;
+
+    const limit = order.limit_price ? Number(order.limit_price) : null;
+    const stop = order.stop_price ? Number(order.stop_price) : null;
+    const side = order.side as string;
+    const type = order.order_type as string;
+
+    let shouldFill = false;
+    if (type === "MARKET") shouldFill = true;
+    else if (type === "LIMIT" && limit != null) {
+      shouldFill = side === "BUY" ? price <= limit : price >= limit;
+    } else if (type === "STOP" && stop != null) {
+      shouldFill = side === "BUY" ? price >= stop : price <= stop;
+    }
+
+    if (!shouldFill) continue;
+
+    // Fill via the existing paper trading engine
+    if (side === "BUY" && order.investment_usd) {
+      const investment = Number(order.investment_usd);
+      const [acctRows] = await db.execute<mysql.RowDataPacket[]>(
+        "SELECT cash FROM paper_accounts WHERE id = ?", [order.account_id]
+      );
+      if (acctRows.length === 0 || Number(acctRows[0].cash) < investment) {
+        await db.execute("UPDATE paper_orders SET status='REJECTED', rejection_reason='Insufficient cash' WHERE id=?", [order.id]);
+        continue;
+      }
+      const qty = investment / price;
+      const [tradeResult] = await db.execute<mysql.ResultSetHeader>(
+        `INSERT INTO paper_trades (account_id, symbol, quantity, buy_price, buy_date, investment_usd, strategy, status)
+         VALUES (?, ?, ?, ?, CURRENT_DATE, ?, ?, 'OPEN')`,
+        [order.account_id, order.symbol, qty, price, investment, `${type} BUY`]
+      );
+      await db.execute("UPDATE paper_accounts SET cash = cash - ? WHERE id = ?", [investment, order.account_id]);
+      await db.execute(
+        "UPDATE paper_orders SET status='FILLED', filled_price=?, filled_at=CURRENT_TIMESTAMP(6), trade_id=? WHERE id=?",
+        [price, tradeResult.insertId, order.id]
+      );
+      ordersFilled++;
+      log(`    FILL ${order.symbol} ${type} BUY at $${price.toFixed(2)}`);
+    } else if (side === "SELL") {
+      const tradeId = order.trade_id ? Number(order.trade_id) : null;
+      const [tradeRows] = await db.execute<mysql.RowDataPacket[]>(
+        tradeId
+          ? "SELECT * FROM paper_trades WHERE id=? AND status='OPEN'"
+          : "SELECT * FROM paper_trades WHERE account_id=? AND symbol=? AND status='OPEN' ORDER BY id ASC LIMIT 1",
+        tradeId ? [tradeId] : [order.account_id, order.symbol]
+      );
+      if (tradeRows.length === 0) {
+        await db.execute("UPDATE paper_orders SET status='REJECTED', rejection_reason='No open position' WHERE id=?", [order.id]);
+        continue;
+      }
+      const trade = tradeRows[0];
+      const buyPrice = Number(trade.buy_price);
+      const investment = Number(trade.investment_usd);
+      const qty = Number(trade.quantity) || investment / buyPrice;
+      const proceeds = qty * price;
+      const pnlUsd = proceeds - investment;
+      const pnlPctVal = (pnlUsd / investment) * 100;
+
+      await db.execute("UPDATE paper_trades SET status='CLOSED', sell_price=?, sell_date=CURRENT_DATE, pnl_usd=?, pnl_pct=? WHERE id=?",
+        [price, pnlUsd, pnlPctVal, trade.id]);
+      await db.execute("UPDATE paper_accounts SET cash = cash + ? WHERE id = ?", [proceeds, order.account_id]);
+      await db.execute("UPDATE paper_orders SET status='FILLED', filled_price=?, filled_at=CURRENT_TIMESTAMP(6), trade_id=? WHERE id=?",
+        [price, trade.id, order.id]);
+      ordersFilled++;
+      log(`    FILL ${order.symbol} ${type} SELL at $${price.toFixed(2)}`);
+    }
+  }
+
+  log(`  Monitor: ${pricesRecorded} prices recorded, ${ordersFilled} orders filled, ${positionsClosed} positions closed`);
+}
+
 // ─── Schedule ───────────────────────────────────────────────────────────────
 
 async function runFullSync() {
@@ -563,6 +814,12 @@ cron.schedule("0 18 * * 1-5", async () => {
   try { await jobSyncPrices(); } catch (err) { log(`ERROR evening sync: ${err}`); }
 }, CRON_OPTIONS);
 
+// Paper position monitor — every 15 minutes during market hours (9:30-16:15 ET)
+cron.schedule("*/15 9-16 * * 1-5", async () => {
+  log("--- Monitor: checking positions + orders ---");
+  try { await jobMonitorPositions(); } catch (err) { log(`ERROR monitoring: ${err}`); }
+}, CRON_OPTIONS);
+
 // ─── Startup ────────────────────────────────────────────────────────────────
 
 log("========================================");
@@ -572,6 +829,7 @@ log("  09:45 — Enroll movers + morning prices");
 log("  12:35 — Midday prices");
 log("  16:05 — Close prices");
 log("  18:00 — Evening catchup");
+log("  */15  — Position monitor (9:00-16:59)");
 log("========================================");
 
 log("Running immediate catchup sync...");
