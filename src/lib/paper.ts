@@ -24,16 +24,20 @@ export async function fetchLivePrice(symbol: string): Promise<number | null> {
   }
 }
 
-/** Fetch live prices for a batch of symbols. Deduplicates. */
+/** Fetch live prices for a batch of symbols. Deduplicates. Limits concurrency to 5. */
 export async function fetchLivePrices(symbols: string[]): Promise<Record<string, number>> {
   const unique = Array.from(new Set(symbols.filter(s => SYMBOL_RE.test(s))));
   const out: Record<string, number> = {};
-  await Promise.all(
-    unique.map(async (s) => {
-      const p = await fetchLivePrice(s);
-      if (p != null) out[s] = p;
-    })
-  );
+  // Process in batches of 5 to avoid hammering Yahoo
+  for (let i = 0; i < unique.length; i += 5) {
+    const batch = unique.slice(i, i + 5);
+    await Promise.all(
+      batch.map(async (s) => {
+        const p = await fetchLivePrice(s);
+        if (p != null) out[s] = p;
+      })
+    );
+  }
   return out;
 }
 
@@ -64,7 +68,13 @@ export async function getDefaultAccount(): Promise<PaperAccount> {
   await pool.execute(
     "INSERT INTO paper_accounts (name, initial_cash, cash) VALUES ('Default', 100000, 100000)"
   );
-  return getDefaultAccount();
+  // Re-fetch after insert (non-recursive to prevent infinite loop)
+  const [created] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_accounts WHERE name = 'Default' LIMIT 1"
+  );
+  if (created.length === 0) throw new Error("Failed to create default paper account");
+  const r = created[0];
+  return { id: r.id, name: r.name, initial_cash: Number(r.initial_cash), cash: Number(r.cash), created_at: r.created_at };
 }
 
 /**
@@ -224,11 +234,11 @@ async function fillOrder(order: mysql.RowDataPacket, fillPrice: number): Promise
       tradeId = tradeRows[0].id;
     }
 
-    const [tradeRows] = await pool.execute<mysql.RowDataPacket[]>(
+    const [openTradeRows] = await pool.execute<mysql.RowDataPacket[]>(
       "SELECT * FROM paper_trades WHERE id=? AND status='OPEN'",
       [tradeId]
     );
-    if (tradeRows.length === 0) {
+    if (openTradeRows.length === 0) {
       await pool.execute(
         "UPDATE paper_orders SET status='REJECTED', rejection_reason='Trade not open' WHERE id=?",
         [order.id]
@@ -236,7 +246,7 @@ async function fillOrder(order: mysql.RowDataPacket, fillPrice: number): Promise
       return;
     }
 
-    const trade = tradeRows[0];
+    const trade = openTradeRows[0];
     const buyPrice = Number(trade.buy_price);
     const investment = Number(trade.investment_usd);
     const quantity = Number(trade.quantity) || investment / buyPrice;

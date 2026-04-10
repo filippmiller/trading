@@ -154,8 +154,12 @@ export function evaluateExit(pos: PositionState, config: StrategyConfig): ExitDe
     }
 
     // Update trailing stop if price made new high
-    if (newTrailingActive && pos.current_price >= pos.max_price) {
-      newTrailingStop = pos.current_price * (1 - exits.trailing_stop_pct / 100);
+    if (newTrailingActive) {
+      const effectiveHigh = Math.max(pos.max_price, pos.current_price);
+      const newStop = effectiveHigh * (1 - exits.trailing_stop_pct / 100);
+      if (newTrailingStop == null || newStop > newTrailingStop) {
+        newTrailingStop = newStop;
+      }
     }
 
     // Check if price hit the trailing stop
@@ -186,6 +190,7 @@ export function computePnL(
   investmentUsd: number,
   leverage: number
 ): { pnl_usd: number; pnl_pct: number } {
+  if (entryPrice <= 0) return { pnl_usd: 0, pnl_pct: 0 };
   const rawPct = ((exitPrice - entryPrice) / entryPrice) * 100;
   const leveragedPct = rawPct * leverage;
   // P&L is capped at -100% of investment (can't lose more than you put in)
