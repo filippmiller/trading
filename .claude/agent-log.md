@@ -346,3 +346,39 @@ Ran a comprehensive 5-agent parallel critic review on the trading platform. Foun
 -> `.claude/sessions/2026-04-02-074017.md`
 
 ---
+
+## [2026-04-11 14:01] — Trading Verification, Markets Chart Upgrade, Site Polish
+
+**Area:** Trading/Markets, Trading/Strategy, Trading/Paper, Trading/UI
+**Type:** feature + bugfix + verification
+
+### Files Changed
+- `src/app/api/strategies/route.ts` — fixed strategy equity accounting using marked open-position values
+- `scripts/surveillance-cron.ts` — fixed auto-trader cash overspend path
+- `scripts/backtest-strategies.ts` — enforced overlapping-position concurrency in backtests
+- `docker/init-db.sql` — aligned deploy schema with paper-trading and strategy runtime schema
+- `src/app/api/markets/route.ts` — added multi-range chart API support (`1d`, `5d`, `1mo`, `6mo`, `1y`)
+- `src/app/markets/page.tsx` — rebuilt ticker UI with Yahoo-like range selector and interactive SVG chart
+- `src/app/page.tsx` — rewrote landing page around actual surveillance → strategy → paper-execution flow
+- `src/app/strategies/page.tsx` — rebuilt strategy dashboard around corrected account metrics
+- `src/app/paper/page.tsx` — standardized copy and fixed effect/lint issue
+- `src/components/AppShell.tsx` — improved IA with `Markets`, `Strategy Dashboard`, and quick-jump search
+- `src/app/globals.css` — added ambient background styling
+
+### Summary
+Audited the recent trading work from scratch under the assumption that it was flawed. Found four high-signal issues: strategy dashboard equity double-counted realized P&L, strategy auto-trade could overspend accounts, backtest concurrency was effectively disabled, and deploy schema lagged runtime expectations. Fixed those issues first, then improved the site’s information architecture and landing flow.
+
+Built a real ad-free ticker interface on `/markets` to cover the gap the user called out: live stats for any symbol, quick watchlist workflow, and historical chart ranges similar to Yahoo. The new flow supports `1D / 5D / 1M / 6M / 1Y` using Yahoo chart data with range-specific intervals and an interactive SVG chart.
+
+Verification completed on the code path changed in this session:
+- `npx tsc --noEmit` — passed
+- targeted `eslint` on touched files — passed
+- `npm run build` — passed
+
+### Commit
+- `909db98` — fix trading accounting and add multi-range markets charts
+
+### Session Notes
+-> `.claude/sessions/2026-04-11-140100.md`
+
+---
