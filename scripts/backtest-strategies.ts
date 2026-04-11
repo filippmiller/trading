@@ -91,12 +91,19 @@ async function main() {
     let equity = 100000;
     let peakEquity = equity;
     let maxDrawdownPct = 0;
-    let openPositions = 0;
+    const activePositionUntilIndexes: number[] = [];
     let dailyNewCount = 0;
     let lastCohortDate = "";
 
-    for (const cohortDate of sortedDates) {
+    for (let cohortIndex = 0; cohortIndex < sortedDates.length; cohortIndex++) {
+      const cohortDate = sortedDates[cohortIndex];
       const cohortEntries = cohorts.get(cohortDate)!;
+
+      for (let i = activePositionUntilIndexes.length - 1; i >= 0; i--) {
+        if (activePositionUntilIndexes[i] <= cohortIndex) {
+          activePositionUntilIndexes.splice(i, 1);
+        }
+      }
 
       // Reset daily new count on new cohort date
       if (cohortDate !== lastCohortDate) {
@@ -106,7 +113,7 @@ async function main() {
 
       for (const entry of cohortEntries) {
         // Check concurrent position cap
-        if (openPositions >= config.sizing.max_concurrent) continue;
+        if (activePositionUntilIndexes.length >= config.sizing.max_concurrent) continue;
         if (dailyNewCount >= config.sizing.max_new_per_day) continue;
 
         // Build candidate
@@ -235,7 +242,6 @@ async function main() {
 
         // Update stats
         trades++;
-        openPositions++; // simplified — in backtest we don't track concurrent time overlap precisely
         dailyNewCount++;
         if (pnl_usd > 0) wins++;
         else losses++;
@@ -246,8 +252,7 @@ async function main() {
         const dd = ((peakEquity - equity) / peakEquity) * 100;
         maxDrawdownPct = Math.max(maxDrawdownPct, dd);
 
-        // Decrement open positions (simplified: assume they close immediately for tracking)
-        openPositions = Math.max(0, openPositions - 1);
+        activePositionUntilIndexes.push(cohortIndex + Math.max(exitDay, 1));
 
         // Insert signal record
         const status = pnl_usd > 0 ? "BACKTEST_WIN" : "BACKTEST_LOSS";

@@ -20,18 +20,47 @@ export async function GET() {
     // Single aggregated query: all signal stats grouped by strategy_id
     const [allStats] = await pool.execute<mysql.RowDataPacket[]>(
       `SELECT
-         strategy_id,
+         ps.strategy_id,
          COUNT(*) as total_signals,
-         SUM(CASE WHEN status IN ('BACKTEST_WIN', 'WIN') THEN 1 ELSE 0 END) as wins,
-         SUM(CASE WHEN status IN ('BACKTEST_LOSS', 'LOSS') THEN 1 ELSE 0 END) as losses,
-         SUM(CASE WHEN status = 'EXECUTED' AND exit_at IS NULL THEN 1 ELSE 0 END) as open_positions,
-         COALESCE(SUM(pnl_usd), 0) as total_pnl_usd,
-         COALESCE(AVG(CASE WHEN pnl_pct IS NOT NULL THEN pnl_pct END), 0) as avg_pnl_pct,
-         COALESCE(MAX(max_pnl_pct), 0) as best_trade_pct,
-         COALESCE(MIN(min_pnl_pct), 0) as worst_trade_pct,
-         COALESCE(SUM(CASE WHEN status = 'EXECUTED' AND exit_at IS NULL THEN investment_usd ELSE 0 END), 0) as open_invested
-       FROM paper_signals
-       GROUP BY strategy_id`
+         SUM(CASE WHEN ps.status IN ('BACKTEST_WIN', 'WIN') THEN 1 ELSE 0 END) as wins,
+         SUM(CASE WHEN ps.status IN ('BACKTEST_LOSS', 'LOSS') THEN 1 ELSE 0 END) as losses,
+         SUM(CASE WHEN ps.status = 'EXECUTED' AND ps.exit_at IS NULL THEN 1 ELSE 0 END) as open_positions,
+         COALESCE(SUM(ps.pnl_usd), 0) as total_pnl_usd,
+         COALESCE(AVG(CASE WHEN ps.pnl_pct IS NOT NULL THEN ps.pnl_pct END), 0) as avg_pnl_pct,
+         COALESCE(MAX(ps.max_pnl_pct), 0) as best_trade_pct,
+         COALESCE(MIN(ps.min_pnl_pct), 0) as worst_trade_pct,
+         COALESCE(SUM(CASE WHEN ps.status = 'EXECUTED' AND ps.exit_at IS NULL THEN ps.investment_usd ELSE 0 END), 0) as open_invested,
+         COALESCE(SUM(
+           CASE
+             WHEN ps.status = 'EXECUTED' AND ps.exit_at IS NULL THEN GREATEST(
+               0,
+               ps.investment_usd + (
+                 ps.investment_usd * GREATEST(
+                   (
+                     (
+                       COALESCE(lp.price, ps.entry_price) - ps.entry_price
+                     ) / NULLIF(ps.entry_price, 0)
+                   ) * ps.leverage,
+                   -1
+                 )
+               )
+             )
+             ELSE 0
+           END
+         ), 0) as open_market_value
+       FROM paper_signals ps
+       LEFT JOIN (
+         SELECT pp.signal_id, pp.price
+         FROM paper_position_prices pp
+         INNER JOIN (
+           SELECT signal_id, MAX(fetched_at) AS max_fetched_at
+           FROM paper_position_prices
+           GROUP BY signal_id
+         ) latest
+           ON latest.signal_id = pp.signal_id
+          AND latest.max_fetched_at = pp.fetched_at
+       ) lp ON lp.signal_id = ps.id
+       GROUP BY ps.strategy_id`
     );
 
     // Index stats by strategy_id for O(1) lookup
@@ -47,7 +76,8 @@ export async function GET() {
       const cash = Number(s.cash ?? 0);
       const initialCash = Number(s.initial_cash ?? 100000);
       const openInvested = Number(st?.open_invested ?? 0);
-      const equity = cash + openInvested + totalPnl;
+      const openMarketValue = Number(st?.open_market_value ?? 0);
+      const equity = cash + openMarketValue;
 
       return {
         id: s.id,
@@ -58,6 +88,8 @@ export async function GET() {
         account: {
           initial_cash: initialCash,
           cash,
+          open_market_value: openMarketValue,
+          open_invested: openInvested,
           equity,
           return_pct: initialCash > 0 ? ((equity - initialCash) / initialCash) * 100 : 0,
         },

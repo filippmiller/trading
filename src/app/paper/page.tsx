@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState, useCallback } from "react";
-import { Activity, TrendingUp, DollarSign, Clock, XCircle, Plus, RefreshCw, Wallet } from "lucide-react";
+import { Activity, DollarSign, Clock, XCircle, Plus, RefreshCw, Wallet } from "lucide-react";
 
 type Trade = {
   id: number;
@@ -73,18 +73,25 @@ export default function PaperTradingPage() {
   }, []);
 
   useEffect(() => {
-    loadData();
+    let cancelled = false;
+    void (async () => {
+      await loadData();
+      if (cancelled) return;
+    })();
     const interval = setInterval(loadData, 30000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [loadData]);
 
   const handleBuy = async () => {
     setBuyError("");
     const symbol = buySymbol.trim().toUpperCase();
     const investment = parseFloat(buyAmount);
-    if (!symbol) { setBuyError("Введите тикер"); return; }
-    if (!(investment > 0)) { setBuyError("Сумма должна быть > 0"); return; }
-    if (orderType === "LIMIT" && !(parseFloat(limitPrice) > 0)) { setBuyError("Укажите лимит-цену"); return; }
+    if (!symbol) { setBuyError("Enter a ticker."); return; }
+    if (!(investment > 0)) { setBuyError("Amount must be greater than zero."); return; }
+    if (orderType === "LIMIT" && !(parseFloat(limitPrice) > 0)) { setBuyError("Provide a valid limit price."); return; }
 
     setBusy(true);
     try {
@@ -101,7 +108,7 @@ export default function PaperTradingPage() {
       });
       const data = await res.json();
       if (!res.ok) {
-        setBuyError(data.error || "Ошибка при покупке");
+        setBuyError(data.error || "Order placement failed.");
       } else {
         setBuySymbol("");
         setLimitPrice("");
@@ -137,7 +144,7 @@ export default function PaperTradingPage() {
   };
 
   const handleReset = async () => {
-    if (!confirm("Сбросить все сделки и восстановить начальный баланс?")) return;
+    if (!confirm("Reset all paper trades and restore the starting balance?")) return;
     setBusy(true);
     await fetch("/api/paper/account", { method: "POST", body: JSON.stringify({}), headers: { "Content-Type": "application/json" } });
     await loadData();
@@ -156,14 +163,14 @@ export default function PaperTradingPage() {
             <DollarSign className="text-amber-500 h-8 w-8" />
             Paper Trading Simulator
           </h1>
-          <p className="text-zinc-500 mt-1">Виртуальные сделки с реальными ценами Yahoo Finance</p>
+          <p className="text-zinc-500 mt-1">Virtual positions with live Yahoo Finance pricing and pending-order support.</p>
         </div>
         <div className="flex gap-2">
           <button onClick={loadData} className="flex items-center gap-1 px-3 py-2 text-sm bg-zinc-100 hover:bg-zinc-200 rounded-lg">
-            <RefreshCw className="h-4 w-4" /> Обновить
+            <RefreshCw className="h-4 w-4" /> Refresh
           </button>
           <button onClick={handleReset} disabled={busy} className="px-3 py-2 text-sm bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-lg disabled:opacity-50">
-            Сброс
+            Reset
           </button>
         </div>
       </div>
@@ -183,12 +190,12 @@ export default function PaperTradingPage() {
           <div className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
             <p className="text-[10px] text-zinc-400 uppercase font-bold">Cash</p>
             <p className="text-2xl font-bold text-zinc-700">${account.cash.toFixed(2)}</p>
-            <p className="text-xs text-zinc-400 mt-1">из ${account.initial_cash.toFixed(0)}</p>
+            <p className="text-xs text-zinc-400 mt-1">of ${account.initial_cash.toFixed(0)}</p>
           </div>
           <div className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
             <p className="text-[10px] text-zinc-400 uppercase font-bold">Positions</p>
             <p className="text-2xl font-bold text-zinc-700">${account.positions_value.toFixed(2)}</p>
-            <p className="text-xs text-zinc-400 mt-1">{account.open_positions} открытых</p>
+            <p className="text-xs text-zinc-400 mt-1">{account.open_positions} open</p>
           </div>
           <div className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
             <p className="text-[10px] text-zinc-400 uppercase font-bold">Realized P&L</p>
@@ -196,7 +203,7 @@ export default function PaperTradingPage() {
               {account.realized_pnl_usd >= 0 ? "+" : ""}${account.realized_pnl_usd.toFixed(2)}
             </p>
             <p className="text-xs text-zinc-400 mt-1">
-              {account.closed_trades} сделок · {account.win_rate_pct.toFixed(0)}% win
+              {account.closed_trades} closed trades · {account.win_rate_pct.toFixed(0)}% win
             </p>
           </div>
         </div>
@@ -205,11 +212,11 @@ export default function PaperTradingPage() {
       {/* Buy form */}
       <div className="bg-white rounded-xl p-5 ring-1 ring-zinc-200/50 shadow-sm">
         <h2 className="text-lg font-bold text-zinc-800 mb-3 flex items-center gap-2">
-          <Plus className="h-5 w-5 text-emerald-500" /> Купить
+          <Plus className="h-5 w-5 text-emerald-500" /> Buy
         </h2>
         <div className="grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
           <div>
-            <label className="text-xs text-zinc-400 font-bold uppercase">Тикер</label>
+            <label className="text-xs text-zinc-400 font-bold uppercase">Ticker</label>
             <input
               type="text"
               value={buySymbol}
@@ -219,7 +226,7 @@ export default function PaperTradingPage() {
             />
           </div>
           <div>
-            <label className="text-xs text-zinc-400 font-bold uppercase">Сумма $</label>
+            <label className="text-xs text-zinc-400 font-bold uppercase">Amount $</label>
             <input
               type="number"
               value={buyAmount}
@@ -229,7 +236,7 @@ export default function PaperTradingPage() {
             />
           </div>
           <div>
-            <label className="text-xs text-zinc-400 font-bold uppercase">Тип</label>
+            <label className="text-xs text-zinc-400 font-bold uppercase">Type</label>
             <select
               value={orderType}
               onChange={e => setOrderType(e.target.value as "MARKET" | "LIMIT")}
@@ -240,7 +247,7 @@ export default function PaperTradingPage() {
             </select>
           </div>
           <div>
-            <label className="text-xs text-zinc-400 font-bold uppercase">Limit цена</label>
+            <label className="text-xs text-zinc-400 font-bold uppercase">Limit price</label>
             <input
               type="number"
               value={limitPrice}
@@ -255,8 +262,19 @@ export default function PaperTradingPage() {
             disabled={busy}
             className="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg font-bold text-sm disabled:opacity-50"
           >
-            {busy ? "..." : "КУПИТЬ"}
+            {busy ? "..." : "BUY"}
           </button>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {[250, 500, 1000, 2500].map((amount) => (
+            <button
+              key={amount}
+              onClick={() => setBuyAmount(String(amount))}
+              className="rounded-full bg-zinc-100 px-3 py-1 text-xs font-semibold text-zinc-600 hover:bg-zinc-200"
+            >
+              ${amount}
+            </button>
+          ))}
         </div>
         {buyError && <p className="text-rose-500 text-xs mt-2">{buyError}</p>}
       </div>
@@ -265,7 +283,7 @@ export default function PaperTradingPage() {
       {orders.length > 0 && (
         <div>
           <h2 className="text-lg font-bold text-zinc-800 mb-3 flex items-center gap-2">
-            <Clock className="h-5 w-5 text-amber-500" /> Ожидают исполнения
+            <Clock className="h-5 w-5 text-amber-500" /> Pending Orders
           </h2>
           <div className="space-y-2">
             {orders.map(o => (
@@ -283,7 +301,7 @@ export default function PaperTradingPage() {
                   onClick={() => handleCancelOrder(o.id)}
                   className="text-xs text-rose-600 hover:underline"
                 >
-                  Отменить
+                  Cancel
                 </button>
               </div>
             ))}
@@ -294,10 +312,10 @@ export default function PaperTradingPage() {
       {/* Open Trades */}
       <div>
         <h2 className="text-lg font-bold text-zinc-800 mb-3 flex items-center gap-2">
-          <Activity className="h-5 w-5 text-emerald-500" /> Открытые позиции
+          <Activity className="h-5 w-5 text-emerald-500" /> Open Positions
         </h2>
         {openTrades.length === 0 ? (
-          <p className="text-zinc-400 text-sm">Нет открытых позиций</p>
+          <p className="text-zinc-400 text-sm">No open positions.</p>
         ) : (
           <div className="space-y-3">
             {openTrades.map(trade => (
@@ -319,9 +337,9 @@ export default function PaperTradingPage() {
                     </div>
                     <div className="flex flex-wrap gap-4 mt-1 text-sm text-zinc-500">
                       <span>Qty: <b className="text-zinc-700">{trade.quantity.toFixed(4)}</b></span>
-                      <span>Купил: <b className="text-zinc-700">${trade.buy_price.toFixed(2)}</b></span>
-                      <span>Сейчас: <b className="text-zinc-700">{trade.current_price ? `$${trade.current_price.toFixed(2)}` : "..."}</b></span>
-                      <span>Вложено: ${trade.investment_usd.toFixed(2)}</span>
+                      <span>Entry: <b className="text-zinc-700">${trade.buy_price.toFixed(2)}</b></span>
+                      <span>Live: <b className="text-zinc-700">{trade.current_price ? `$${trade.current_price.toFixed(2)}` : "..."}</b></span>
+                      <span>Allocated: ${trade.investment_usd.toFixed(2)}</span>
                       <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {trade.buy_date}</span>
                     </div>
                     {trade.notes && <p className="text-xs text-zinc-400 mt-1">{trade.notes}</p>}
@@ -335,7 +353,7 @@ export default function PaperTradingPage() {
                         : "bg-rose-100 hover:bg-rose-200 text-rose-700"
                     } disabled:opacity-50`}
                   >
-                    {selling === trade.id ? "..." : "ПРОДАТЬ"}
+                    {selling === trade.id ? "..." : "SELL"}
                   </button>
                 </div>
 
@@ -357,17 +375,17 @@ export default function PaperTradingPage() {
       {closedTrades.length > 0 && (
         <div>
           <h2 className="text-lg font-bold text-zinc-800 mb-3 flex items-center gap-2">
-            <XCircle className="h-5 w-5 text-zinc-400" /> История сделок
+            <XCircle className="h-5 w-5 text-zinc-400" /> Trade History
           </h2>
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-zinc-400 text-xs uppercase border-b">
-                <th className="pb-2">Тикер</th>
-                <th className="pb-2">Купил</th>
-                <th className="pb-2">Продал</th>
+                <th className="pb-2">Ticker</th>
+                <th className="pb-2">Buy</th>
+                <th className="pb-2">Sell</th>
                 <th className="pb-2">P&L</th>
                 <th className="pb-2">%</th>
-                <th className="pb-2">Стратегия</th>
+                <th className="pb-2">Strategy</th>
               </tr>
             </thead>
             <tbody>
@@ -392,7 +410,7 @@ export default function PaperTradingPage() {
 
       {/* Footer */}
       <div className="text-xs text-zinc-400 text-right">
-        Обновлено: {lastUpdate || "..."} · обновление каждые 30 сек
+        Updated: {lastUpdate || "..."} · refreshes every 30s
       </div>
     </div>
   );

@@ -14,14 +14,17 @@ import {
   Search,
   Menu,
   X,
-  DollarSign
+  DollarSign,
+  ChevronRight
 } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { cn } from "@/lib/utils";
 
 const navigation = [
-  { name: "Executive Summary", href: "/", icon: LayoutDashboard },
+  { name: "Overview", href: "/", icon: LayoutDashboard },
+  { name: "Markets", href: "/markets", icon: Search, badge: "Live" },
   { name: "Mean Reversion", href: "/reversal", icon: Activity, badge: "Live" },
+  { name: "Strategy Dashboard", href: "/strategies", icon: BarChart3, badge: "Auto" },
   { name: "Strategy Scenarios", href: "/scenarios", icon: BarChart3 },
   { name: "Market Signals", href: "/signals", icon: Zap },
   { name: "Price Surveillance", href: "/prices", icon: LineChart },
@@ -33,13 +36,21 @@ const navigation = [
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [quickNav, setQuickNav] = useState("");
+  const [quickNavOpen, setQuickNavOpen] = useState(false);
+
+  const filteredNavigation = useMemo(() => {
+    const query = quickNav.trim().toLowerCase();
+    if (!query) return navigation;
+    return navigation.filter((item) => item.name.toLowerCase().includes(query) || item.href.toLowerCase().includes(query));
+  }, [quickNav]);
 
   return (
     <div className="flex min-h-screen bg-zinc-50">
       {/* Sidebar for Desktop */}
       <aside className="hidden md:flex w-72 flex-col fixed inset-y-0 z-50 bg-white border-r border-zinc-200">
         <div className="flex flex-col flex-grow pt-6 overflow-y-auto">
-          <div className="px-6 pb-8 border-b border-zinc-50">
+          <div className="px-6 pb-8 border-b border-zinc-100">
             <div className="flex items-center gap-2">
               <div className="bg-emerald-600 rounded-lg p-1.5 shadow-sm shadow-emerald-200">
                 <Activity className="h-5 w-5 text-white" />
@@ -49,6 +60,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <p className="text-[10px] text-zinc-400 font-bold uppercase tracking-widest mt-2 px-0.5">
               Digital City Market Node
             </p>
+            <div className="mt-4 grid grid-cols-2 gap-2 text-[11px]">
+              <div className="rounded-xl bg-emerald-50 px-3 py-2 text-emerald-700">
+                <div className="font-semibold">Data Loop</div>
+                <div className="text-emerald-600/80">Surveillance + sync</div>
+              </div>
+              <div className="rounded-xl bg-blue-50 px-3 py-2 text-blue-700">
+                <div className="font-semibold">Execution</div>
+                <div className="text-blue-600/80">Paper orders + exits</div>
+              </div>
+            </div>
           </div>
 
           <nav className="flex-1 px-4 mt-6 space-y-1">
@@ -117,9 +138,43 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-zinc-400 group-focus-within:text-emerald-500 transition-colors" />
               <input 
                 type="text" 
-                placeholder="Search surveillance data..."
+                value={quickNav}
+                onChange={(e) => setQuickNav(e.target.value)}
+                onFocus={() => setQuickNavOpen(true)}
+                onBlur={() => setTimeout(() => setQuickNavOpen(false), 120)}
+                placeholder="Jump to a page: markets, strategies, paper..."
                 className="w-full bg-zinc-100/50 border-none rounded-full pl-10 pr-4 py-2 text-sm focus:ring-2 focus:ring-emerald-500/20 focus:bg-white transition-all outline-none"
               />
+              {quickNavOpen && filteredNavigation.length > 0 && (
+                <div className="absolute left-0 right-0 top-12 rounded-2xl border border-zinc-200 bg-white p-2 shadow-xl shadow-zinc-200/50">
+                  {filteredNavigation.map((item) => {
+                    const isActive = pathname === item.href;
+                    return (
+                      <Link
+                        key={item.href}
+                        href={item.href}
+                        onClick={() => {
+                          setQuickNav("");
+                          setQuickNavOpen(false);
+                        }}
+                        className={cn(
+                          "flex items-center justify-between rounded-xl px-3 py-2 text-sm transition-colors",
+                          isActive ? "bg-emerald-50 text-emerald-700" : "hover:bg-zinc-50 text-zinc-700"
+                        )}
+                      >
+                        <span className="flex items-center gap-3">
+                          <item.icon className="h-4 w-4" />
+                          {item.name}
+                        </span>
+                        <span className="flex items-center gap-2 text-xs text-zinc-400">
+                          {item.badge && <span>{item.badge}</span>}
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        </span>
+                      </Link>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-4 text-xs font-medium text-zinc-500">
@@ -127,6 +182,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <div className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
               Market Live
             </div>
+            <div className="h-4 w-px bg-zinc-200" />
+            <span>Strategy Auto: 09:50 ET</span>
             <div className="h-4 w-px bg-zinc-200" />
             <span>UTC-5: {new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York' })}</span>
           </div>

@@ -570,7 +570,7 @@ async function jobExecuteStrategies() {
     const investmentPerTrade = Number(sizing.amount_usd || 1000);
     const maxConcurrent = Number(sizing.max_concurrent || 15);
     const maxNewPerDay = Number(sizing.max_new_per_day || 3);
-    const cash = Number(strat.cash || 0);
+    let remainingCash = Number(strat.cash || 0);
 
     // Count existing open positions for this strategy
     const [openCount] = await db.execute<mysql.RowDataPacket[]>(
@@ -592,7 +592,7 @@ async function jobExecuteStrategies() {
       // Cap checks
       if (currentOpen >= maxConcurrent) break;
       if (todayNew >= maxNewPerDay) break;
-      if (cash < investmentPerTrade) break;
+      if (remainingCash < investmentPerTrade) break;
 
       // Direction filter
       if (entry.direction === "LONG" && e.direction !== "LONG") continue;
@@ -645,11 +645,16 @@ async function jobExecuteStrategies() {
       );
 
       // Deduct from strategy account
-      await db.execute(
-        "UPDATE paper_accounts SET cash = cash - ? WHERE id = ?",
-        [investmentPerTrade, strat.account_id]
+      const [cashUpdate] = await db.execute<mysql.ResultSetHeader>(
+        "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
+        [investmentPerTrade, strat.account_id, investmentPerTrade]
       );
+      if (cashUpdate.affectedRows === 0) {
+        log(`    ${strat.name}: cash exhausted before filling ${e.symbol}`);
+        break;
+      }
 
+      remainingCash -= investmentPerTrade;
       currentOpen++;
       todayNew++;
       stratSignals++;
@@ -657,7 +662,7 @@ async function jobExecuteStrategies() {
     }
 
     if (stratSignals > 0) {
-      log(`    ${strat.name}: ${stratSignals} signals (${currentOpen} open, $${(cash - stratSignals * investmentPerTrade).toFixed(0)} cash remaining)`);
+      log(`    ${strat.name}: ${stratSignals} signals (${currentOpen} open, $${remainingCash.toFixed(0)} cash remaining)`);
     }
   }
 

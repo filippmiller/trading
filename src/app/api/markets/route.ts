@@ -16,6 +16,40 @@ type QuoteData = {
   marketCap: number;
 };
 
+type MarketRange = "1d" | "5d" | "1mo" | "6mo" | "1y";
+
+type ChartPoint = {
+  time: number;
+  price: number;
+  label: string;
+};
+
+const RANGE_CONFIG: Record<MarketRange, { range: string; interval: string; labelMode: "time" | "date"; includePrePost?: boolean }> = {
+  "1d": { range: "1d", interval: "5m", labelMode: "time", includePrePost: false },
+  "5d": { range: "5d", interval: "15m", labelMode: "date", includePrePost: false },
+  "1mo": { range: "1mo", interval: "1d", labelMode: "date" },
+  "6mo": { range: "6mo", interval: "1d", labelMode: "date" },
+  "1y": { range: "1y", interval: "1wk", labelMode: "date" },
+};
+
+function isMarketRange(value: string | null): value is MarketRange {
+  return value === "1d" || value === "5d" || value === "1mo" || value === "6mo" || value === "1y";
+}
+
+function formatChartLabel(timestampSec: number, mode: "time" | "date"): string {
+  const date = new Date(timestampSec * 1000);
+  if (mode === "time") {
+    return date.toLocaleTimeString("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+  return date.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+  });
+}
+
 async function fetchQuote(symbol: string): Promise<QuoteData | null> {
   try {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=5m`;
@@ -69,10 +103,40 @@ async function fetchMovers(type: "gainers" | "losers"): Promise<QuoteData[]> {
   }
 }
 
+async function fetchChart(symbol: string, marketRange: MarketRange): Promise<ChartPoint[]> {
+  const config = RANGE_CONFIG[marketRange];
+  const params = new URLSearchParams({
+    range: config.range,
+    interval: config.interval,
+  });
+  if (config.includePrePost) params.set("includePrePost", "false");
+
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?${params.toString()}`;
+  const res = await fetch(url, { headers: { "User-Agent": UA } });
+  if (!res.ok) return [];
+
+  const chartData = await res.json();
+  const result = chartData?.chart?.result?.[0];
+  const timestamps: number[] = result?.timestamp || [];
+  const closes: Array<number | null> = result?.indicators?.quote?.[0]?.close || [];
+
+  return timestamps
+    .map((timestamp, index) => {
+      const price = closes[index];
+      if (price == null || !Number.isFinite(price)) return null;
+      return {
+        time: timestamp,
+        price,
+        label: formatChartLabel(timestamp, config.labelMode),
+      };
+    })
+    .filter((point): point is ChartPoint => point !== null);
+}
+
 /**
  * GET /api/markets?symbols=AAPL,MSFT,GOOGL
  * GET /api/markets?view=movers
- * GET /api/markets?search=TSLA
+ * GET /api/markets?search=TSLA&range=6mo
  */
 export async function GET(req: Request) {
   try {
@@ -80,6 +144,8 @@ export async function GET(req: Request) {
     const view = url.searchParams.get("view");
     const symbols = url.searchParams.get("symbols");
     const search = url.searchParams.get("search");
+    const rangeParam = url.searchParams.get("range");
+    const marketRange: MarketRange = isMarketRange(rangeParam) ? rangeParam : "1d";
 
     if (view === "movers") {
       const [gainers, losers] = await Promise.all([
@@ -90,36 +156,28 @@ export async function GET(req: Request) {
     }
 
     if (search) {
-      const quote = await fetchQuote(search.toUpperCase());
+      const upper = search.toUpperCase();
+      const [quote, chart] = await Promise.all([
+        fetchQuote(upper),
+        fetchChart(upper, marketRange),
+      ]);
       if (!quote) return NextResponse.json({ error: "Symbol not found" }, { status: 404 });
-
-      // Also fetch chart data
-      const chartUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(search.toUpperCase())}?range=1d&interval=5m`;
-      const chartRes = await fetch(chartUrl, { headers: { "User-Agent": UA } });
-      let chart: Array<{ time: number; price: number }> = [];
-      if (chartRes.ok) {
-        const chartData = await chartRes.json();
-        const result = chartData?.chart?.result?.[0];
-        const ts = result?.timestamp || [];
-        const closes = result?.indicators?.quote?.[0]?.close || [];
-        chart = ts.map((t: number, i: number) => ({ time: t, price: closes[i] })).filter((p: { price: number | null }) => p.price != null);
-      }
-
-      return NextResponse.json({ quote, chart });
+      return NextResponse.json({ quote, chart, range: marketRange });
     }
 
     if (symbols) {
-      const list = symbols.split(",").map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 20);
+      const list = symbols.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean).slice(0, 20);
       const quotes: QuoteData[] = [];
       for (let i = 0; i < list.length; i += 5) {
         const batch = list.slice(i, i + 5);
         const results = await Promise.all(batch.map(fetchQuote));
-        for (const r of results) if (r) quotes.push(r);
+        for (const result of results) {
+          if (result) quotes.push(result);
+        }
       }
       return NextResponse.json({ quotes });
     }
 
-    // Default: market indices + top movers
     const indices = ["^GSPC", "^IXIC", "^DJI", "^VIX"];
     const indexQuotes = await Promise.all(indices.map(fetchQuote));
     const [gainers, losers] = await Promise.all([

@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
-import { Search, TrendingUp, TrendingDown, BarChart3, RefreshCw, Star, X } from "lucide-react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { BarChart3, RefreshCw, Search, Star, TrendingDown, TrendingUp, X } from "lucide-react";
 
 type Quote = {
   symbol: string;
@@ -17,7 +17,152 @@ type Quote = {
   marketCap: number;
 };
 
-type ChartPoint = { time: number; price: number };
+type ChartPoint = {
+  time: number;
+  price: number;
+  label: string;
+};
+
+type MarketRange = "1d" | "5d" | "1mo" | "6mo" | "1y";
+
+const RANGE_OPTIONS: Array<{ key: MarketRange; label: string }> = [
+  { key: "1d", label: "1D" },
+  { key: "5d", label: "5D" },
+  { key: "1mo", label: "1M" },
+  { key: "6mo", label: "6M" },
+  { key: "1y", label: "1Y" },
+];
+
+function PriceChart({
+  data,
+  range,
+}: {
+  data: ChartPoint[];
+  range: MarketRange;
+}) {
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+
+  const chart = useMemo(() => {
+    const width = 820;
+    const height = 300;
+    const padding = { top: 20, right: 24, bottom: 36, left: 20 };
+    const usableWidth = width - padding.left - padding.right;
+    const usableHeight = height - padding.top - padding.bottom;
+    const prices = data.map((point) => point.price);
+    const min = Math.min(...prices);
+    const max = Math.max(...prices);
+    const rangeValue = Math.max(max - min, 0.01);
+    const startPrice = data[0]?.price ?? 0;
+    const endPrice = data[data.length - 1]?.price ?? 0;
+    const trendUp = endPrice >= startPrice;
+
+    const points = data.map((point, index) => {
+      const x = padding.left + (index / Math.max(data.length - 1, 1)) * usableWidth;
+      const y = padding.top + ((max - point.price) / rangeValue) * usableHeight;
+      return { ...point, x, y };
+    });
+
+    const polyline = points.map((point) => `${point.x},${point.y}`).join(" ");
+    const area = `${padding.left},${height - padding.bottom} ${polyline} ${padding.left + usableWidth},${height - padding.bottom}`;
+
+    return {
+      width,
+      height,
+      padding,
+      usableWidth,
+      usableHeight,
+      min,
+      max,
+      trendUp,
+      points,
+      polyline,
+      area,
+    };
+  }, [data]);
+
+  const hoveredPoint = hoverIndex != null ? chart.points[hoverIndex] : null;
+  const color = chart.trendUp ? "#059669" : "#dc2626";
+
+  if (data.length < 2) {
+    return <div className="rounded-2xl bg-zinc-50 px-4 py-12 text-center text-sm text-zinc-400">No chart data for this range.</div>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between text-xs text-zinc-500">
+        <span>{range.toUpperCase()} view</span>
+        {hoveredPoint ? (
+          <span className="font-semibold text-zinc-700">
+            {hoveredPoint.label} · ${hoveredPoint.price.toFixed(2)}
+          </span>
+        ) : (
+          <span>Hover for exact values</span>
+        )}
+      </div>
+      <div className="overflow-x-auto">
+        <svg
+          viewBox={`0 0 ${chart.width} ${chart.height}`}
+          className="w-full min-w-[640px] rounded-2xl bg-zinc-50"
+          onMouseLeave={() => setHoverIndex(null)}
+        >
+          <defs>
+            <linearGradient id="marketAreaGradient" x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stopColor={color} stopOpacity="0.28" />
+              <stop offset="100%" stopColor={color} stopOpacity="0.02" />
+            </linearGradient>
+          </defs>
+
+          {[0, 0.5, 1].map((position) => {
+            const y = chart.padding.top + position * chart.usableHeight;
+            const value = chart.max - (chart.max - chart.min) * position;
+            return (
+              <g key={position}>
+                <line x1={chart.padding.left} x2={chart.width - chart.padding.right} y1={y} y2={y} stroke="#e4e4e7" strokeDasharray="4 4" />
+                <text x={chart.width - chart.padding.right + 4} y={y + 4} fontSize="10" fill="#71717a">
+                  {value.toFixed(2)}
+                </text>
+              </g>
+            );
+          })}
+
+          <polygon points={chart.area} fill="url(#marketAreaGradient)" />
+          <polyline fill="none" stroke={color} strokeWidth="3" points={chart.polyline} strokeLinejoin="round" strokeLinecap="round" />
+
+          {chart.points.map((point, index) => (
+            <g key={point.time}>
+              <rect
+                x={index === 0 ? chart.padding.left : (chart.points[index - 1].x + point.x) / 2}
+                y={0}
+                width={index === chart.points.length - 1 ? chart.width - point.x - chart.padding.right : Math.max(((chart.points[index + 1].x + point.x) / 2) - (index === 0 ? chart.padding.left : (chart.points[index - 1].x + point.x) / 2), 10)}
+                height={chart.height}
+                fill="transparent"
+                onMouseEnter={() => setHoverIndex(index)}
+              />
+              {hoverIndex === index && (
+                <>
+                  <line x1={point.x} x2={point.x} y1={chart.padding.top} y2={chart.height - chart.padding.bottom} stroke={color} strokeDasharray="4 4" />
+                  <circle cx={point.x} cy={point.y} r="4" fill={color} />
+                </>
+              )}
+            </g>
+          ))}
+
+          {chart.points.filter((_, index) => {
+            const step = Math.max(Math.floor(chart.points.length / 6), 1);
+            return index % step === 0 || index === chart.points.length - 1;
+          }).map((point) => (
+            <text key={`label-${point.time}`} x={point.x} y={chart.height - 12} textAnchor="middle" fontSize="10" fill="#71717a">
+              {point.label}
+            </text>
+          ))}
+        </svg>
+      </div>
+      <div className="rounded-xl border border-zinc-200 bg-white px-4 py-3 text-xs text-zinc-500">
+        The chart uses live Yahoo Finance data. `1D` shows 5-minute bars, `5D` shows 15-minute bars, and longer ranges aggregate into daily or weekly points.
+      </div>
+    </div>
+  );
+}
 
 export default function MarketsPage() {
   const [indices, setIndices] = useState<Quote[]>([]);
@@ -28,6 +173,9 @@ export default function MarketsPage() {
   const [chartData, setChartData] = useState<ChartPoint[]>([]);
   const [searching, setSearching] = useState(false);
   const [watchlist, setWatchlist] = useState<Quote[]>([]);
+  const [overviewLoading, setOverviewLoading] = useState(true);
+  const [selectedRange, setSelectedRange] = useState<MarketRange>("1d");
+  const [activeSymbol, setActiveSymbol] = useState<string | null>(null);
   const [watchSymbols, setWatchSymbols] = useState<string[]>(() => {
     if (typeof window !== "undefined") {
       const saved = localStorage.getItem("watchlist");
@@ -36,54 +184,79 @@ export default function MarketsPage() {
     return ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"];
   });
   const [lastUpdate, setLastUpdate] = useState("");
+  const [error, setError] = useState("");
 
-  // Load market overview
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch("/api/markets");
-        const data = await res.json();
-        if (!cancelled) {
-          setIndices(data.indices || []);
-          setGainers(data.gainers || []);
-          setLosers(data.losers || []);
-          setLastUpdate(new Date().toLocaleTimeString());
-        }
-      } catch { /* ignore */ }
-    })();
-    return () => { cancelled = true; };
+  const loadOverview = useCallback(async () => {
+    setOverviewLoading(true);
+    setError("");
+    try {
+      const res = await fetch("/api/markets");
+      const data = await res.json();
+      setIndices(data.indices || []);
+      setGainers(data.gainers || []);
+      setLosers(data.losers || []);
+      setLastUpdate(new Date().toLocaleTimeString());
+    } catch {
+      setError("Failed to load live market overview.");
+    } finally {
+      setOverviewLoading(false);
+    }
   }, []);
 
-  // Load watchlist prices
+  const runSearch = useCallback(async (symbolOrTerm: string, range: MarketRange = selectedRange) => {
+    const term = symbolOrTerm.trim().toUpperCase();
+    if (!term) return;
+    setSearching(true);
+    setError("");
+    setSearchTerm(term);
+    setActiveSymbol(term);
+    setSearchResult(null);
+    setChartData([]);
+    try {
+      const res = await fetch(`/api/markets?search=${encodeURIComponent(term)}&range=${range}`);
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "Symbol not found.");
+      } else {
+        setSearchResult(data.quote);
+        setChartData(data.chart || []);
+        setSelectedRange(data.range || range);
+        setLastUpdate(new Date().toLocaleTimeString());
+      }
+    } catch {
+      setError("Search failed.");
+    } finally {
+      setSearching(false);
+    }
+  }, [selectedRange]);
+
   useEffect(() => {
-    if (watchSymbols.length === 0) return;
+    void loadOverview();
+    const interval = setInterval(() => {
+      void loadOverview();
+    }, 60000);
+    return () => clearInterval(interval);
+  }, [loadOverview]);
+
+  useEffect(() => {
+    if (watchSymbols.length === 0) {
+      setWatchlist([]);
+      return;
+    }
     let cancelled = false;
-    (async () => {
+    void (async () => {
       try {
         const res = await fetch(`/api/markets?symbols=${watchSymbols.join(",")}`);
         const data = await res.json();
         if (!cancelled) setWatchlist(data.quotes || []);
-      } catch { /* ignore */ }
-    })();
-    return () => { cancelled = true; };
-  }, [watchSymbols]);
-
-  const handleSearch = async () => {
-    if (!searchTerm.trim()) return;
-    setSearching(true);
-    setSearchResult(null);
-    setChartData([]);
-    try {
-      const res = await fetch(`/api/markets?search=${encodeURIComponent(searchTerm.trim())}`);
-      if (res.ok) {
-        const data = await res.json();
-        setSearchResult(data.quote);
-        setChartData(data.chart || []);
+      } catch {
+        if (!cancelled) setWatchlist([]);
       }
-    } catch { /* ignore */ }
-    setSearching(false);
-  };
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [watchSymbols]);
 
   const addToWatchlist = (symbol: string) => {
     if (watchSymbols.includes(symbol)) return;
@@ -93,53 +266,45 @@ export default function MarketsPage() {
   };
 
   const removeFromWatchlist = (symbol: string) => {
-    const updated = watchSymbols.filter(s => s !== symbol);
+    const updated = watchSymbols.filter((s) => s !== symbol);
     setWatchSymbols(updated);
     localStorage.setItem("watchlist", JSON.stringify(updated));
-    setWatchlist(prev => prev.filter(q => q.symbol !== symbol));
+    setWatchlist((prev) => prev.filter((quote) => quote.symbol !== symbol));
   };
 
-  const pnlColor = (v: number) => v >= 0 ? "text-emerald-600" : "text-rose-600";
-  const pnlBg = (v: number) => v >= 0 ? "bg-emerald-500" : "bg-rose-500";
-  const fmtVol = (v: number) => v >= 1e9 ? `${(v/1e9).toFixed(1)}B` : v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(0)}K` : String(v);
-  const fmtCap = (v: number) => v >= 1e12 ? `$${(v/1e12).toFixed(2)}T` : v >= 1e9 ? `$${(v/1e9).toFixed(1)}B` : v >= 1e6 ? `$${(v/1e6).toFixed(0)}M` : "";
-
-  // Mini sparkline SVG
-  const Sparkline = ({ data, width = 120, height = 32 }: { data: ChartPoint[]; width?: number; height?: number }) => {
-    if (data.length < 2) return null;
-    const prices = data.map(d => d.price);
-    const min = Math.min(...prices);
-    const max = Math.max(...prices);
-    const range = max - min || 1;
-    const points = prices.map((p, i) => `${(i / (prices.length - 1)) * width},${height - ((p - min) / range) * height}`).join(" ");
-    const color = prices[prices.length - 1] >= prices[0] ? "#10b981" : "#ef4444";
-    return (
-      <svg width={width} height={height} className="inline-block">
-        <polyline fill="none" stroke={color} strokeWidth="1.5" points={points} />
-      </svg>
-    );
-  };
+  const pnlColor = (value: number) => value >= 0 ? "text-emerald-600" : "text-rose-600";
+  const pnlBg = (value: number) => value >= 0 ? "bg-emerald-500" : "bg-rose-500";
+  const fmtVol = (value: number) => value >= 1e9 ? `${(value / 1e9).toFixed(1)}B` : value >= 1e6 ? `${(value / 1e6).toFixed(1)}M` : value >= 1e3 ? `${(value / 1e3).toFixed(0)}K` : String(value);
+  const fmtCap = (value: number) => value >= 1e12 ? `$${(value / 1e12).toFixed(2)}T` : value >= 1e9 ? `$${(value / 1e9).toFixed(1)}B` : value >= 1e6 ? `$${(value / 1e6).toFixed(0)}M` : "";
 
   const indexNames: Record<string, string> = { "^GSPC": "S&P 500", "^IXIC": "NASDAQ", "^DJI": "DOW 30", "^VIX": "VIX" };
+  const quickSearchSymbols = ["SPY", "QQQ", "NVDA", "AAPL", "TSLA", "META"];
 
   return (
     <div className="max-w-7xl mx-auto space-y-6 pb-20">
-      {/* Header */}
       <div className="border-b pb-4 flex items-start justify-between">
         <div>
           <h1 className="text-3xl font-bold tracking-tight text-zinc-900 flex items-center gap-3">
             <BarChart3 className="text-blue-500 h-8 w-8" />
             Markets
           </h1>
-          <p className="text-zinc-500 mt-1">Live stock data from Yahoo Finance — no ads, no noise</p>
+          <p className="text-zinc-500 mt-1">Live stock lookup, multi-range price charts, watchlists, and movers without the Yahoo Finance ad clutter.</p>
         </div>
-        <div className="text-xs text-zinc-400">Updated: {lastUpdate || "..."}</div>
+        <div className="flex items-center gap-2 text-xs text-zinc-400">
+          <span>Updated: {lastUpdate || "..."}</span>
+          <button
+            onClick={() => void loadOverview()}
+            className="inline-flex items-center gap-1 rounded-full bg-zinc-100 px-2 py-1 text-zinc-500 hover:bg-zinc-200"
+          >
+            <RefreshCw className="h-3 w-3" />
+            Refresh
+          </button>
+        </div>
       </div>
 
-      {/* Market Indices */}
-      {indices.length > 0 && (
+      {!overviewLoading && indices.length > 0 && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {indices.map(idx => (
+          {indices.map((idx) => (
             <div key={idx.symbol} className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
               <p className="text-xs text-zinc-400 font-bold uppercase">{indexNames[idx.symbol] || idx.symbol}</p>
               <p className="text-2xl font-bold mt-1">{idx.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}</p>
@@ -151,7 +316,6 @@ export default function MarketsPage() {
         </div>
       )}
 
-      {/* Search */}
       <div className="bg-white rounded-xl p-5 ring-1 ring-zinc-200/50 shadow-sm">
         <div className="flex gap-3">
           <div className="flex-1 relative">
@@ -159,21 +323,32 @@ export default function MarketsPage() {
             <input
               type="text"
               value={searchTerm}
-              onChange={e => setSearchTerm(e.target.value.toUpperCase())}
-              onKeyDown={e => e.key === "Enter" && handleSearch()}
+              onChange={(e) => setSearchTerm(e.target.value.toUpperCase())}
+              onKeyDown={(e) => e.key === "Enter" && void runSearch(searchTerm)}
               placeholder="Search ticker... AAPL, TSLA, MSFT"
               className="w-full pl-10 pr-4 py-2 border rounded-lg text-sm font-mono"
             />
           </div>
-          <button onClick={handleSearch} disabled={searching} className="px-5 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-bold text-sm disabled:opacity-50">
+          <button onClick={() => void runSearch(searchTerm)} disabled={searching} className="px-5 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-bold text-sm disabled:opacity-50">
             {searching ? "..." : "Search"}
           </button>
         </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {quickSearchSymbols.map((symbol) => (
+            <button
+              key={symbol}
+              onClick={() => void runSearch(symbol)}
+              className="rounded-full bg-zinc-100 px-3 py-1 text-xs font-semibold text-zinc-600 hover:bg-zinc-200"
+            >
+              {symbol}
+            </button>
+          ))}
+        </div>
+        {error && <p className="mt-3 text-sm text-rose-600">{error}</p>}
 
-        {/* Search Result */}
         {searchResult && (
-          <div className="mt-4 border-t pt-4">
-            <div className="flex items-start justify-between">
+          <div className="mt-4 border-t pt-4 space-y-4">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div>
                 <div className="flex items-center gap-3">
                   <h2 className="text-2xl font-bold">{searchResult.symbol}</h2>
@@ -189,30 +364,45 @@ export default function MarketsPage() {
                   </span>
                 </div>
               </div>
-              <div className="text-right text-sm text-zinc-500 space-y-1">
+              <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-sm text-zinc-500">
                 <div>Open: <b className="text-zinc-700">${searchResult.open.toFixed(2)}</b></div>
                 <div>High: <b className="text-zinc-700">${searchResult.high.toFixed(2)}</b></div>
                 <div>Low: <b className="text-zinc-700">${searchResult.low.toFixed(2)}</b></div>
                 <div>Vol: <b className="text-zinc-700">{fmtVol(searchResult.volume)}</b></div>
+                <div>Prev Close: <b className="text-zinc-700">${searchResult.prevClose.toFixed(2)}</b></div>
                 {searchResult.marketCap > 0 && <div>Cap: <b className="text-zinc-700">{fmtCap(searchResult.marketCap)}</b></div>}
               </div>
             </div>
-            {/* Intraday Chart */}
-            {chartData.length > 2 && (
-              <div className="mt-4 bg-zinc-50 rounded-lg p-4">
-                <Sparkline data={chartData} width={700} height={120} />
-              </div>
-            )}
+
+            <div className="flex flex-wrap items-center gap-2">
+              {RANGE_OPTIONS.map((option) => (
+                <button
+                  key={option.key}
+                  onClick={() => {
+                    setSelectedRange(option.key);
+                    if (activeSymbol) void runSearch(activeSymbol, option.key);
+                  }}
+                  className={`rounded-full px-3 py-1.5 text-xs font-semibold transition ${
+                    selectedRange === option.key
+                      ? "bg-zinc-900 text-white"
+                      : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200"
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+
+            <PriceChart data={chartData} range={selectedRange} />
           </div>
         )}
       </div>
 
-      {/* Watchlist */}
-      {watchlist.length > 0 && (
+      {watchlist.length > 0 ? (
         <div className="bg-white rounded-xl ring-1 ring-zinc-200/50 shadow-sm overflow-hidden">
           <div className="px-4 py-3 border-b bg-zinc-50 flex items-center justify-between">
             <h3 className="font-bold text-zinc-800 flex items-center gap-2"><Star className="h-4 w-4 text-amber-500" /> Watchlist</h3>
-            <button onClick={() => { setWatchlist([]); setTimeout(() => { const s = watchSymbols; setWatchSymbols([]); setTimeout(() => setWatchSymbols(s), 50); }, 50); }} className="text-xs text-zinc-400 hover:text-zinc-600 flex items-center gap-1">
+            <button onClick={() => void loadOverview()} className="text-xs text-zinc-400 hover:text-zinc-600 flex items-center gap-1">
               <RefreshCw className="h-3 w-3" /> Refresh
             </button>
           </div>
@@ -230,25 +420,25 @@ export default function MarketsPage() {
               </tr>
             </thead>
             <tbody>
-              {watchlist.map(q => (
-                <tr key={q.symbol} className="border-b border-zinc-50 hover:bg-zinc-50/50">
-                  <td className="px-4 py-2.5 font-bold cursor-pointer text-blue-600 hover:underline" onClick={() => { setSearchTerm(q.symbol); setSearchResult(q); }}>
-                    {q.symbol}
+              {watchlist.map((quote) => (
+                <tr key={quote.symbol} className="border-b border-zinc-50 hover:bg-zinc-50/50">
+                  <td className="px-4 py-2.5 font-bold cursor-pointer text-blue-600 hover:underline" onClick={() => void runSearch(quote.symbol)}>
+                    {quote.symbol}
                   </td>
-                  <td className="px-4 py-2.5 text-zinc-500 max-w-[200px] truncate">{q.name}</td>
-                  <td className="px-4 py-2.5 text-right font-mono font-bold">${q.price.toFixed(2)}</td>
-                  <td className={`px-4 py-2.5 text-right font-mono ${pnlColor(q.change)}`}>
-                    {q.change >= 0 ? "+" : ""}{q.change.toFixed(2)}
+                  <td className="px-4 py-2.5 text-zinc-500 max-w-[200px] truncate">{quote.name}</td>
+                  <td className="px-4 py-2.5 text-right font-mono font-bold">${quote.price.toFixed(2)}</td>
+                  <td className={`px-4 py-2.5 text-right font-mono ${pnlColor(quote.change)}`}>
+                    {quote.change >= 0 ? "+" : ""}{quote.change.toFixed(2)}
                   </td>
                   <td className="px-4 py-2.5 text-right">
-                    <span className={`px-2 py-0.5 rounded text-xs font-bold text-white ${pnlBg(q.changePct)}`}>
-                      {q.changePct >= 0 ? "+" : ""}{q.changePct.toFixed(2)}%
+                    <span className={`px-2 py-0.5 rounded text-xs font-bold text-white ${pnlBg(quote.changePct)}`}>
+                      {quote.changePct >= 0 ? "+" : ""}{quote.changePct.toFixed(2)}%
                     </span>
                   </td>
-                  <td className="px-4 py-2.5 text-right font-mono text-zinc-500">{fmtVol(q.volume)}</td>
-                  <td className="px-4 py-2.5 text-right text-zinc-500">{fmtCap(q.marketCap)}</td>
+                  <td className="px-4 py-2.5 text-right font-mono text-zinc-500">{fmtVol(quote.volume)}</td>
+                  <td className="px-4 py-2.5 text-right text-zinc-500">{fmtCap(quote.marketCap)}</td>
                   <td className="px-4 py-2.5">
-                    <button onClick={() => removeFromWatchlist(q.symbol)} className="text-zinc-300 hover:text-rose-500">
+                    <button onClick={() => removeFromWatchlist(quote.symbol)} className="text-zinc-300 hover:text-rose-500">
                       <X className="h-3.5 w-3.5" />
                     </button>
                   </td>
@@ -257,27 +447,29 @@ export default function MarketsPage() {
             </tbody>
           </table>
         </div>
+      ) : (
+        <div className="rounded-xl border border-dashed border-zinc-300 bg-white/70 p-5 text-sm text-zinc-500">
+          Your watchlist is empty. Search for any ticker and add it to keep a quick live monitor here.
+        </div>
       )}
 
-      {/* Top Movers */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {/* Gainers */}
         <div className="bg-white rounded-xl ring-1 ring-zinc-200/50 shadow-sm overflow-hidden">
           <div className="px-4 py-3 border-b bg-emerald-50 flex items-center gap-2">
             <TrendingUp className="h-4 w-4 text-emerald-600" />
             <h3 className="font-bold text-emerald-800">Top Gainers</h3>
           </div>
           <div className="divide-y divide-zinc-50">
-            {gainers.map(q => (
-              <div key={q.symbol} className="px-4 py-2.5 flex items-center justify-between hover:bg-zinc-50/50 cursor-pointer" onClick={() => { setSearchTerm(q.symbol); setSearchResult(q); }}>
+            {gainers.map((quote) => (
+              <div key={quote.symbol} className="px-4 py-2.5 flex items-center justify-between hover:bg-zinc-50/50 cursor-pointer" onClick={() => void runSearch(quote.symbol)}>
                 <div className="flex items-center gap-3">
-                  <span className="font-bold text-sm w-16">{q.symbol}</span>
-                  <span className="text-xs text-zinc-400 max-w-[120px] truncate">{q.name}</span>
+                  <span className="font-bold text-sm w-16">{quote.symbol}</span>
+                  <span className="text-xs text-zinc-400 max-w-[120px] truncate">{quote.name}</span>
                 </div>
                 <div className="flex items-center gap-3">
-                  <span className="font-mono text-sm">${q.price.toFixed(2)}</span>
+                  <span className="font-mono text-sm">${quote.price.toFixed(2)}</span>
                   <span className="px-2 py-0.5 rounded text-xs font-bold text-white bg-emerald-500 min-w-[60px] text-center">
-                    +{q.changePct.toFixed(1)}%
+                    +{quote.changePct.toFixed(1)}%
                   </span>
                 </div>
               </div>
@@ -285,23 +477,22 @@ export default function MarketsPage() {
           </div>
         </div>
 
-        {/* Losers */}
         <div className="bg-white rounded-xl ring-1 ring-zinc-200/50 shadow-sm overflow-hidden">
           <div className="px-4 py-3 border-b bg-rose-50 flex items-center gap-2">
             <TrendingDown className="h-4 w-4 text-rose-600" />
             <h3 className="font-bold text-rose-800">Top Losers</h3>
           </div>
           <div className="divide-y divide-zinc-50">
-            {losers.map(q => (
-              <div key={q.symbol} className="px-4 py-2.5 flex items-center justify-between hover:bg-zinc-50/50 cursor-pointer" onClick={() => { setSearchTerm(q.symbol); setSearchResult(q); }}>
+            {losers.map((quote) => (
+              <div key={quote.symbol} className="px-4 py-2.5 flex items-center justify-between hover:bg-zinc-50/50 cursor-pointer" onClick={() => void runSearch(quote.symbol)}>
                 <div className="flex items-center gap-3">
-                  <span className="font-bold text-sm w-16">{q.symbol}</span>
-                  <span className="text-xs text-zinc-400 max-w-[120px] truncate">{q.name}</span>
+                  <span className="font-bold text-sm w-16">{quote.symbol}</span>
+                  <span className="text-xs text-zinc-400 max-w-[120px] truncate">{quote.name}</span>
                 </div>
                 <div className="flex items-center gap-3">
-                  <span className="font-mono text-sm">${q.price.toFixed(2)}</span>
+                  <span className="font-mono text-sm">${quote.price.toFixed(2)}</span>
                   <span className="px-2 py-0.5 rounded text-xs font-bold text-white bg-rose-500 min-w-[60px] text-center">
-                    {q.changePct.toFixed(1)}%
+                    {quote.changePct.toFixed(1)}%
                   </span>
                 </div>
               </div>
