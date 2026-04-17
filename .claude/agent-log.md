@@ -9,6 +9,69 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-18 00:45] — Strategy Research — интерактивный проигрыватель сценариев
+
+**Area:** Trading/Research, Trading/UI, Trading/API, Trading/Schema
+**Type:** feat (4-phase feature shipped in one PR)
+
+### Files Changed
+- `src/lib/scenario-simulator.ts` — **new** core simulator (runScenario with direction-aware exits, equity curve)
+- `src/app/api/research/run/route.ts` — **new** POST run endpoint
+- `src/app/api/research/scenarios/route.ts` — **new** save/list endpoints (upsert by name)
+- `src/app/api/research/scenarios/[id]/route.ts` — **new** DELETE endpoint
+- `src/app/api/research/sweep/route.ts` — **new** parameter sweep endpoint (8 dims)
+- `src/app/research/page.tsx` — **new** UI page with form + table + SVG equity curve + sweep
+- `docker/init-db.sql` + `src/lib/migrations.ts` — new `paper_scenarios` table
+- `src/components/AppShell.tsx` — added "Strategy Research" nav entry
+- `scripts/backtest-strategies.ts` — bundled live-pair collision fix (missed in PR #3 merge)
+- `.claude/sessions/2026-04-17-data-driven-strategy-research.md` — **new** analysis log
+
+### Database Tables
+- `paper_scenarios` — **new** (id, name UNIQUE, description, filters_json, trade_json, costs_json, last_result_summary_json, created_at, updated_at). Created automatically on first API hit via ensureSchema.
+
+### Summary
+Built Strategy Research — интерактивный "what-if" playground на странице `/research`. Пользователь задаёт фильтры (cohort period, UP/DOWN, magnitude, streak, source), параметры сделки (investment, leverage, LONG/SHORT, exit strategy), издержки (commission, margin APY) и получает: таблицу симулированных сделок, сводку (win rate, ROI, best/worst, MaxDD), SVG equity curve график.
+
+4 фазы всё в одном PR (пользователь сказал "гони до конца"):
+
+1. **Phase 1** — core simulator + базовая форма с таблицей результатов
+2. **Phase 2** — 4 типа exits (TIME, HARD_STOP, TAKE_PROFIT, TRAIL_STOP), direction-aware walk через d1..dN, leverage liquidation, SVG equity curve
+3. **Phase 3** — сохранение/загрузка сценариев (upsert по name, chips с last-PnL индикатором)
+4. **Phase 4** — parameter sweep: автоматический перебор одного параметра (holdDays, leverage, investmentUsd, day-change range, hard stop, take profit, trailing), таблица с 🏆 best highlighted
+
+Переиспользует direction-aware `computePnL` из `strategy-engine.ts` (fixed в PR #3). Read-only — не пишет в live paper_signals / paper_accounts. Только в новую таблицу paper_scenarios для сохранения настроек.
+
+### Context (зачем это сделано)
+Предыдущие сессии нашли:
+- SHORT стратегии стабильно убыточны (4/4 gap-stops day 1 live)
+- Asymmetric market behavior: UP streaks продолжаются (75-90%), DOWN streaks отскакивают (82-86%)
+- Friday 2026-04-10 симуляция: 10 UP movers × $100 × 5x = +$619 за 4 дня
+
+Пользователь попросил инструмент чтобы исследовать эти гипотезы интерактивно без написания node-скриптов. `/research` — это именно он.
+
+### Verification
+- `npx tsc --noEmit`: clean
+- `npx eslint`: clean
+- `npm run build`: PASSES, все routes зарегистрированы:
+  - `/research` (static page)
+  - `/api/research/run`, `/api/research/scenarios`, `/api/research/scenarios/[id]`, `/api/research/sweep` (dynamic)
+- paper_scenarios table будет создана автоматически при первом API hit (ensureSchema)
+
+### Commits
+- `3c65c2f` — feat: Strategy Research — интерактивный проигрыватель сценариев (#5)
+
+### Как использовать
+```bash
+bash scripts/tunnel-db.sh   # в одном терминале
+npm run dev                  # в другом
+# → http://localhost:3000/research
+```
+
+### Session Notes
+- `.claude/sessions/2026-04-17-data-driven-strategy-research.md` — strategy research data + insights
+
+---
+
 ## [2026-04-17 23:55] — Internal Review + Adversarial Critic (5 follow-up fixes + dupe-key recovery)
 
 **Area:** Trading/Cron, Trading/API, Trading/Schema, Trading/Lib
