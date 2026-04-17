@@ -556,15 +556,18 @@ async function jobEnrollMovers() {
       return;
     }
 
-    // Guard against pre-market startup runs: Yahoo's screener returns stale
-    // prior-session data before market open, which would enroll with wrong
-    // entry_price. Require market to be open (or past open) for today.
+    // Guard: enrollment runs AFTER close so `day_change_pct` reflects the
+    // full open-to-close move (not overnight + first 15 min). Yahoo's
+    // screener at 16:05+ ET returns end-of-day top gainers/losers with
+    // regularMarketPrice = close and regularMarketChangePercent = full day.
+    // Before close, the screener is mid-session and ranks stocks by
+    // partial-day move — polluted signal we're trying to avoid.
     const now = new Date();
     const nyClock = now.toLocaleString("en-US", { timeZone: "America/New_York", hour12: false }).split(", ")[1];
     const [h, m] = nyClock.split(":").map(Number);
     const curMinutes = h * 60 + m;
-    if (curMinutes < 9 * 60 + 45) {
-      log(`  SKIP: too early (${nyClock} ET) — movers enrollment runs at 09:45 ET`);
+    if (curMinutes < 16 * 60) {
+      log(`  SKIP: too early (${nyClock} ET) — post-close movers enrollment runs at 16:05 ET`);
       return;
     }
 
@@ -1664,12 +1667,13 @@ async function jobScanTrends() {
 
 // ─── Schedule ───────────────────────────────────────────────────────────────
 
-async function runFullSync() {
-  try {
-    await jobEnrollMovers();
-  } catch (err) {
-    log(`ERROR enrolling movers: ${err}`);
-  }
+/**
+ * Morning sync — runs at 09:45 ET. Fetches overnight price updates for
+ * yesterday's (and earlier) cohorts. Does NOT enroll new movers — enrollment
+ * was moved to post-close (16:05 ET) so day_change_pct reflects full-day
+ * movement rather than overnight gap + first 15 min.
+ */
+async function runMorningSync() {
   try {
     await jobSyncPrices();
   } catch (err) {
@@ -1677,11 +1681,29 @@ async function runFullSync() {
   }
 }
 
+/**
+ * Close sync + enrollment — runs at 16:05 ET. First fills d_close for
+ * existing active cohorts, then enrolls today's top movers based on
+ * full-day close move.
+ */
+async function runCloseSync() {
+  try {
+    await jobSyncPrices();
+  } catch (err) {
+    log(`ERROR syncing close prices: ${err}`);
+  }
+  try {
+    await jobEnrollMovers();
+  } catch (err) {
+    log(`ERROR enrolling movers (post-close): ${err}`);
+  }
+}
+
 const CRON_OPTIONS = { timezone: "America/New_York" };
 
 cron.schedule("45 9 * * 1-5", async () => {
-  log("=== MORNING: Enroll movers + sync ===");
-  try { await runFullSync(); } catch (err) { log(`ERROR morning sync: ${err}`); }
+  log("=== MORNING: Sync prior-cohort morning prices (no enrollment) ===");
+  try { await runMorningSync(); } catch (err) { log(`ERROR morning sync: ${err}`); }
 }, CRON_OPTIONS);
 
 cron.schedule("50 9 * * 1-5", async () => {
@@ -1695,8 +1717,8 @@ cron.schedule("35 12 * * 1-5", async () => {
 }, CRON_OPTIONS);
 
 cron.schedule("5 16 * * 1-5", async () => {
-  log("=== CLOSE: Sync prices ===");
-  try { await jobSyncPrices(); } catch (err) { log(`ERROR close sync: ${err}`); }
+  log("=== CLOSE: Sync d_close + enroll today's post-close movers ===");
+  try { await runCloseSync(); } catch (err) { log(`ERROR close sync: ${err}`); }
 }, CRON_OPTIONS);
 
 cron.schedule("15 16 * * 1-5", async () => {
@@ -1731,19 +1753,22 @@ cron.schedule("0 3 * * *", async () => {
 log("========================================");
 log("Surveillance Cron Scheduler started");
 log("Schedule (ET, Mon-Fri):");
-log("  09:45 — Enroll movers + morning prices");
-log("  09:50 — Execute trading strategies");
-log("  12:35 — Midday prices");
-log("  16:05 — Close prices");
+log("  09:45 — Morning price sync (d_morning) — no enrollment");
+log("  09:50 — Execute trading strategies (trades yesterday's close cohort)");
+log("  12:35 — Midday prices (d_midday)");
+log("  16:05 — Close prices (d_close) + ENROLL today's post-close movers");
 log("  16:15 — Trend scanner (detect 3+ day streaks)");
 log("  16:30 — Execute confirmation strategies");
-log("  18:00 — Evening catchup");
+log("  18:00 — Evening catchup sync");
 log("  */15  — Position monitor (9:00-16:59)");
 log(`  03:00 — Retention prune (>${PRICE_RETENTION_DAYS}d paper_position_prices, daily)`);
 log("========================================");
 
-log("Running immediate catchup sync...");
-runFullSync().then(async () => {
+// Startup catchup: prior-cohort price sync only. Never enroll on startup —
+// enrollment only via the scheduled 16:05 ET tick (or will be picked up
+// the next trading day if container restarts after close).
+log("Running immediate catchup sync (no enrollment)...");
+runMorningSync().then(async () => {
   log("Startup sync complete.");
   try {
     await jobExecuteStrategies();
