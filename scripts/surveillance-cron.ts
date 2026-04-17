@@ -36,6 +36,13 @@ const DB_CONFIG: mysql.PoolOptions = {
 };
 
 const RATE_LIMIT_MS = Number(process.env.RATE_LIMIT_MS ?? 500);
+/**
+ * How many days of paper_position_prices history to keep. Grows at roughly
+ * (open_positions × 26 ticks/day) rows/day; at 80 open positions that is
+ * ~2k rows/day, so 30d ≈ 60k rows — small, fast self-join.
+ * Tune via PRICE_RETENTION_DAYS env var.
+ */
+const PRICE_RETENTION_DAYS = Number(process.env.PRICE_RETENTION_DAYS ?? 30);
 
 let pool: mysql.Pool | null = null;
 function getPool() {
@@ -50,6 +57,33 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 const SYMBOL_RE = /^[A-Z0-9.\-]{1,16}$/;
 
+/** Default per-request timeout. A hung connection on any upstream wedges
+ *  the containing job and (via *Running guards) stops the entire pipeline,
+ *  so every external fetch must be bounded. */
+const FETCH_TIMEOUT_MS = 8000;
+
+/**
+ * fetch() with a hard AbortController timeout. Returns null on network
+ * failure, non-2xx response, or timeout — callers uniformly guard on null.
+ */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = FETCH_TIMEOUT_MS
+): Promise<Response | null> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    if (!res.ok) return null;
+    return res;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 type Mover = {
   symbol: string;
   name: string;
@@ -61,8 +95,8 @@ type Mover = {
 
 async function fetchMoversFromYahoo(type: "gainers" | "losers"): Promise<Mover[]> {
   const url = `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_${type}&count=25`;
-  const res = await fetch(url, { headers: { "User-Agent": UA } });
-  if (!res.ok) throw new Error(`Yahoo movers API ${res.status}`);
+  const res = await fetchWithTimeout(url, { headers: { "User-Agent": UA } });
+  if (!res) throw new Error(`Yahoo movers API failed or timed out (type=${type})`);
   const data = await res.json();
   const quotes = data?.finance?.result?.[0]?.quotes ?? [];
   return quotes
@@ -79,18 +113,8 @@ async function fetchMoversFromYahoo(type: "gainers" | "losers"): Promise<Mover[]
 
 async function fetchDailyBars(symbol: string): Promise<{ date: string; close: number }[]> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1mo&interval=1d`;
-  // Hard 8-second timeout per request — prevents hung connections from stalling batch
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 8000);
-  let res: Response;
-  try {
-    res = await fetch(url, { headers: { "User-Agent": UA }, signal: controller.signal });
-  } catch {
-    clearTimeout(timeoutId);
-    return [];
-  }
-  clearTimeout(timeoutId);
-  if (!res.ok) return [];
+  const res = await fetchWithTimeout(url, { headers: { "User-Agent": UA } });
+  if (!res) return [];
   const data = await res.json();
   const result = data?.chart?.result?.[0];
   const timestamps: number[] = result?.timestamp || [];
@@ -159,8 +183,9 @@ type SymbolBarCache = Map<string, Bar5m[]>;
 async function fetchYahoo60d(symbol: string): Promise<Bar5m[] | null> {
   try {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=60d`;
-    const res = await fetch(url, { headers: { "User-Agent": UA } });
-    if (!res.ok) return null;
+    // 60-day payloads can be ~4700 bars; allow extra budget vs default.
+    const res = await fetchWithTimeout(url, { headers: { "User-Agent": UA } }, 15000);
+    if (!res) return null;
     const data = await res.json();
     const result = data?.chart?.result?.[0];
     const timestamps: number[] = result?.timestamp || [];
@@ -204,7 +229,19 @@ async function fetchTwelveDataDay(symbol: string, dateStr: string): Promise<Bar5
   if (twelveDataDisabled) return null;
   try {
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=5min&start_date=${dateStr}%2009:30:00&end_date=${dateStr}%2016:00:00&timezone=America/New_York&apikey=${TWELVEDATA_API_KEY}`;
-    const res = await fetch(url);
+    // Must call fetch directly here — we need access to status=429 before the
+    // ok-check. fetchWithTimeout would null-on-non-2xx and we'd lose the
+    // quota-exhausted signal. Apply AbortController inline.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(url, { signal: controller.signal });
+    } catch {
+      clearTimeout(timeoutId);
+      return null;
+    }
+    clearTimeout(timeoutId);
     if (res.status === 429) {
       twelveDataDisabled = true;
       log("  NOTE: Twelve Data quota exhausted, disabling for remainder of sync");
@@ -427,6 +464,23 @@ async function forceCloseExpiredSignals() {
   }
 
   if (closed > 0) log(`  Force-closed ${closed} orphan signal(s) from expired cohorts`);
+}
+
+/**
+ * Prune paper_position_prices older than PRICE_RETENTION_DAYS.
+ * Without this the table grows unbounded (~2k rows/trading day at current
+ * open-position count), and the MAX/GROUP BY self-join in /api/strategies
+ * degrades superlinearly. 30-day default keeps only what charts need.
+ *
+ * Runs nightly at 03:00 ET — outside market hours, never races the monitor.
+ */
+async function jobPruneOldPrices() {
+  const db = getPool();
+  const [res] = await db.execute<mysql.ResultSetHeader>(
+    "DELETE FROM paper_position_prices WHERE fetched_at < DATE_SUB(NOW(), INTERVAL ? DAY)",
+    [PRICE_RETENTION_DAYS]
+  );
+  log(`  Pruned ${res.affectedRows} paper_position_prices rows older than ${PRICE_RETENTION_DAYS} days`);
 }
 
 // US market holidays (NYSE/NASDAQ closures) — update annually
@@ -896,8 +950,8 @@ async function jobMonitorPositionsImpl() {
     await Promise.all(batch.map(async (sym) => {
       try {
         const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`;
-        const res = await fetch(url, { headers: { "User-Agent": UA } });
-        if (!res.ok) return;
+        const res = await fetchWithTimeout(url, { headers: { "User-Agent": UA } });
+        if (!res) return;
         const data = await res.json();
         const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
         if (typeof price === "number" && isFinite(price) && price > 0) {
@@ -1557,6 +1611,12 @@ cron.schedule("*/15 9-16 * * 1-5", async () => {
   try { await jobMonitorPositions(); } catch (err) { log(`ERROR monitoring: ${err}`); }
 }, CRON_OPTIONS);
 
+// Retention — daily at 03:00 ET (well outside market + job windows)
+cron.schedule("0 3 * * *", async () => {
+  log("=== RETENTION: Prune old paper_position_prices ===");
+  try { await jobPruneOldPrices(); } catch (err) { log(`ERROR pruning: ${err}`); }
+}, CRON_OPTIONS);
+
 // ─── Startup ────────────────────────────────────────────────────────────────
 
 log("========================================");
@@ -1570,6 +1630,7 @@ log("  16:15 — Trend scanner (detect 3+ day streaks)");
 log("  16:30 — Execute confirmation strategies");
 log("  18:00 — Evening catchup");
 log("  */15  — Position monitor (9:00-16:59)");
+log(`  03:00 — Retention prune (>${PRICE_RETENTION_DAYS}d paper_position_prices, daily)`);
 log("========================================");
 
 log("Running immediate catchup sync...");
