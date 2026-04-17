@@ -39,6 +39,23 @@ async function main() {
   await pool.execute("DELETE FROM paper_signals WHERE status IN ('BACKTEST_WIN', 'BACKTEST_LOSS', 'BACKTEST_OPEN')");
   console.log("Cleared previous backtest results.\n");
 
+  // Pre-load (strategy_id, reversal_entry_id) pairs that already have a
+  // LIVE signal. The UX_signal_strat_entry UNIQUE KEY (added 2026-04-17)
+  // prevents the backtest from re-INSERTing a pair that's already tracked
+  // by live execution. Skipping these up-front avoids errno 1062 crashes
+  // mid-run and keeps the live signal's real P&L authoritative for that
+  // pair rather than overwriting with a simulated one.
+  const [liveRows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT strategy_id, reversal_entry_id FROM paper_signals WHERE status IN ('EXECUTED', 'WIN', 'LOSS')"
+  );
+  const livePairKeys = new Set<string>();
+  for (const r of liveRows) {
+    if (r.strategy_id != null && r.reversal_entry_id != null) {
+      livePairKeys.add(`${r.strategy_id}|${r.reversal_entry_id}`);
+    }
+  }
+  console.log(`${livePairKeys.size} (strategy, entry) pairs already have live signals — will skip in backtest.\n`);
+
   // Load strategies
   const [stratRows] = await pool.execute<mysql.RowDataPacket[]>(
     "SELECT * FROM paper_strategies WHERE enabled = 1 ORDER BY id"
@@ -115,6 +132,10 @@ async function main() {
         // Check concurrent position cap
         if (activePositionUntilIndexes.length >= config.sizing.max_concurrent) continue;
         if (dailyNewCount >= config.sizing.max_new_per_day) continue;
+
+        // Skip pairs with an existing live signal — the UNIQUE KEY would
+        // block the INSERT and the live P&L is the real number anyway.
+        if (livePairKeys.has(`${strat.id}|${entry.id}`)) continue;
 
         // Build candidate
         const candidate: ReversalCandidate = {
@@ -272,43 +293,50 @@ async function main() {
 
         activePositionUntilIndexes.push(cohortIndex + Math.max(exitDay, 1));
 
-        // Insert signal record
+        // Insert signal record. Swallow errno 1062 — it's possible a live
+        // signal for this (strat, entry) snuck in between the pre-load and
+        // this INSERT; in that case the live record is authoritative.
         const status = pnl_usd > 0 ? "BACKTEST_WIN" : "BACKTEST_LOSS";
-        await pool.execute(
-          `INSERT INTO paper_signals
-           (strategy_id, reversal_entry_id, symbol, generated_at, status,
-            entry_price, entry_at, exit_price, exit_at, exit_reason,
-            investment_usd, leverage, effective_exposure,
-            max_price, min_price, max_pnl_pct, min_pnl_pct,
-            pnl_usd, pnl_pct, holding_minutes)
-           VALUES (?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?,
-                   ?, ?, ?,
-                   ?, ?, ?, ?,
-                   ?, ?, ?)`,
-          [
-            strat.id,
-            entry.id,
-            candidate.symbol,
-            entry.created_at || new Date(),
-            status,
-            entryPrice,
-            entry.created_at || new Date(),
-            exitPrice,
-            entry.created_at || new Date(), // approximate
-            exitReason,
-            investment,
-            leverage,
-            investment * leverage,
-            maxPrice,
-            minPrice,
-            maxPnlPct,
-            minPnlPct,
-            pnl_usd,
-            pnl_pct,
-            exitDay * 24 * 60, // approximate holding time
-          ]
-        );
+        try {
+          await pool.execute(
+            `INSERT INTO paper_signals
+             (strategy_id, reversal_entry_id, symbol, generated_at, status,
+              entry_price, entry_at, exit_price, exit_at, exit_reason,
+              investment_usd, leverage, effective_exposure,
+              max_price, min_price, max_pnl_pct, min_pnl_pct,
+              pnl_usd, pnl_pct, holding_minutes)
+             VALUES (?, ?, ?, ?, ?,
+                     ?, ?, ?, ?, ?,
+                     ?, ?, ?,
+                     ?, ?, ?, ?,
+                     ?, ?, ?)`,
+            [
+              strat.id,
+              entry.id,
+              candidate.symbol,
+              entry.created_at || new Date(),
+              status,
+              entryPrice,
+              entry.created_at || new Date(),
+              exitPrice,
+              entry.created_at || new Date(), // approximate
+              exitReason,
+              investment,
+              leverage,
+              investment * leverage,
+              maxPrice,
+              minPrice,
+              maxPnlPct,
+              minPnlPct,
+              pnl_usd,
+              pnl_pct,
+              exitDay * 24 * 60, // approximate holding time
+            ]
+          );
+        } catch (err) {
+          if ((err as { errno?: number }).errno !== 1062) throw err;
+          // Silent skip — live signal won the race.
+        }
       }
     }
 

@@ -213,6 +213,18 @@ const schemaStatements = [
     fetched_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     INDEX IX_pos_price_signal (signal_id, fetched_at)
   ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS paper_scenarios (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(128) NOT NULL,
+    description TEXT NULL,
+    filters_json LONGTEXT NOT NULL,
+    trade_json LONGTEXT NOT NULL,
+    costs_json LONGTEXT NOT NULL,
+    last_result_summary_json LONGTEXT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY UX_scenario_name (name)
+  ) ENGINE=InnoDB;`,
 ];
 
 const ALLOWED_TABLES = new Set(["strategy_runs", "run_metrics", "reversal_entries", "paper_trades"]);
