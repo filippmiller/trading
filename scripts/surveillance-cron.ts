@@ -483,14 +483,42 @@ async function jobPruneOldPrices() {
   log(`  Pruned ${res.affectedRows} paper_position_prices rows older than ${PRICE_RETENTION_DAYS} days`);
 }
 
-// US market holidays (NYSE/NASDAQ closures) — update annually
+// US market holidays (NYSE/NASDAQ full closures) — REVIEW BY 2028-10-01.
+// Observation rules: holiday on Sat → observed Friday (except NY Day exception),
+// holiday on Sun → observed Monday. Juneteenth is an NYSE holiday since 2022.
 const MARKET_HOLIDAYS = new Set([
   // 2026
-  "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
-  "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+  "2026-01-01", // New Year's Day (Thu)
+  "2026-01-19", // MLK Day (Mon)
+  "2026-02-16", // Presidents Day (Mon)
+  "2026-04-03", // Good Friday (Fri) — Easter 2026 = Apr 5
+  "2026-05-25", // Memorial Day (Mon)
+  "2026-06-19", // Juneteenth (Fri)
+  "2026-07-03", // Independence Day observed — Jul 4 is Sat
+  "2026-09-07", // Labor Day (Mon)
+  "2026-11-26", // Thanksgiving (Thu)
+  "2026-12-25", // Christmas (Fri)
   // 2027
-  "2027-01-01", "2027-01-18", "2027-02-15", "2027-04-16", "2027-05-31",
-  "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+  "2027-01-01", // New Year's Day (Fri)
+  "2027-01-18", // MLK Day (Mon)
+  "2027-02-15", // Presidents Day (Mon)
+  "2027-03-26", // Good Friday (Fri) — Easter 2027 = Mar 28 (previous entry 2027-04-16 was 2028's date)
+  "2027-05-31", // Memorial Day (Mon)
+  "2027-06-18", // Juneteenth observed — Jun 19 is Sat
+  "2027-07-05", // Independence Day observed — Jul 4 is Sun
+  "2027-09-06", // Labor Day (Mon)
+  "2027-11-25", // Thanksgiving (Thu)
+  "2027-12-24", // Christmas observed — Dec 25 is Sat
+  // 2028
+  "2028-01-17", // MLK Day (Mon) — Jan 1 is Sat; NYSE exception: no preceding-Friday observation for NY Day
+  "2028-02-21", // Presidents Day (Mon)
+  "2028-04-14", // Good Friday (Fri) — Easter 2028 = Apr 16
+  "2028-05-29", // Memorial Day (Mon)
+  "2028-06-19", // Juneteenth (Mon)
+  "2028-07-04", // Independence Day (Tue)
+  "2028-09-04", // Labor Day (Mon)
+  "2028-11-23", // Thanksgiving (Thu)
+  "2028-12-25", // Christmas (Mon)
 ]);
 
 /** Returns true if the given date string is a market holiday */
@@ -964,16 +992,33 @@ async function jobMonitorPositionsImpl() {
 
   let pricesRecorded = 0, ordersFilled = 0, positionsClosed = 0;
 
+  // Pre-fetch every distinct strategy config referenced by an open signal in
+  // a single query, instead of 1 SELECT per signal inside the loop. Configs
+  // don't change within a tick.
+  const stratIdsArr = Array.from(new Set(openSignals.map(s => Number(s.strategy_id))));
+  const stratConfigById = new Map<number, { config_json: string; leverage: number }>();
+  if (stratIdsArr.length > 0) {
+    const placeholders = stratIdsArr.map(() => "?").join(",");
+    const [stratRows] = await db.execute<mysql.RowDataPacket[]>(
+      `SELECT id, config_json, leverage FROM paper_strategies WHERE id IN (${placeholders})`,
+      stratIdsArr
+    );
+    for (const r of stratRows) {
+      stratConfigById.set(Number(r.id), { config_json: String(r.config_json), leverage: Number(r.leverage) });
+    }
+  }
+
+  // Collect price-point rows and flush in a single multi-row INSERT after the
+  // loop. Previously a per-signal INSERT ran inside the loop, producing one
+  // round-trip per signal per tick (~80 trips on today's portfolio).
+  const priceInserts: Array<[number, number]> = [];
+
   // 5. Record prices + update watermarks for open signals
   for (const sig of openSignals) {
     const price = prices[sig.symbol];
     if (price == null) continue;
 
-    // Record price point
-    await db.execute(
-      "INSERT INTO paper_position_prices (signal_id, price) VALUES (?, ?)",
-      [sig.id, price]
-    );
+    priceInserts.push([Number(sig.id), price]);
     pricesRecorded++;
 
     const isShort = sig.direction === "SHORT";
@@ -986,25 +1031,26 @@ async function jobMonitorPositionsImpl() {
     const pnlPct = isShort ? -rawPricePct : rawPricePct;
     const leveragedPnl = pnlPct * leverage;
 
-    // Update max/min watermarks (track actual price extremes)
-    const maxPrice = Math.max(Number(sig.max_price || 0), price);
-    const minPrice = sig.min_price ? Math.min(Number(sig.min_price), price) : price;
-    const maxPnl = Math.max(Number(sig.max_pnl_pct || -999), leveragedPnl);
-    const minPnl = Math.min(Number(sig.min_pnl_pct || 999), leveragedPnl);
+    // Update max/min watermarks (track actual price extremes).
+    // Use null-checks rather than `|| fallback` — a legitimate watermark of 0
+    // is falsy and would otherwise get swapped with the sentinel, causing
+    // "best: -0.5%" displays for positions that truly peaked at 0% (their
+    // entry point). Same applies to max_price for any position insert where
+    // entry_price happened to be zero.
+    const maxPrice = sig.max_price == null ? price : Math.max(Number(sig.max_price), price);
+    const minPrice = sig.min_price == null ? price : Math.min(Number(sig.min_price), price);
+    const maxPnl = sig.max_pnl_pct == null ? leveragedPnl : Math.max(Number(sig.max_pnl_pct), leveragedPnl);
+    const minPnl = sig.min_pnl_pct == null ? leveragedPnl : Math.min(Number(sig.min_pnl_pct), leveragedPnl);
 
     await db.execute(
       `UPDATE paper_signals SET max_price = ?, min_price = ?, max_pnl_pct = ?, min_pnl_pct = ? WHERE id = ?`,
       [maxPrice, minPrice, maxPnl, minPnl, sig.id]
     );
 
-    // Check exit conditions from strategy config
-    const [stratRows] = await db.execute<mysql.RowDataPacket[]>(
-      "SELECT config_json, leverage FROM paper_strategies WHERE id = ?",
-      [sig.strategy_id]
-    );
-    if (stratRows.length === 0) continue;
-
-    const config = JSON.parse(stratRows[0].config_json);
+    // Check exit conditions — strategy config pre-fetched above.
+    const stratInfo = stratConfigById.get(Number(sig.strategy_id));
+    if (!stratInfo) continue;
+    const config = JSON.parse(stratInfo.config_json);
     const exits = config.exits || {};
 
     let exitReason: string | null = null;
@@ -1106,6 +1152,13 @@ async function jobMonitorPositionsImpl() {
       const dir = isShort ? "SHORT" : "LONG";
       log(`    EXIT ${dir} ${sig.symbol} [${exitReason}] P&L: ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${leveragedPctFinal.toFixed(1)}%)`);
     }
+  }
+
+  // Flush all price points in one multi-row INSERT — uses .query() (not
+  // .execute()) because mysql2 prepared statements don't accept the VALUES ?
+  // nested-array shape.
+  if (priceInserts.length > 0) {
+    await db.query("INSERT INTO paper_position_prices (signal_id, price) VALUES ?", [priceInserts]);
   }
 
   // 6. Fill triggered pending orders (limit/stop)
@@ -1398,15 +1451,28 @@ import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import * as path from "path";
 
-// Load universe once at startup — ~500 liquid US stocks for trend scanning
+// Load universe once at startup — ~500 liquid US stocks for trend scanning.
+// Fail LOUDLY on read/parse error so deployment bugs (file not copied, JSON
+// malformed) surface as container crashes rather than a silently disabled
+// scanner. An intentionally-empty `{ "symbols": [] }` is allowed.
 const UNIVERSE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "trend-universe.json");
 let TREND_UNIVERSE: string[] = [];
 try {
-  const data = JSON.parse(readFileSync(UNIVERSE_PATH, "utf-8"));
-  TREND_UNIVERSE = Array.isArray(data.symbols) ? data.symbols : [];
+  const raw = readFileSync(UNIVERSE_PATH, "utf-8");
+  const data = JSON.parse(raw);
+  if (!Array.isArray(data?.symbols)) {
+    throw new Error(`trend-universe.json: "symbols" must be an array`);
+  }
+  TREND_UNIVERSE = data.symbols.filter((s: unknown): s is string => typeof s === "string" && SYMBOL_RE.test(s));
   log(`Trend universe loaded: ${TREND_UNIVERSE.length} symbols from ${UNIVERSE_PATH}`);
+  if (TREND_UNIVERSE.length === 0) {
+    log(`NOTE: trend-universe.json contains 0 valid symbols — trend scanner will no-op by design.`);
+  }
 } catch (err) {
-  log(`WARNING: Could not load trend universe (${UNIVERSE_PATH}): ${err}. Trend scanner will be disabled.`);
+  console.error(`FATAL: Failed to load trend universe at ${UNIVERSE_PATH}: ${err instanceof Error ? err.message : err}`);
+  console.error(`       This indicates a deployment bug (file not copied into container, or malformed JSON).`);
+  console.error(`       Exiting(1) so the container restart policy surfaces the failure.`);
+  process.exit(1);
 }
 
 let trendScanRunning = false;
@@ -1425,18 +1491,21 @@ async function jobScanTrends() {
   if (!isTradingDay()) { log("  SKIP: trend scan — not a trading day"); return; }
   if (TREND_UNIVERSE.length === 0) { log("  SKIP: trend universe empty"); return; }
 
-  // Guard: daily bars from Yahoo include a partial bar during market hours.
-  // Skip ONLY during active trading (9:30-16:05 ET). Pre-market (before 9:30)
-  // and post-close (after 16:05) are safe — Yahoo's last daily bar is the
-  // previous trading day's finalized close.
+  // Guard: Yahoo's daily bar is in-progress during market hours AND briefly
+  // after close. Earlier window was 9:30-16:05 which missed the 16:05-16:14
+  // bar-finalization tail — startup catchup in that window could ingest a
+  // partial "today" bar, enroll on a streak detected from in-progress data,
+  // then flip direction after the real close finalizes. Widen to 16:15 ET
+  // to match the scheduled scan time. Pre-market (before 9:30) remains safe
+  // because Yahoo's latest daily bar there is yesterday's finalized close.
   const now = new Date();
   const nyClock = now.toLocaleString("en-US", { timeZone: "America/New_York", hour12: false }).split(", ")[1];
   const [h, m] = nyClock.split(":").map(Number);
   const curMinutes = h * 60 + m;
   const marketOpen = 9 * 60 + 30;
-  const marketCloseBuffer = 16 * 60 + 5;
-  if (curMinutes >= marketOpen && curMinutes < marketCloseBuffer) {
-    log(`  SKIP: trend scan — market is open (${nyClock} ET). Will run at scheduled 16:15 ET.`);
+  const barFinalizedAfter = 16 * 60 + 15;
+  if (curMinutes >= marketOpen && curMinutes < barFinalizedAfter) {
+    log(`  SKIP: trend scan — today's daily bar not finalized (${nyClock} ET). Will run at scheduled 16:15 ET.`);
     return;
   }
 
