@@ -9,6 +9,62 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-18 21:10] — Move MOVERS enrollment 09:45 AM → 16:05 ET (post-close)
+
+**Area:** Trading/Cron, Trading/Data migration
+**Type:** refactor (semantic shift) + data backfill
+
+### Files Changed
+- `scripts/surveillance-cron.ts` — jobEnrollMovers guard 09:45→16:05; runFullSync split into runMorningSync + runCloseSync; cron schedule updated; startup catchup no longer enrolls
+- `scripts/backfill-movers-post-close.ts` — **new** one-time migration script
+
+### Database Tables
+- `reversal_entries` — 540 rows updated (entry_price → daily close, day_change_pct → close-to-close full day)
+- `reversal_entries_backup_20260418` — **new** safety backup of 560 MOVERS rows pre-backfill
+
+### Summary
+После обсуждения с user обнаружено семантическое несоответствие: пользователь ожидал enrollment **post-close** (акции закрывшиеся сильно вверх/вниз за день), но код enrolls в 09:45 AM — это overnight gap + первые 15 мин. Часто такие утренние движения = продолжение вчерашнего news-driven move, не независимый сегодняшний сигнал.
+
+**Два изменения в одном потоке:**
+
+1. **Cron refactor**: enrollment moved to 16:05 ET, runFullSync split, startup catchup no longer enrolls. Deployed to VPS (container Up 17s, schedule log показывает новый taim). Первый реальный post-close enrollment — понедельник 2026-04-20 16:05 ET.
+
+2. **Backfill existing data**: 540 MOVERS entries обновлены:
+   - entry_price = daily close вместо 09:45 AM price
+   - day_change_pct = full day close-to-close вместо overnight+15min
+   - d1..d10 columns НЕ трогались (они уже правильные)
+   - Safety backup в `reversal_entries_backup_20260418` (560 rows)
+   - Restore query задокументирован в backup table
+
+**Эффект на данные:**
+- 18 entries где direction=SHORT но close went DOWN (gap-and-fade)
+- 21 entry где direction=LONG но close went UP (gap-and-rally)
+- Т.е. ~7% существующих entries имеют semantic mismatch — 9:45 сигнал оказался шумом
+- Остальные 93% consistent с ожидаемым направлением
+
+**Пример AAOI 2026-04-09:**
+- Было: entry $132.70, day_change +12.8% (overnight gap + ранний spike)
+- Стало: entry $133.30, day_change **+0.5%** (real full-day close-to-close)
+- Т.е. акция открылась с +12% gap, но за день полностью вернулась ближе к flat. Оригинальный 9:45 сигнал это чистый шум.
+
+### Verification
+- Code: tsc clean, eslint clean, deployed to VPS
+- Data: 540 rows updated, 0 misses, backup table verified (560 rows)
+- Direction consistency: 93% entries consistent (521/560)
+
+### Deploy
+- Cron container rebuilt via GitHub raw pull (SCP failed due to VPS memory pressure — 12GB swap used)
+- Startup log confirms new schedule: "09:45 — Morning price sync — no enrollment", "16:05 — ... + ENROLL today's post-close movers"
+
+### Commits
+- `85a7f6c` — refactor(cron): move MOVERS enrollment 09:45 AM → 16:05 ET (#7)
+
+### Follow-up
+- Re-run /research на обновлённых данных — пересчитать edge numbers (вероятно edges станут чётче без noise от 9:45 entries)
+- Решить что делать с 39 direction-mismatch entries (можно добавить flag в UI /research для фильтра)
+
+---
+
 ## [2026-04-18 01:15] — Strategy Research polish: Sharpe, histogram, presets, CSV, persistence
 
 **Area:** Trading/Research, Trading/UI
