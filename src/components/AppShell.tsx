@@ -26,6 +26,7 @@ const navigation = [
   { name: "Mean Reversion", href: "/reversal", icon: Activity, badge: "Live" },
   { name: "Strategy Dashboard", href: "/strategies", icon: BarChart3, badge: "Auto" },
   { name: "Strategy Scenarios", href: "/scenarios", icon: BarChart3 },
+  { name: "Strategy Research", href: "/research", icon: Activity, badge: "New" },
   { name: "Market Signals", href: "/signals", icon: Zap },
   { name: "Price Surveillance", href: "/prices", icon: LineChart },
   { name: "Voice Intelligence", href: "/voice", icon: Mic2 },

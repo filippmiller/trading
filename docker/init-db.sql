@@ -243,5 +243,19 @@ CREATE TABLE IF NOT EXISTS paper_position_prices (
     ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
+-- Saved scenarios for Strategy Research ("what-if" playground).
+CREATE TABLE IF NOT EXISTS paper_scenarios (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(128) NOT NULL,
+  description TEXT NULL,
+  filters_json LONGTEXT NOT NULL,
+  trade_json LONGTEXT NOT NULL,
+  costs_json LONGTEXT NOT NULL,
+  last_result_summary_json LONGTEXT NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  UNIQUE KEY UX_scenario_name (name)
+) ENGINE=InnoDB;
+
 INSERT IGNORE INTO paper_accounts (name, initial_cash, cash)
 VALUES ('Default', 100000, 100000);
