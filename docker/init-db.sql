@@ -225,7 +225,11 @@ CREATE TABLE IF NOT EXISTS paper_signals (
   INDEX IX_signal_strategy (strategy_id),
   INDEX IX_signal_status (status),
   INDEX IX_signal_symbol (symbol),
-  INDEX IX_signal_reversal (reversal_entry_id)
+  INDEX IX_signal_reversal (reversal_entry_id),
+  -- One signal per (strategy, reversal_entry) pair. Closes the dup-check
+  -- race where two concurrent executor runs both pass the SELECT-existence
+  -- check before either commits.
+  UNIQUE KEY UX_signal_strat_entry (strategy_id, reversal_entry_id)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS paper_position_prices (

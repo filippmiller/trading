@@ -95,11 +95,12 @@ export function matchesEntry(candidate: ReversalCandidate, config: StrategyConfi
 export type PositionState = {
   entry_price: number;
   current_price: number;
-  max_price: number;       // high watermark since entry
-  min_price: number;       // low watermark since entry
+  max_price: number;       // high watermark since entry (best for LONG)
+  min_price: number;       // low watermark since entry (best for SHORT)
   entry_at: Date;
   now: Date;
   leverage: number;
+  direction: "LONG" | "SHORT";
   trailing_active: boolean;
   trailing_stop_price: number | null;
 };
@@ -119,18 +120,22 @@ export type ExitDecision = {
  */
 export function evaluateExit(pos: PositionState, config: StrategyConfig): ExitDecision {
   const { exits } = config;
-  const pnlPct = ((pos.current_price - pos.entry_price) / pos.entry_price) * 100;
+  const isShort = pos.direction === "SHORT";
+
+  // Raw price move (positive = price went up). For LONG that is profit;
+  // for SHORT that is loss. Flip the sign so `pnlPct` represents profit for
+  // BOTH directions (matches the cron's jobMonitorPositions convention).
+  const rawPricePct = ((pos.current_price - pos.entry_price) / pos.entry_price) * 100;
+  const pnlPct = isShort ? -rawPricePct : rawPricePct;
   const leveragedPnlPct = pnlPct * pos.leverage;
 
   let newTrailingActive = pos.trailing_active;
   let newTrailingStop = pos.trailing_stop_price;
 
-  // 1. Hard stop (based on raw price movement, not leveraged)
-  if (exits.hard_stop_pct != null) {
-    const stopPrice = pos.entry_price * (1 + exits.hard_stop_pct / 100);
-    if (pos.current_price <= stopPrice) {
-      return { should_exit: true, reason: "HARD_STOP", exit_price: pos.current_price, new_trailing_stop: newTrailingStop, new_trailing_active: newTrailingActive };
-    }
+  // 1. Hard stop — fires on direction-aware loss (pnlPct <= hard_stop_pct
+  //    where hard_stop_pct is typically negative, e.g. -7).
+  if (exits.hard_stop_pct != null && pnlPct <= exits.hard_stop_pct) {
+    return { should_exit: true, reason: "HARD_STOP", exit_price: pos.current_price, new_trailing_stop: newTrailingStop, new_trailing_active: newTrailingActive };
   }
 
   // 2. Leverage liquidation check (if leveraged pnl wipes out margin)
@@ -138,33 +143,48 @@ export function evaluateExit(pos: PositionState, config: StrategyConfig): ExitDe
     return { should_exit: true, reason: "LIQUIDATED", exit_price: pos.current_price, new_trailing_stop: newTrailingStop, new_trailing_active: newTrailingActive };
   }
 
-  // 3. Take profit
+  // 3. Take profit — direction-aware: positive pnlPct means in-the-money
+  //    for both LONG and SHORT.
   if (exits.take_profit_pct != null && pnlPct >= exits.take_profit_pct) {
     return { should_exit: true, reason: "TAKE_PROFIT", exit_price: pos.current_price, new_trailing_stop: newTrailingStop, new_trailing_active: newTrailingActive };
   }
 
-  // 4. Trailing stop
+  // 4. Trailing stop — LONG trails BELOW the best (highest) price so far;
+  //    SHORT trails ABOVE the best (lowest) price so far.
   if (exits.trailing_stop_pct != null) {
     const activateAt = exits.trailing_activates_at_profit_pct ?? 0;
 
-    // Activate trailing when profit exceeds threshold
+    // Activate once profit crosses the threshold.
     if (!newTrailingActive && pnlPct >= activateAt) {
       newTrailingActive = true;
-      newTrailingStop = pos.current_price * (1 - exits.trailing_stop_pct / 100);
+      newTrailingStop = isShort
+        ? pos.current_price * (1 + exits.trailing_stop_pct / 100)
+        : pos.current_price * (1 - exits.trailing_stop_pct / 100);
     }
 
-    // Update trailing stop if price made new high
     if (newTrailingActive) {
-      const effectiveHigh = Math.max(pos.max_price, pos.current_price);
-      const newStop = effectiveHigh * (1 - exits.trailing_stop_pct / 100);
-      if (newTrailingStop == null || newStop > newTrailingStop) {
-        newTrailingStop = newStop;
+      if (isShort) {
+        // SHORT: best = lowest price. Stop goes above it. A TIGHTER stop is
+        // a LOWER value, so update if newStop < current trailingStop.
+        const effectiveLow = Math.min(pos.min_price, pos.current_price);
+        const newStop = effectiveLow * (1 + exits.trailing_stop_pct / 100);
+        if (newTrailingStop == null || newStop < newTrailingStop) {
+          newTrailingStop = newStop;
+        }
+        if (newTrailingStop != null && pos.current_price >= newTrailingStop) {
+          return { should_exit: true, reason: "TRAIL_STOP", exit_price: pos.current_price, new_trailing_stop: newTrailingStop, new_trailing_active: newTrailingActive };
+        }
+      } else {
+        // LONG: best = highest price. Stop goes below it. Tighter = higher.
+        const effectiveHigh = Math.max(pos.max_price, pos.current_price);
+        const newStop = effectiveHigh * (1 - exits.trailing_stop_pct / 100);
+        if (newTrailingStop == null || newStop > newTrailingStop) {
+          newTrailingStop = newStop;
+        }
+        if (newTrailingStop != null && pos.current_price <= newTrailingStop) {
+          return { should_exit: true, reason: "TRAIL_STOP", exit_price: pos.current_price, new_trailing_stop: newTrailingStop, new_trailing_active: newTrailingActive };
+        }
       }
-    }
-
-    // Check if price hit the trailing stop
-    if (newTrailingActive && newTrailingStop != null && pos.current_price <= newTrailingStop) {
-      return { should_exit: true, reason: "TRAIL_STOP", exit_price: pos.current_price, new_trailing_stop: newTrailingStop, new_trailing_active: newTrailingActive };
     }
   }
 
@@ -188,11 +208,14 @@ export function computePnL(
   entryPrice: number,
   exitPrice: number,
   investmentUsd: number,
-  leverage: number
+  leverage: number,
+  direction: "LONG" | "SHORT" = "LONG"
 ): { pnl_usd: number; pnl_pct: number } {
   if (entryPrice <= 0) return { pnl_usd: 0, pnl_pct: 0 };
+  // Direction-aware raw return. For SHORT, a price rise is a LOSS.
   const rawPct = ((exitPrice - entryPrice) / entryPrice) * 100;
-  const leveragedPct = rawPct * leverage;
+  const directionalPct = direction === "SHORT" ? -rawPct : rawPct;
+  const leveragedPct = directionalPct * leverage;
   // P&L is capped at -100% of investment (can't lose more than you put in)
   const cappedPct = Math.max(leveragedPct, -100);
   const pnlUsd = investmentUsd * (cappedPct / 100);

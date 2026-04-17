@@ -230,7 +230,28 @@ async function ensureColumn(table: string, column: string, definition: string) {
   }
 }
 
-export async function ensureSchema() {
+// Memoize the schema-migration promise at module scope so concurrent API
+// requests await the same one-shot run instead of each issuing its own
+// flight of CREATE TABLE / ALTER TABLE statements. Those DDL statements
+// acquire MySQL metadata locks that serialize with the cron's INSERT/UPDATE
+// traffic — under load this produced lock contention that could delay
+// monitor ticks. The first request triggers it; all subsequent callers are
+// a no-op await against a resolved promise.
+let schemaReadyPromise: Promise<void> | null = null;
+
+export async function ensureSchema(): Promise<void> {
+  if (!schemaReadyPromise) {
+    schemaReadyPromise = runSchemaMigrations().catch((err) => {
+      // If the migration fails, allow a retry on the next call rather than
+      // trapping the whole process in a rejected-promise state.
+      schemaReadyPromise = null;
+      throw err;
+    });
+  }
+  return schemaReadyPromise;
+}
+
+async function runSchemaMigrations() {
   const pool = await getPool();
   for (const statement of schemaStatements) {
     await pool.execute(statement);
