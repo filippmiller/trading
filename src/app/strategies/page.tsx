@@ -41,44 +41,36 @@ export default function StrategiesPage() {
   const [sortBy, setSortBy] = useState<"equity" | "realized" | "win_rate">("equity");
   const [scope, setScope] = useState<"all" | "trading" | "confirmation" | "analysis">("all");
   const [lastUpdate, setLastUpdate] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
 
+  // Single effect handles initial load, 60s polling, and explicit refresh
+  // (via refreshKey bump). The `cancelled` closure prevents setState after
+  // unmount OR after a newer load has been scheduled — fixes the React
+  // "setState on unmounted" warning that the duplicate loader caused.
   useEffect(() => {
     let cancelled = false;
-
     const loadData = async () => {
       try {
         const res = await fetch("/api/strategies");
         const data = await res.json();
-        if (!cancelled) {
-          setStrategies(data.strategies || []);
-          setGrouped(data.grouped || {});
-          setLastUpdate(new Date().toLocaleTimeString());
-          setLoading(false);
-        }
+        if (cancelled) return;
+        setStrategies(data.strategies || []);
+        setGrouped(data.grouped || {});
+        setLastUpdate(new Date().toLocaleTimeString());
+        setLoading(false);
       } catch {
         if (!cancelled) setLoading(false);
       }
     };
-
     void loadData();
     const interval = setInterval(loadData, 60000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [refreshKey]);
 
-  const loadData = async () => {
-    try {
-      const res = await fetch("/api/strategies");
-      const data = await res.json();
-      setStrategies(data.strategies || []);
-      setGrouped(data.grouped || {});
-      setLastUpdate(new Date().toLocaleTimeString());
-    } catch {
-      // ignore
-    }
-  };
+  const refresh = () => setRefreshKey((k) => k + 1);
 
   const visibleStrategies = useMemo(() => {
     return strategies.filter((strategy) => {
@@ -167,7 +159,7 @@ export default function StrategiesPage() {
           >
             {view === "ranking" ? "By Strategy" : "Ranking"}
           </button>
-          <button onClick={loadData} className="flex items-center gap-1 px-3 py-2 text-sm bg-zinc-100 hover:bg-zinc-200 rounded-lg">
+          <button onClick={refresh} className="flex items-center gap-1 px-3 py-2 text-sm bg-zinc-100 hover:bg-zinc-200 rounded-lg">
             <RefreshCw className="h-4 w-4" />
           </button>
         </div>

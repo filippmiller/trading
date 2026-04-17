@@ -650,9 +650,14 @@ async function jobSyncPrices() {
     );
     logId = logResult.insertId;
 
-    // Auto-close entries older than 14 calendar days
+    // Auto-close entries older than 14 calendar days.
+    // Use explicit ET-today parameter — MySQL's CURRENT_DATE evaluates in the
+    // server session TZ (UTC in this deployment), which diverges from ET
+    // after 20:00 ET. Passing todayET() decouples the comparison from server
+    // TZ drift.
     await db.execute(
-      "UPDATE reversal_entries SET status = 'COMPLETED' WHERE status = 'ACTIVE' AND cohort_date < DATE_SUB(CURRENT_DATE, INTERVAL 14 DAY)"
+      "UPDATE reversal_entries SET status = 'COMPLETED' WHERE status = 'ACTIVE' AND cohort_date < DATE_SUB(?, INTERVAL 14 DAY)",
+      [todayET()]
     );
 
     // Force-close any paper_signals still open against just-expired cohorts.
@@ -816,7 +821,10 @@ async function jobExecuteStrategiesImpl() {
 
     // Count signals already created today for this strategy
     const [todayCount] = await db.execute<mysql.RowDataPacket[]>(
-      "SELECT COUNT(*) as cnt FROM paper_signals WHERE strategy_id = ? AND DATE(generated_at) = ?",
+      // DATE(generated_at) evaluates the stored UTC TIMESTAMP in server TZ
+      // (UTC). CONVERT_TZ shifts to ET so "signals generated today in ET" is
+      // what we actually count — robust against post-20:00 ET writes.
+      "SELECT COUNT(*) as cnt FROM paper_signals WHERE strategy_id = ? AND DATE(CONVERT_TZ(generated_at, '+00:00', 'America/New_York')) = ?",
       [strat.id, today]
     );
     let todayNew = Number(todayCount[0].cnt);
@@ -1194,8 +1202,8 @@ async function jobMonitorPositionsImpl() {
       const qty = investment / price;
       const [tradeResult] = await db.execute<mysql.ResultSetHeader>(
         `INSERT INTO paper_trades (account_id, symbol, quantity, buy_price, buy_date, investment_usd, strategy, status)
-         VALUES (?, ?, ?, ?, CURRENT_DATE, ?, ?, 'OPEN')`,
-        [order.account_id, order.symbol, qty, price, investment, `${type} BUY`]
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN')`,
+        [order.account_id, order.symbol, qty, price, todayET(), investment, `${type} BUY`]
       );
       await db.execute("UPDATE paper_accounts SET cash = cash - ? WHERE id = ?", [investment, order.account_id]);
       await db.execute(
@@ -1224,8 +1232,8 @@ async function jobMonitorPositionsImpl() {
       const pnlUsd = proceeds - investment;
       const pnlPctVal = (pnlUsd / investment) * 100;
 
-      await db.execute("UPDATE paper_trades SET status='CLOSED', sell_price=?, sell_date=CURRENT_DATE, pnl_usd=?, pnl_pct=? WHERE id=?",
-        [price, pnlUsd, pnlPctVal, trade.id]);
+      await db.execute("UPDATE paper_trades SET status='CLOSED', sell_price=?, sell_date=?, pnl_usd=?, pnl_pct=? WHERE id=?",
+        [price, todayET(), pnlUsd, pnlPctVal, trade.id]);
       await db.execute("UPDATE paper_accounts SET cash = cash + ? WHERE id = ?", [proceeds, order.account_id]);
       await db.execute("UPDATE paper_orders SET status='FILLED', filled_price=?, filled_at=CURRENT_TIMESTAMP(6), trade_id=? WHERE id=?",
         [price, trade.id, order.id]);
@@ -1303,7 +1311,10 @@ async function jobExecuteConfirmationStrategiesImpl() {
     let currentOpen = Number(openCount[0].cnt);
 
     const [todayCount] = await db.execute<mysql.RowDataPacket[]>(
-      "SELECT COUNT(*) as cnt FROM paper_signals WHERE strategy_id = ? AND DATE(generated_at) = ?",
+      // DATE(generated_at) evaluates the stored UTC TIMESTAMP in server TZ
+      // (UTC). CONVERT_TZ shifts to ET so "signals generated today in ET" is
+      // what we actually count — robust against post-20:00 ET writes.
+      "SELECT COUNT(*) as cnt FROM paper_signals WHERE strategy_id = ? AND DATE(CONVERT_TZ(generated_at, '+00:00', 'America/New_York')) = ?",
       [strat.id, today]
     );
     let todayNew = Number(todayCount[0].cnt);
@@ -1448,14 +1459,18 @@ async function jobExecuteConfirmationStrategiesImpl() {
 // ─── Trend Scanner ─────────────────────────────────────────────────────────
 
 import { readFileSync } from "fs";
-import { fileURLToPath } from "url";
 import * as path from "path";
 
 // Load universe once at startup — ~500 liquid US stocks for trend scanning.
 // Fail LOUDLY on read/parse error so deployment bugs (file not copied, JSON
 // malformed) surface as container crashes rather than a silently disabled
 // scanner. An intentionally-empty `{ "symbols": [] }` is allowed.
-const UNIVERSE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "trend-universe.json");
+//
+// Resolve relative to process.cwd() (set by Dockerfile WORKDIR) rather than
+// import.meta.url — tsx's `import.meta.url` behavior can change across
+// versions depending on how it transforms the module URL; cwd is stable.
+// `UNIVERSE_PATH` env var overrides for local dev / alternate layouts.
+const UNIVERSE_PATH = process.env.UNIVERSE_PATH ?? path.join(process.cwd(), "scripts", "trend-universe.json");
 let TREND_UNIVERSE: string[] = [];
 try {
   const raw = readFileSync(UNIVERSE_PATH, "utf-8");

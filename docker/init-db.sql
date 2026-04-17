@@ -233,7 +233,10 @@ CREATE TABLE IF NOT EXISTS paper_position_prices (
   signal_id INT NOT NULL,
   price DECIMAL(18,6) NOT NULL,
   fetched_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  INDEX IX_pos_price_signal (signal_id, fetched_at)
+  INDEX IX_pos_price_signal (signal_id, fetched_at),
+  CONSTRAINT FK_pos_price_signal
+    FOREIGN KEY (signal_id) REFERENCES paper_signals(id)
+    ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 INSERT IGNORE INTO paper_accounts (name, initial_cash, cash)
