@@ -148,7 +148,10 @@ async function main() {
 
         if (checkpoints.length === 0) continue;
 
-        // Walk through checkpoints, evaluate exit conditions
+        // Walk through checkpoints, evaluate exit conditions. All PnL math
+        // is direction-aware: `pnlPct` represents PROFIT for both LONG and
+        // SHORT (raw price-move sign flipped for SHORT).
+        const isShort = candidate.direction === "SHORT";
         let maxPrice = entryPrice;
         let minPrice = entryPrice;
         let trailingActive = false;
@@ -162,17 +165,16 @@ async function main() {
           maxPrice = Math.max(maxPrice, price);
           minPrice = Math.min(minPrice, price);
 
-          const pnlPct = ((price - entryPrice) / entryPrice) * 100;
+          const rawPricePct = ((price - entryPrice) / entryPrice) * 100;
+          const pnlPct = isShort ? -rawPricePct : rawPricePct;
           const leveragedPnl = pnlPct * leverage;
 
-          // Hard stop
-          if (config.exits.hard_stop_pct != null) {
-            if (pnlPct <= config.exits.hard_stop_pct) {
-              exitPrice = price;
-              exitReason = "HARD_STOP";
-              exitDay = cp.day;
-              break;
-            }
+          // Hard stop (pnlPct is direction-aware: negative = losing)
+          if (config.exits.hard_stop_pct != null && pnlPct <= config.exits.hard_stop_pct) {
+            exitPrice = price;
+            exitReason = "HARD_STOP";
+            exitDay = cp.day;
+            break;
           }
 
           // Leverage liquidation
@@ -183,7 +185,7 @@ async function main() {
             break;
           }
 
-          // Take profit
+          // Take profit (direction-aware)
           if (config.exits.take_profit_pct != null && pnlPct >= config.exits.take_profit_pct) {
             exitPrice = price;
             exitReason = "TAKE_PROFIT";
@@ -191,25 +193,36 @@ async function main() {
             break;
           }
 
-          // Trailing stop
+          // Trailing stop — LONG trails below max, SHORT trails above min.
           if (config.exits.trailing_stop_pct != null) {
             const activateAt = config.exits.trailing_activates_at_profit_pct ?? 0;
             if (!trailingActive && pnlPct >= activateAt) {
               trailingActive = true;
-              trailingStop = price * (1 - config.exits.trailing_stop_pct / 100);
+              trailingStop = isShort
+                ? price * (1 + config.exits.trailing_stop_pct / 100)
+                : price * (1 - config.exits.trailing_stop_pct / 100);
             }
             if (trailingActive) {
-              // Update trailing on new high
-              const newStop = maxPrice * (1 - config.exits.trailing_stop_pct / 100);
-              if (trailingStop == null || newStop > trailingStop) {
-                trailingStop = newStop;
-              }
-              // Check trigger
-              if (price <= trailingStop) {
-                exitPrice = price;
-                exitReason = "TRAIL_STOP";
-                exitDay = cp.day;
-                break;
+              if (isShort) {
+                // SHORT: stop is above min; tighter stop is LOWER.
+                const newStop = minPrice * (1 + config.exits.trailing_stop_pct / 100);
+                if (trailingStop == null || newStop < trailingStop) trailingStop = newStop;
+                if (trailingStop != null && price >= trailingStop) {
+                  exitPrice = price;
+                  exitReason = "TRAIL_STOP";
+                  exitDay = cp.day;
+                  break;
+                }
+              } else {
+                // LONG: stop is below max; tighter stop is HIGHER.
+                const newStop = maxPrice * (1 - config.exits.trailing_stop_pct / 100);
+                if (trailingStop == null || newStop > trailingStop) trailingStop = newStop;
+                if (trailingStop != null && price <= trailingStop) {
+                  exitPrice = price;
+                  exitReason = "TRAIL_STOP";
+                  exitDay = cp.day;
+                  break;
+                }
               }
             }
           }
@@ -235,10 +248,15 @@ async function main() {
 
         if (exitPrice == null) continue;
 
-        // Compute P&L
-        const { pnl_usd, pnl_pct } = computePnL(entryPrice, exitPrice, investment, leverage);
-        const maxPnlPct = ((maxPrice - entryPrice) / entryPrice) * 100 * leverage;
-        const minPnlPct = ((minPrice - entryPrice) / entryPrice) * 100 * leverage;
+        // Compute P&L (direction-aware)
+        const direction = candidate.direction === "SHORT" ? "SHORT" : "LONG";
+        const { pnl_usd, pnl_pct } = computePnL(entryPrice, exitPrice, investment, leverage, direction);
+        // High-watermark pnl: for LONG the best is maxPrice; for SHORT the
+        // best is minPrice. Flip sign accordingly.
+        const maxRaw = ((maxPrice - entryPrice) / entryPrice) * 100;
+        const minRaw = ((minPrice - entryPrice) / entryPrice) * 100;
+        const maxPnlPct = (isShort ? -minRaw : maxRaw) * leverage;
+        const minPnlPct = (isShort ? -maxRaw : minRaw) * leverage;
 
         // Update stats
         trades++;

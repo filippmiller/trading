@@ -10,12 +10,19 @@ const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
 const SYMBOL_RE = /^[A-Z0-9.\-]{1,16}$/;
 
-// US market holidays — update annually
+// US market holidays (NYSE/NASDAQ full closures) — mirrors cron's list.
+// Observation rules: holiday on Sat → observed Friday (except NY-Day
+// exception). Juneteenth is a holiday since 2022.
 const MARKET_HOLIDAYS = new Set([
+  // 2026
   "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
-  "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
-  "2027-01-01", "2027-01-18", "2027-02-15", "2027-04-16", "2027-05-31",
-  "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+  "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+  // 2027
+  "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+  "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+  // 2028
+  "2028-01-17", "2028-02-21", "2028-04-14", "2028-05-29", "2028-06-19",
+  "2028-07-04", "2028-09-04", "2028-11-23", "2028-12-25",
 ]);
 
 // Column name allowlist to prevent SQL injection
@@ -29,6 +36,36 @@ for (let d = 1; d <= 10; d++) {
 /** Returns today's date as YYYY-MM-DD in ET timezone */
 function todayET(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
+}
+
+/** Parse a MySQL DATE (returned as UTC-midnight Date under timezone:"Z") into
+ *  a YYYY-MM-DD ET-calendar string. Uses UTC accessors so the stored
+ *  calendar date is preserved (reading in ET would shift -4h = prior day). */
+function mysqlDateToETStr(v: unknown): string {
+  if (typeof v === "string") return v.slice(0, 10);
+  if (v instanceof Date) {
+    const y = v.getUTCFullYear();
+    const m = String(v.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(v.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  return String(v);
+}
+
+/** Add N calendar days to a YYYY-MM-DD string using ET-calendar semantics. */
+function addCalendarDaysET(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const base = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  base.setUTCDate(base.getUTCDate() + days);
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(base);
+}
+
+/** Returns true if the given YYYY-MM-DD lands on Sat/Sun in ET. */
+function isWeekendET(dateStr: string): boolean {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const base = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  const dow = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short" }).format(base);
+  return dow === "Sat" || dow === "Sun";
 }
 
 /**
@@ -175,9 +212,12 @@ export async function syncActiveSurveillance() {
   const pool = await getPool();
 
   // Auto-close logic: Mark anything older than 14 days as COMPLETED
-  // (10 business days ≈ 14 calendar days)
+  // (10 business days ≈ 14 calendar days). Pass ET today explicitly — MySQL
+  // CURRENT_DATE runs in server TZ (UTC in this deployment) which diverges
+  // from ET after 20:00 ET.
   await pool.execute(
-    "UPDATE reversal_entries SET status = 'COMPLETED' WHERE status = 'ACTIVE' AND cohort_date < DATE_SUB(CURRENT_DATE, INTERVAL 14 DAY)"
+    "UPDATE reversal_entries SET status = 'COMPLETED' WHERE status = 'ACTIVE' AND cohort_date < DATE_SUB(?, INTERVAL 14 DAY)",
+    [todayET()]
   );
 
   const [logResult] = await pool.execute<mysql.ResultSetHeader>(
@@ -195,17 +235,21 @@ export async function syncActiveSurveillance() {
     );
 
     for (const row of entries) {
-      const entryDate = new Date(row.cohort_date);
       const updates: string[] = [];
       const params: (number | string)[] = [];
 
-      // Walk trading days (skip weekends + holidays), matching cron logic
+      // Walk trading days (skip weekends + holidays) in ET-calendar space.
+      // Previous implementation mixed UTC (`new Date(mysql_date)` → UTC
+      // midnight), LOCAL (`.getDay()`), and UTC again (`.toISOString()`),
+      // which produced dateStr values one day ahead of what getDay reported
+      // on TZ boundaries — same P0-4 bug the cron had.
+      const cohortStr = mysqlDateToETStr(row.cohort_date);
       let tradingDay = 0;
-      const obsDate = new Date(entryDate);
+      let cursor = cohortStr;
       while (tradingDay < 10) {
-        obsDate.setDate(obsDate.getDate() + 1);
-        if (obsDate.getDay() === 0 || obsDate.getDay() === 6) continue;
-        const dateStr = obsDate.toISOString().split('T')[0];
+        cursor = addCalendarDaysET(cursor, 1);
+        if (isWeekendET(cursor)) continue;
+        const dateStr = cursor;
         if (MARKET_HOLIDAYS.has(dateStr)) continue;
         tradingDay++;
         const nowStr = todayET();
