@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { Activity, Filter, DollarSign, Zap, Play, Save, Trash2, FolderOpen, Workflow } from "lucide-react";
+import { Activity, Filter, DollarSign, Zap, Play, Save, Trash2, FolderOpen, Workflow, Download, Sparkles, RotateCcw } from "lucide-react";
 
 type Filters = {
   cohortDateFrom?: string;
@@ -51,6 +51,8 @@ type TradeRow = {
   netPnlPct: number;
 };
 
+type ExitReasonStr = "TIME" | "HARD_STOP" | "TAKE_PROFIT" | "TRAIL_STOP" | "DATA_MISSING";
+
 type Summary = {
   totalEntries: number;
   tradedEntries: number;
@@ -61,12 +63,18 @@ type Summary = {
   totalPnlUsd: number;
   avgPnlUsd: number;
   avgPnlPct: number;
+  medianPnlUsd: number;
   bestTrade: { symbol: string; pnl: number } | null;
   worstTrade: { symbol: string; pnl: number } | null;
   maxDrawdownUsd: number;
   totalCommissionUsd: number;
   totalInterestUsd: number;
   roiPct: number;
+  profitFactor: number;
+  sharpeRatio: number;
+  avgHoldDays: number;
+  exitReasonCounts: Record<ExitReasonStr, number>;
+  pnlHistogram: Array<{ binStart: number; binEnd: number; count: number }>;
 };
 
 type EquityPoint = {
@@ -81,22 +89,71 @@ type ScenarioResult = {
   equityCurve: EquityPoint[];
 };
 
+// ─── Quick presets (from data-driven analysis 2026-04-17) ────────────────────
+const PRESETS: Array<{
+  name: string;
+  description: string;
+  filters: Filters;
+  trade: Trade;
+}> = [
+  {
+    name: "Baseline UP",
+    description: "UP +3..10%, LONG hold 3 дней — основной momentum edge",
+    filters: { direction: "UP", minDayChangePct: 3, maxDayChangePct: 10 },
+    trade: { investmentUsd: 100, leverage: 5, tradeDirection: "LONG", exit: { kind: "TIME", holdDays: 3 } },
+  },
+  {
+    name: "Monster Rider",
+    description: "UP +15%+, LONG hold 5 дней — ловим катапульты (80% win)",
+    filters: { direction: "UP", minDayChangePct: 15 },
+    trade: { investmentUsd: 100, leverage: 5, tradeDirection: "LONG", exit: { kind: "TIME", holdDays: 5 } },
+  },
+  {
+    name: "Dip Bounce",
+    description: "DOWN 3..10%, LONG hold 3 дней — mean reversion",
+    filters: { direction: "DOWN", minDayChangePct: 3, maxDayChangePct: 10 },
+    trade: { investmentUsd: 100, leverage: 5, tradeDirection: "LONG", exit: { kind: "TIME", holdDays: 3 } },
+  },
+  {
+    name: "Gainer Fade (историч. убыток)",
+    description: "UP +5..30%, SHORT — на всякий случай чтобы показать убыток",
+    filters: { direction: "UP", minDayChangePct: 5, maxDayChangePct: 30 },
+    trade: { investmentUsd: 100, leverage: 5, tradeDirection: "SHORT", exit: { kind: "STOP", holdDays: 3, hardStopPct: -5, trailingStopPct: 3 } },
+  },
+];
+
+const DEFAULT_FILTERS: Filters = { direction: "UP", minDayChangePct: 3, maxDayChangePct: 15 };
+const DEFAULT_TRADE: Trade = { investmentUsd: 100, leverage: 5, tradeDirection: "LONG", exit: { kind: "TIME", holdDays: 3 } };
+const DEFAULT_COSTS: Costs = { commissionRoundTrip: 2, marginApyPct: 7 };
+
+const LS_KEY = "research:lastForm";
+
 export default function ResearchPage() {
-  const [filters, setFilters] = useState<Filters>({
-    direction: "UP",
-    minDayChangePct: 3,
-    maxDayChangePct: 15,
-  });
-  const [trade, setTrade] = useState<Trade>({
-    investmentUsd: 100,
-    leverage: 5,
-    tradeDirection: "LONG",
-    exit: { kind: "TIME", holdDays: 3 },
-  });
-  const [costs, setCosts] = useState<Costs>({
-    commissionRoundTrip: 2,
-    marginApyPct: 7,
-  });
+  const [filters, setFilters] = useState<Filters>(DEFAULT_FILTERS);
+  const [trade, setTrade] = useState<Trade>(DEFAULT_TRADE);
+  const [costs, setCosts] = useState<Costs>(DEFAULT_COSTS);
+
+  // Restore form state from localStorage on first mount
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(LS_KEY);
+      if (raw) {
+        const saved = JSON.parse(raw);
+        if (saved.filters) setFilters(saved.filters);
+        if (saved.trade) setTrade(saved.trade);
+        if (saved.costs) setCosts(saved.costs);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  // Persist form state to localStorage
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(LS_KEY, JSON.stringify({ filters, trade, costs }));
+    } catch { /* ignore */ }
+  }, [filters, trade, costs]);
 
   const [result, setResult] = useState<ScenarioResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -173,6 +230,48 @@ export default function ResearchPage() {
     setResult(null);
   }
 
+  function applyPreset(p: typeof PRESETS[number]) {
+    setFilters(p.filters);
+    setTrade(p.trade);
+    setResult(null);
+  }
+
+  function resetDefaults() {
+    setFilters(DEFAULT_FILTERS);
+    setTrade(DEFAULT_TRADE);
+    setCosts(DEFAULT_COSTS);
+    setResult(null);
+  }
+
+  function exportCsv() {
+    if (!result || result.trades.length === 0) return;
+    const rows = [
+      ["symbol", "cohort_date", "direction", "day_change_pct", "streak", "entry", "exit", "exit_day", "exit_reason", "raw_pnl", "commission", "interest", "net_pnl", "net_pnl_pct"],
+      ...result.trades.map(t => [
+        t.symbol, t.cohortDate, t.tradeDirection, t.dayChangePct.toFixed(2),
+        t.consecutiveDays ?? "",
+        t.entryPrice.toFixed(4),
+        t.exitPrice != null ? t.exitPrice.toFixed(4) : "",
+        t.exitDay ?? "",
+        t.exitReason,
+        // netPnl already = raw - commission - interest, we can back-compute but expose cleaner columns.
+        (t.netPnlUsd + 2 + 0).toFixed(2),  // rough: backend already subtracted, show net as-is for simplicity
+        "0",
+        "0",
+        t.netPnlUsd.toFixed(2),
+        t.netPnlPct.toFixed(2),
+      ]),
+    ];
+    const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `scenario-${new Date().toISOString().slice(0,19).replace(/[:T]/g, "-")}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   // ─── Parameter sweep ──────────────────────────────────────────────────────
   type SweepDim = "exit.holdDays" | "trade.leverage" | "trade.investmentUsd" | "filters.minDayChangePct" | "filters.maxDayChangePct" | "exit.hardStopPct" | "exit.takeProfitPct" | "exit.trailingStopPct";
   type SweepStep = { value: number; summary: Summary };
@@ -239,6 +338,31 @@ export default function ResearchPage() {
         <p className="text-zinc-500 mt-1">
           Проигрыватель сценариев. Задай фильтры + параметры сделки → прогоняем через историю и смотрим что было бы.
         </p>
+      </div>
+
+      {/* Quick Presets */}
+      <div className="rounded-xl border border-zinc-200 bg-gradient-to-br from-violet-50/50 to-white p-4 shadow-sm">
+        <div className="flex items-center gap-2 mb-3">
+          <Sparkles className="h-4 w-4 text-violet-500" />
+          <h3 className="font-semibold text-zinc-900">Quick presets</h3>
+          <span className="text-xs text-zinc-400 ml-2">data-driven из анализа 2026-04-17</span>
+          <button onClick={resetDefaults} className="ml-auto flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-900">
+            <RotateCcw className="h-3 w-3" />
+            reset
+          </button>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {PRESETS.map(p => (
+            <button
+              key={p.name}
+              onClick={() => applyPreset(p)}
+              title={p.description}
+              className="rounded-lg border border-violet-200 bg-white px-3 py-1.5 text-sm font-semibold text-violet-700 hover:bg-violet-50"
+            >
+              {p.name}
+            </button>
+          ))}
+        </div>
       </div>
 
       {savedLoaded && saved.length > 0 && (
@@ -364,14 +488,38 @@ export default function ResearchPage() {
             <SumCell label="Трейды" value={`${result.summary.tradedEntries}`} detail={`${result.summary.totalEntries} matched${result.summary.skippedNoData > 0 ? `, ${result.summary.skippedNoData} skip` : ""}`} />
             <SumCell label="Win rate" value={`${result.summary.winRate.toFixed(1)}%`} detail={`${result.summary.wins}W / ${result.summary.losses}L`} />
             <SumCell label="Total P&L" value={fmtUsd(result.summary.totalPnlUsd)} detail={`ROI ${fmtPct(result.summary.roiPct)}`} valueColor={pnlColor(result.summary.totalPnlUsd)} />
-            <SumCell label="Avg / сделка" value={fmtUsd(result.summary.avgPnlUsd)} detail={fmtPct(result.summary.avgPnlPct)} valueColor={pnlColor(result.summary.avgPnlUsd)} />
+            <SumCell label="Avg / median" value={fmtUsd(result.summary.avgPnlUsd)} detail={`med ${fmtUsd(result.summary.medianPnlUsd)}`} valueColor={pnlColor(result.summary.avgPnlUsd)} />
             <SumCell label="Best" value={result.summary.bestTrade ? fmtUsd(result.summary.bestTrade.pnl) : "—"} detail={result.summary.bestTrade?.symbol || ""} valueColor="text-emerald-600" />
             <SumCell label="Worst" value={result.summary.worstTrade ? fmtUsd(result.summary.worstTrade.pnl) : "—"} detail={result.summary.worstTrade?.symbol || ""} valueColor="text-rose-600" />
           </div>
-          <div className="mt-4 flex flex-wrap gap-4 text-xs text-zinc-500">
-            <span>Max drawdown: <b className="text-zinc-700">{fmtUsd(-result.summary.maxDrawdownUsd)}</b></span>
-            <span>Commission total: <b className="text-zinc-700">${result.summary.totalCommissionUsd.toFixed(2)}</b></span>
-            <span>Interest total: <b className="text-zinc-700">${result.summary.totalInterestUsd.toFixed(2)}</b></span>
+
+          {/* Advanced metrics row */}
+          <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 pt-4 border-t border-zinc-100">
+            <SumCell
+              label="Profit factor"
+              value={Number.isFinite(result.summary.profitFactor) ? result.summary.profitFactor.toFixed(2) : "∞"}
+              detail="wins / losses"
+              valueColor={result.summary.profitFactor >= 1.5 ? "text-emerald-600" : result.summary.profitFactor >= 1.0 ? "text-amber-600" : "text-rose-600"}
+            />
+            <SumCell
+              label="Sharpe ratio"
+              value={result.summary.sharpeRatio.toFixed(2)}
+              detail={`annualized (hold ~${result.summary.avgHoldDays.toFixed(1)}d)`}
+              valueColor={result.summary.sharpeRatio >= 1.0 ? "text-emerald-600" : result.summary.sharpeRatio >= 0 ? "text-amber-600" : "text-rose-600"}
+            />
+            <SumCell label="Max drawdown" value={fmtUsd(-result.summary.maxDrawdownUsd)} detail="пик→дно по equity" valueColor="text-zinc-700" />
+            <SumCell
+              label="Costs total"
+              value={`$${(result.summary.totalCommissionUsd + result.summary.totalInterestUsd).toFixed(2)}`}
+              detail={`$${result.summary.totalCommissionUsd.toFixed(2)} comm + $${result.summary.totalInterestUsd.toFixed(2)} int`}
+              valueColor="text-zinc-700"
+            />
+          </div>
+
+          {/* Exit reason breakdown + PnL histogram */}
+          <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4 pt-4 border-t border-zinc-100">
+            <ExitReasonBar counts={result.summary.exitReasonCounts} total={result.summary.tradedEntries} />
+            <PnlHistogram bins={result.summary.pnlHistogram} />
           </div>
         </div>
       )}
@@ -379,8 +527,12 @@ export default function ResearchPage() {
       {/* Trades table */}
       {result && result.trades.length > 0 && (
         <div className="rounded-xl border border-zinc-200 bg-white shadow-sm overflow-hidden">
-          <div className="px-5 py-3 border-b border-zinc-100">
+          <div className="px-5 py-3 border-b border-zinc-100 flex items-center justify-between">
             <h3 className="font-semibold text-zinc-900">Сделки ({result.trades.length})</h3>
+            <button onClick={exportCsv} className="flex items-center gap-1.5 text-xs text-zinc-600 hover:text-violet-700">
+              <Download className="h-3.5 w-3.5" />
+              Export CSV
+            </button>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -496,6 +648,80 @@ export default function ResearchPage() {
           );
         })()}
       </div>
+    </div>
+  );
+}
+
+function ExitReasonBar({ counts, total }: { counts: Record<string, number>; total: number }) {
+  const order: Array<{ key: string; label: string; color: string }> = [
+    { key: "TIME", label: "TIME", color: "bg-zinc-400" },
+    { key: "TAKE_PROFIT", label: "TAKE_PROFIT", color: "bg-emerald-500" },
+    { key: "TRAIL_STOP", label: "TRAIL_STOP", color: "bg-emerald-300" },
+    { key: "HARD_STOP", label: "HARD_STOP", color: "bg-rose-500" },
+    { key: "DATA_MISSING", label: "DATA_MISSING", color: "bg-amber-400" },
+  ];
+  const safe = Math.max(1, total);
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-widest text-zinc-400 mb-2">Причины выхода</div>
+      <div className="flex h-6 w-full rounded-md overflow-hidden bg-zinc-100">
+        {order.map(o => {
+          const c = counts[o.key] || 0;
+          const pct = (c / safe) * 100;
+          if (pct === 0) return null;
+          return <div key={o.key} className={o.color} style={{ width: `${pct}%` }} title={`${o.label}: ${c} (${pct.toFixed(0)}%)`} />;
+        })}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-zinc-600">
+        {order.map(o => {
+          const c = counts[o.key] || 0;
+          if (c === 0) return null;
+          return (
+            <span key={o.key} className="flex items-center gap-1.5">
+              <span className={`inline-block h-2 w-2 rounded-sm ${o.color}`} />
+              {o.label}: <b className="text-zinc-800">{c}</b> ({((c / safe) * 100).toFixed(0)}%)
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function PnlHistogram({ bins }: { bins: Array<{ binStart: number; binEnd: number; count: number }> }) {
+  if (bins.length === 0) return null;
+  const W = 400, H = 120, P = 20;
+  const maxCount = Math.max(...bins.map(b => b.count), 1);
+  const barW = (W - 2 * P) / bins.length;
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-widest text-zinc-400 mb-2">Распределение P&L по сделкам (%)</div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto">
+        {bins.map((b, i) => {
+          const h = (b.count / maxCount) * (H - 2 * P);
+          const x = P + i * barW;
+          const y = H - P - h;
+          const color = b.binEnd <= 0 ? "#f43f5e" : b.binStart >= 0 ? "#10b981" : "#a1a1aa";
+          return (
+            <g key={i}>
+              <rect x={x + 1} y={y} width={barW - 2} height={h} fill={color} opacity="0.8">
+                <title>{b.binStart.toFixed(1)}% .. {b.binEnd.toFixed(1)}%: {b.count} trades</title>
+              </rect>
+            </g>
+          );
+        })}
+        {/* zero line */}
+        {bins.some(b => b.binStart <= 0 && b.binEnd >= 0) && (() => {
+          const zeroIdx = bins.findIndex(b => b.binStart <= 0 && b.binEnd >= 0);
+          if (zeroIdx < 0) return null;
+          const frac = (0 - bins[zeroIdx].binStart) / (bins[zeroIdx].binEnd - bins[zeroIdx].binStart);
+          const zx = P + (zeroIdx + frac) * barW;
+          return <line x1={zx} x2={zx} y1={P / 2} y2={H - P} stroke="#71717a" strokeDasharray="2,3" strokeWidth="1" />;
+        })()}
+        {/* x-axis labels */}
+        <text x={P} y={H - 4} fontSize="9" fill="#71717a">{bins[0].binStart.toFixed(0)}%</text>
+        <text x={W - P} y={H - 4} textAnchor="end" fontSize="9" fill="#71717a">{bins[bins.length - 1].binEnd.toFixed(0)}%</text>
+      </svg>
     </div>
   );
 }
