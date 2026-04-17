@@ -79,7 +79,17 @@ async function fetchMoversFromYahoo(type: "gainers" | "losers"): Promise<Mover[]
 
 async function fetchDailyBars(symbol: string): Promise<{ date: string; close: number }[]> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1mo&interval=1d`;
-  const res = await fetch(url, { headers: { "User-Agent": UA } });
+  // Hard 8-second timeout per request — prevents hung connections from stalling batch
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  let res: Response;
+  try {
+    res = await fetch(url, { headers: { "User-Agent": UA }, signal: controller.signal });
+  } catch {
+    clearTimeout(timeoutId);
+    return [];
+  }
+  clearTimeout(timeoutId);
   if (!res.ok) return [];
   const data = await res.json();
   const result = data?.chart?.result?.[0];
@@ -358,20 +368,30 @@ async function jobEnrollMovers() {
       return;
     }
 
+    // Guard against pre-market startup runs: Yahoo's screener returns stale
+    // prior-session data before market open, which would enroll with wrong
+    // entry_price. Require market to be open (or past open) for today.
+    const now = new Date();
+    const nyClock = now.toLocaleString("en-US", { timeZone: "America/New_York", hour12: false }).split(", ")[1];
+    const [h, m] = nyClock.split(":").map(Number);
+    const curMinutes = h * 60 + m;
+    if (curMinutes < 9 * 60 + 45) {
+      log(`  SKIP: too early (${nyClock} ET) — movers enrollment runs at 09:45 ET`);
+      return;
+    }
+
     const db = getPool();
     const today = todayET();
 
-    // Idempotency: if we've already enrolled today's cohort, skip.
-    // Prevents duplicate enrollments from container restarts, manual API triggers,
-    // or scheduled re-runs — Yahoo's top movers change throughout the day, so
-    // running again would add new symbols to the same cohort.
+    // Idempotency: skip if we've already enrolled today's MOVERS cohort.
+    // Filter by source so trend-scanner entries don't block morning movers enrollment.
     const [existing] = await db.execute<mysql.RowDataPacket[]>(
-      "SELECT COUNT(*) as cnt FROM reversal_entries WHERE cohort_date = ?",
+      "SELECT COUNT(*) as cnt FROM reversal_entries WHERE cohort_date = ? AND enrollment_source = 'MOVERS'",
       [today]
     );
     const existingCount = Number(existing[0]?.cnt ?? 0);
     if (existingCount > 0) {
-      log(`  SKIP: already enrolled ${existingCount} tickers for ${today}`);
+      log(`  SKIP: already enrolled ${existingCount} MOVERS tickers for ${today}`);
       return;
     }
 
@@ -398,8 +418,8 @@ async function jobEnrollMovers() {
     for (const item of enhanced) {
       const direction = item.changePct > 0 ? "SHORT" : "LONG";
       await db.execute(
-        `INSERT INTO reversal_entries (cohort_date, symbol, direction, day_change_pct, entry_price, consecutive_days, cumulative_change_pct, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+        `INSERT INTO reversal_entries (cohort_date, symbol, direction, enrollment_source, day_change_pct, entry_price, consecutive_days, cumulative_change_pct, status)
+         VALUES (?, ?, ?, 'MOVERS', ?, ?, ?, ?, 'ACTIVE')
          ON DUPLICATE KEY UPDATE
            entry_price = VALUES(entry_price),
            day_change_pct = VALUES(day_change_pct),
@@ -598,6 +618,11 @@ async function jobExecuteStrategies() {
       if (entry.direction === "LONG" && e.direction !== "LONG") continue;
       if (entry.direction === "SHORT" && e.direction !== "SHORT") continue;
 
+      // Enrollment source filter (e.g., "MOVERS" or "TREND" or "ANY")
+      if (entry.enrollment_source && entry.enrollment_source !== "ANY") {
+        if (e.enrollment_source !== entry.enrollment_source) continue;
+      }
+
       const pct = Number(e.day_change_pct);
 
       // Drop magnitude for LONG
@@ -631,14 +656,14 @@ async function jobExecuteStrategies() {
       const entryPrice = Number(e.entry_price);
       await db.execute(
         `INSERT INTO paper_signals
-         (strategy_id, reversal_entry_id, symbol, status,
+         (strategy_id, reversal_entry_id, symbol, direction, status,
           entry_price, entry_at, investment_usd, leverage, effective_exposure,
           max_price, min_price, max_pnl_pct, min_pnl_pct)
-         VALUES (?, ?, ?, 'EXECUTED',
+         VALUES (?, ?, ?, ?, 'EXECUTED',
                  ?, CURRENT_TIMESTAMP(6), ?, ?, ?,
                  ?, ?, 0, 0)`,
         [
-          strat.id, e.id, e.symbol,
+          strat.id, e.id, e.symbol, e.direction,
           entryPrice, investmentPerTrade, leverage, investmentPerTrade * leverage,
           entryPrice, entryPrice,
         ]
@@ -738,13 +763,19 @@ async function jobMonitorPositions() {
     );
     pricesRecorded++;
 
-    // Update max/min watermarks
+    const isShort = sig.direction === "SHORT";
+    const entryPrice = Number(sig.entry_price);
+    const leverage = Number(sig.leverage || 1);
+
+    // Raw price move % (positive = price went up)
+    const rawPricePct = entryPrice > 0 ? ((price - entryPrice) / entryPrice) * 100 : 0;
+    // Direction-aware PnL: LONG profits when price goes up, SHORT profits when price goes down
+    const pnlPct = isShort ? -rawPricePct : rawPricePct;
+    const leveragedPnl = pnlPct * leverage;
+
+    // Update max/min watermarks (track actual price extremes)
     const maxPrice = Math.max(Number(sig.max_price || 0), price);
     const minPrice = sig.min_price ? Math.min(Number(sig.min_price), price) : price;
-    const entryPrice = Number(sig.entry_price);
-    const pnlPct = entryPrice > 0 ? ((price - entryPrice) / entryPrice) * 100 : 0;
-    const leverage = Number(sig.leverage || 1);
-    const leveragedPnl = pnlPct * leverage;
     const maxPnl = Math.max(Number(sig.max_pnl_pct || -999), leveragedPnl);
     const minPnl = Math.min(Number(sig.min_pnl_pct || 999), leveragedPnl);
 
@@ -765,7 +796,7 @@ async function jobMonitorPositions() {
 
     let exitReason: string | null = null;
 
-    // Hard stop
+    // Hard stop (pnlPct is direction-aware: negative = losing)
     if (exits.hard_stop_pct != null && pnlPct <= exits.hard_stop_pct) {
       exitReason = "HARD_STOP";
     }
@@ -775,12 +806,12 @@ async function jobMonitorPositions() {
       exitReason = "LIQUIDATED";
     }
 
-    // Take profit
+    // Take profit (pnlPct is direction-aware: positive = winning)
     if (exits.take_profit_pct != null && pnlPct >= exits.take_profit_pct) {
       exitReason = "TAKE_PROFIT";
     }
 
-    // Trailing stop
+    // Trailing stop — direction-aware
     if (exits.trailing_stop_pct != null) {
       const activateAt = exits.trailing_activates_at_profit_pct ?? 0;
       let trailActive = sig.trailing_active === 1;
@@ -788,12 +819,23 @@ async function jobMonitorPositions() {
 
       if (!trailActive && pnlPct >= activateAt) {
         trailActive = true;
-        trailStop = price * (1 - exits.trailing_stop_pct / 100);
+        // LONG: trail below price; SHORT: trail above price
+        trailStop = isShort
+          ? price * (1 + exits.trailing_stop_pct / 100)
+          : price * (1 - exits.trailing_stop_pct / 100);
       }
       if (trailActive) {
-        const newStop = maxPrice * (1 - exits.trailing_stop_pct / 100);
-        if (trailStop == null || newStop > trailStop) trailStop = newStop;
-        if (price <= trailStop) exitReason = "TRAIL_STOP";
+        if (isShort) {
+          // SHORT: best price is the lowest (minPrice); trail stop goes above it
+          const newStop = minPrice * (1 + exits.trailing_stop_pct / 100);
+          if (trailStop == null || newStop < trailStop) trailStop = newStop;
+          if (price >= trailStop) exitReason = "TRAIL_STOP";
+        } else {
+          // LONG: best price is the highest (maxPrice); trail stop goes below it
+          const newStop = maxPrice * (1 - exits.trailing_stop_pct / 100);
+          if (trailStop == null || newStop > trailStop) trailStop = newStop;
+          if (price <= trailStop) exitReason = "TRAIL_STOP";
+        }
       }
 
       // Persist trailing state
@@ -814,8 +856,9 @@ async function jobMonitorPositions() {
     // Execute exit
     if (exitReason) {
       const investment = Number(sig.investment_usd);
-      const rawPct = ((price - entryPrice) / entryPrice) * 100;
-      const leveragedPctFinal = Math.max(rawPct * leverage, -100);
+      // Direction-aware final PnL
+      const finalPnlPct = isShort ? -rawPricePct : rawPricePct;
+      const leveragedPctFinal = Math.max(finalPnlPct * leverage, -100);
       const pnlUsd = investment * (leveragedPctFinal / 100);
       const holdMinutes = sig.entry_at
         ? Math.round((Date.now() - new Date(sig.entry_at).getTime()) / 60000)
@@ -840,7 +883,8 @@ async function jobMonitorPositions() {
       }
 
       positionsClosed++;
-      log(`    EXIT ${sig.symbol} [${exitReason}] P&L: ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${leveragedPctFinal.toFixed(1)}%)`);
+      const dir = isShort ? "SHORT" : "LONG";
+      log(`    EXIT ${dir} ${sig.symbol} [${exitReason}] P&L: ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${leveragedPctFinal.toFixed(1)}%)`);
     }
   }
 
@@ -920,6 +964,350 @@ async function jobMonitorPositions() {
   log(`  Monitor: ${pricesRecorded} prices recorded, ${ordersFilled} orders filled, ${positionsClosed} positions closed`);
 }
 
+// ─── Confirmation Strategy Engine ─────────────────────────────────────────
+
+/**
+ * Execute CONFIRMATION strategies — these wait for d1/d2 price confirmation
+ * before entering a trade. Runs after close sync so d1/d2 prices are available.
+ *
+ * For each enabled CONFIRMATION strategy:
+ *   1. Load config (includes confirmation_days, d1/d2 filters)
+ *   2. Query reversal_entries from N days ago with d1/d2 close prices filled
+ *   3. Check confirmation conditions against actual price data
+ *   4. Enter at the latest close price (d1 or d2 close depending on strategy)
+ */
+async function jobExecuteConfirmationStrategies() {
+  if (!isTradingDay()) return;
+
+  const db = getPool();
+  const today = todayET();
+
+  const [strategies] = await db.execute<mysql.RowDataPacket[]>(
+    "SELECT s.*, a.cash FROM paper_strategies s LEFT JOIN paper_accounts a ON s.account_id = a.id WHERE s.enabled = 1 AND s.strategy_type = 'CONFIRMATION'"
+  );
+
+  if (strategies.length === 0) { log("  Confirmation strategies: none enabled"); return; }
+
+  // Load recent entries (enrolled 1-5 trading days ago) with at least d1 close
+  const [entries] = await db.execute<mysql.RowDataPacket[]>(
+    `SELECT * FROM reversal_entries
+     WHERE status = 'ACTIVE'
+       AND cohort_date >= DATE_SUB(?, INTERVAL 8 DAY)
+       AND cohort_date < ?
+       AND d1_close IS NOT NULL
+     ORDER BY cohort_date DESC`,
+    [today, today]
+  );
+
+  if (entries.length === 0) { log("  Confirmation strategies: no recent entries with d1 data"); return; }
+
+  let totalSignals = 0;
+
+  for (const strat of strategies) {
+    const config = JSON.parse(strat.config_json);
+    const entry = config.entry || {};
+    const sizing = config.sizing || {};
+    const leverage = Number(strat.leverage || 1);
+    const investmentPerTrade = Number(sizing.amount_usd || 100);
+    const maxConcurrent = Number(sizing.max_concurrent || 10);
+    const maxNewPerDay = Number(sizing.max_new_per_day || 5);
+    let remainingCash = Number(strat.cash || 0);
+    const confirmDays = Number(entry.confirmation_days || 2);
+
+    const [openCount] = await db.execute<mysql.RowDataPacket[]>(
+      "SELECT COUNT(*) as cnt FROM paper_signals WHERE strategy_id = ? AND status = 'EXECUTED' AND exit_at IS NULL",
+      [strat.id]
+    );
+    let currentOpen = Number(openCount[0].cnt);
+
+    const [todayCount] = await db.execute<mysql.RowDataPacket[]>(
+      "SELECT COUNT(*) as cnt FROM paper_signals WHERE strategy_id = ? AND DATE(generated_at) = ?",
+      [strat.id, today]
+    );
+    let todayNew = Number(todayCount[0].cnt);
+
+    let stratSignals = 0;
+
+    for (const e of entries) {
+      if (currentOpen >= maxConcurrent) break;
+      if (todayNew >= maxNewPerDay) break;
+      if (remainingCash < investmentPerTrade) break;
+
+      const ep = Number(e.entry_price);
+      const d1Close = e.d1_close != null ? Number(e.d1_close) : null;
+      const d2Close = e.d2_close != null ? Number(e.d2_close) : null;
+      const pct = Number(e.day_change_pct);
+
+      // Must have required confirmation days of data
+      if (confirmDays >= 1 && d1Close == null) continue;
+      if (confirmDays >= 2 && d2Close == null) continue;
+
+      // Direction filter
+      if (entry.direction === "LONG" && e.direction !== "LONG") continue;
+      if (entry.direction === "SHORT" && e.direction !== "SHORT") continue;
+
+      // Enrollment source filter
+      if (entry.enrollment_source && entry.enrollment_source !== "ANY") {
+        if (e.enrollment_source !== entry.enrollment_source) continue;
+      }
+
+      // Consecutive days filter (for trend strategies)
+      if (entry.min_consecutive_days != null) {
+        if (e.consecutive_days == null || Number(e.consecutive_days) < entry.min_consecutive_days) continue;
+      }
+      if (entry.max_consecutive_days != null) {
+        if (e.consecutive_days == null || Number(e.consecutive_days) > entry.max_consecutive_days) continue;
+      }
+
+      // Magnitude filters (same as regular strategies)
+      if (e.direction === "LONG") {
+        if (entry.min_drop_pct != null && pct > entry.min_drop_pct) continue;
+        if (entry.max_drop_pct != null && pct < entry.max_drop_pct) continue;
+      }
+      if (e.direction === "SHORT") {
+        if (entry.min_rise_pct != null && pct < entry.min_rise_pct) continue;
+        if (entry.max_rise_pct != null && pct > entry.max_rise_pct) continue;
+      }
+
+      // Min price filter
+      if (entry.min_price != null && ep < entry.min_price) continue;
+
+      // ─── Confirmation checks ─────────────────────────────────────
+      const d1Ret = d1Close != null ? ((d1Close - ep) / ep) * 100 : null;
+      const d2Ret = d2Close != null && d1Close != null ? ((d2Close - d1Close) / d1Close) * 100 : null;
+
+      // "favorable" = direction the strategy profits from
+      // LONG profits when price goes UP; SHORT profits when price goes DOWN
+      const d1Favorable = e.direction === "LONG" ? (d1Ret != null && d1Ret > 0) : (d1Ret != null && d1Ret < 0);
+      const d2Favorable = e.direction === "LONG" ? (d2Ret != null && d2Ret > 0) : (d2Ret != null && d2Ret < 0);
+      const d1Unfavorable = e.direction === "LONG" ? (d1Ret != null && d1Ret <= 0) : (d1Ret != null && d1Ret >= 0);
+      const d2Unfavorable = e.direction === "LONG" ? (d2Ret != null && d2Ret <= 0) : (d2Ret != null && d2Ret >= 0);
+
+      if (entry.d1_must_be_favorable && !d1Favorable) continue;
+      if (entry.d1_must_be_unfavorable && !d1Unfavorable) continue;
+      if (entry.d2_must_be_favorable && !d2Favorable) continue;
+      if (entry.d2_must_be_unfavorable && !d2Unfavorable) continue;
+
+      // Minimum d1 bounce magnitude
+      if (entry.min_d1_move_pct != null && d1Ret != null) {
+        if (Math.abs(d1Ret) < entry.min_d1_move_pct) continue;
+      }
+
+      // ─── Determine entry price ───────────────────────────────────
+      // Enter at the latest confirmation day's close price
+      const entryPrice = confirmDays >= 2 && d2Close != null ? d2Close : d1Close!;
+
+      // Duplicate check
+      const [dupCheck] = await db.execute<mysql.RowDataPacket[]>(
+        "SELECT 1 FROM paper_signals WHERE strategy_id = ? AND reversal_entry_id = ?",
+        [strat.id, e.id]
+      );
+      if (dupCheck.length > 0) continue;
+
+      // Create signal
+      await db.execute(
+        `INSERT INTO paper_signals
+         (strategy_id, reversal_entry_id, symbol, direction, status,
+          entry_price, entry_at, investment_usd, leverage, effective_exposure,
+          max_price, min_price, max_pnl_pct, min_pnl_pct)
+         VALUES (?, ?, ?, ?, 'EXECUTED',
+                 ?, CURRENT_TIMESTAMP(6), ?, ?, ?,
+                 ?, ?, 0, 0)`,
+        [
+          strat.id, e.id, e.symbol, e.direction,
+          entryPrice, investmentPerTrade, leverage, investmentPerTrade * leverage,
+          entryPrice, entryPrice,
+        ]
+      );
+
+      log(`    ${strat.name}: ENTER ${e.direction} ${e.symbol} @ $${entryPrice.toFixed(2)} ($${investmentPerTrade} × ${leverage}x)`);
+
+      // Deduct from strategy account
+      const [cashUpdate] = await db.execute<mysql.ResultSetHeader>(
+        "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
+        [investmentPerTrade, strat.account_id, investmentPerTrade]
+      );
+      if (cashUpdate.affectedRows === 0) {
+        log(`    ${strat.name}: cash exhausted before filling ${e.symbol}`);
+        break;
+      }
+
+      remainingCash -= investmentPerTrade;
+      currentOpen++;
+      todayNew++;
+      stratSignals++;
+      totalSignals++;
+    }
+
+    if (stratSignals > 0) {
+      log(`    ${strat.name}: ${stratSignals} new signals (${currentOpen} total open, $${remainingCash.toFixed(0)} cash remaining)`);
+    }
+  }
+
+  log(`  Confirmation strategies: ${totalSignals} total signals across ${strategies.length} strategies`);
+}
+
+// ─── Trend Scanner ─────────────────────────────────────────────────────────
+
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import * as path from "path";
+
+// Load universe once at startup — ~500 liquid US stocks for trend scanning
+const UNIVERSE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "trend-universe.json");
+let TREND_UNIVERSE: string[] = [];
+try {
+  const data = JSON.parse(readFileSync(UNIVERSE_PATH, "utf-8"));
+  TREND_UNIVERSE = Array.isArray(data.symbols) ? data.symbols : [];
+  log(`Trend universe loaded: ${TREND_UNIVERSE.length} symbols from ${UNIVERSE_PATH}`);
+} catch (err) {
+  log(`WARNING: Could not load trend universe (${UNIVERSE_PATH}): ${err}. Trend scanner will be disabled.`);
+}
+
+let trendScanRunning = false;
+
+/**
+ * Scan the trend universe for stocks with ≥3 consecutive same-direction days.
+ * Enrolls qualifying stocks into reversal_entries with enrollment_source='TREND'.
+ *
+ * DOWN streaks → LONG direction (expect bounce up)
+ * UP streaks → SHORT direction (expect fade down)
+ *
+ * Runs after market close when today's daily close is available.
+ */
+async function jobScanTrends() {
+  if (trendScanRunning) { log("  SKIP: trend scan already running"); return; }
+  if (!isTradingDay()) { log("  SKIP: trend scan — not a trading day"); return; }
+  if (TREND_UNIVERSE.length === 0) { log("  SKIP: trend universe empty"); return; }
+
+  // Guard: daily bars from Yahoo include a partial bar during market hours.
+  // Skip ONLY during active trading (9:30-16:05 ET). Pre-market (before 9:30)
+  // and post-close (after 16:05) are safe — Yahoo's last daily bar is the
+  // previous trading day's finalized close.
+  const now = new Date();
+  const nyClock = now.toLocaleString("en-US", { timeZone: "America/New_York", hour12: false }).split(", ")[1];
+  const [h, m] = nyClock.split(":").map(Number);
+  const curMinutes = h * 60 + m;
+  const marketOpen = 9 * 60 + 30;
+  const marketCloseBuffer = 16 * 60 + 5;
+  if (curMinutes >= marketOpen && curMinutes < marketCloseBuffer) {
+    log(`  SKIP: trend scan — market is open (${nyClock} ET). Will run at scheduled 16:15 ET.`);
+    return;
+  }
+
+  trendScanRunning = true;
+  const db = getPool();
+  const today = todayET();
+
+  // Tunable thresholds
+  const MIN_STREAK_DAYS = 3;
+  const MIN_CUMULATIVE_MOVE_PCT = 3;
+  const BATCH_SIZE = 5;
+  const BATCH_DELAY_MS = 400;
+
+  log(`Trend scan: checking ${TREND_UNIVERSE.length} symbols for ≥${MIN_STREAK_DAYS}d streaks...`);
+
+  try {
+    // Prefetch recent enrollments. We check the last 2 calendar days because the
+    // scan's cohort_date = lastBar.date, which can be today (post-close) OR the
+    // previous trading day (if scan runs pre-market). Over-scanning is safe
+    // (INSERT's UNIQUE constraint prevents duplicates); under-filtering just
+    // wastes API calls.
+    const [existingRows] = await db.execute<mysql.RowDataPacket[]>(
+      "SELECT DISTINCT symbol FROM reversal_entries WHERE cohort_date >= DATE_SUB(?, INTERVAL 2 DAY)",
+      [today]
+    );
+    const alreadyEnrolled = new Set(existingRows.map(r => r.symbol as string));
+
+    const candidates = TREND_UNIVERSE.filter(s => !alreadyEnrolled.has(s));
+    log(`  ${alreadyEnrolled.size} already enrolled in last 2 days, scanning ${candidates.length} candidates`);
+
+    let enrolled = 0, scanned = 0, failed = 0;
+    const examples: string[] = [];
+
+    for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+      const batch = candidates.slice(i, i + BATCH_SIZE);
+
+      const results = await Promise.all(batch.map(async (symbol) => {
+        try {
+          const bars = await fetchDailyBars(symbol);
+          if (bars.length < MIN_STREAK_DAYS + 1) return null;
+
+          // Compute day-over-day returns from last 7 bars
+          const recent = bars.slice(-7);
+          const returns: number[] = [];
+          for (let j = 1; j < recent.length; j++) {
+            returns.push((recent[j].close - recent[j - 1].close) / recent[j - 1].close);
+          }
+          if (returns.length < MIN_STREAK_DAYS) return null;
+
+          // Walk backward from the end, count consecutive same-direction days.
+          // Flat days (exactly 0 return) break the streak — don't silently extend it.
+          let consecutiveDays = 0;
+          let streakDir: "UP" | "DOWN" | null = null;
+          for (let j = returns.length - 1; j >= 0; j--) {
+            if (returns[j] === 0) break; // flat day breaks the streak
+            const dir = returns[j] > 0 ? "UP" : "DOWN";
+            if (streakDir == null) { streakDir = dir; consecutiveDays = 1; }
+            else if (dir === streakDir) { consecutiveDays++; }
+            else break;
+          }
+          if (consecutiveDays < MIN_STREAK_DAYS || streakDir == null) return null;
+
+          // Compute cumulative change over the streak
+          const startIdx = recent.length - 1 - consecutiveDays;
+          const startPrice = recent[Math.max(0, startIdx)].close;
+          const lastBar = recent[recent.length - 1];
+          const endPrice = lastBar.close;
+          const cumulativeChangePct = ((endPrice - startPrice) / startPrice) * 100;
+          if (Math.abs(cumulativeChangePct) < MIN_CUMULATIVE_MOVE_PCT) return null;
+
+          const direction = streakDir === "UP" ? "SHORT" : "LONG";
+          const dayChangePct = returns[returns.length - 1] * 100;
+          const entryPrice = endPrice;
+          // Use the date of the last bar (NOT today). If the scan runs before today's
+          // bar is available (startup pre-market), cohortDate will be the prior
+          // trading day — which keeps entry_price aligned with d1/d2 indexing.
+          const cohortDate = lastBar.date;
+
+          return { symbol, direction, dayChangePct, entryPrice, consecutiveDays, cumulativeChangePct, streakDir, cohortDate };
+        } catch {
+          return null;
+        }
+      }));
+
+      for (const r of results) {
+        scanned++;
+        if (r == null) continue;
+
+        try {
+          await db.execute(
+            `INSERT INTO reversal_entries
+             (cohort_date, symbol, direction, enrollment_source, day_change_pct, entry_price, consecutive_days, cumulative_change_pct, status)
+             VALUES (?, ?, ?, 'TREND', ?, ?, ?, ?, 'ACTIVE')`,
+            [r.cohortDate, r.symbol, r.direction, r.dayChangePct, r.entryPrice, r.consecutiveDays, r.cumulativeChangePct]
+          );
+          enrolled++;
+          if (examples.length < 10) {
+            examples.push(`    TREND ${r.direction} ${r.symbol} ${r.consecutiveDays}d ${r.streakDir} cohort=${r.cohortDate} entry=$${r.entryPrice.toFixed(2)} (cum ${r.cumulativeChangePct.toFixed(1)}%)`);
+          }
+        } catch (err) {
+          // Likely unique constraint conflict — another enrollment beat us
+          failed++;
+          if (failed <= 3) log(`    Insert failed ${r.symbol}: ${err}`);
+        }
+      }
+
+      if (i + BATCH_SIZE < candidates.length) await sleep(BATCH_DELAY_MS);
+    }
+
+    for (const e of examples) log(e);
+    log(`  Trend scan done: ${enrolled} enrolled (${failed} insert errors), ${scanned} scanned`);
+  } finally {
+    trendScanRunning = false;
+  }
+}
+
 // ─── Schedule ───────────────────────────────────────────────────────────────
 
 async function runFullSync() {
@@ -957,6 +1345,16 @@ cron.schedule("5 16 * * 1-5", async () => {
   try { await jobSyncPrices(); } catch (err) { log(`ERROR close sync: ${err}`); }
 }, CRON_OPTIONS);
 
+cron.schedule("15 16 * * 1-5", async () => {
+  log("=== TREND SCAN: Scanning universe for multi-day streaks ===");
+  try { await jobScanTrends(); } catch (err) { log(`ERROR trend scan: ${err}`); }
+}, CRON_OPTIONS);
+
+cron.schedule("30 16 * * 1-5", async () => {
+  log("=== CONFIRMATION: Execute confirmation strategies ===");
+  try { await jobExecuteConfirmationStrategies(); } catch (err) { log(`ERROR confirmation strategies: ${err}`); }
+}, CRON_OPTIONS);
+
 cron.schedule("0 18 * * 1-5", async () => {
   log("=== EVENING CATCHUP: Final sync ===");
   try { await jobSyncPrices(); } catch (err) { log(`ERROR evening sync: ${err}`); }
@@ -977,6 +1375,8 @@ log("  09:45 — Enroll movers + morning prices");
 log("  09:50 — Execute trading strategies");
 log("  12:35 — Midday prices");
 log("  16:05 — Close prices");
+log("  16:15 — Trend scanner (detect 3+ day streaks)");
+log("  16:30 — Execute confirmation strategies");
 log("  18:00 — Evening catchup");
 log("  */15  — Position monitor (9:00-16:59)");
 log("========================================");
@@ -984,11 +1384,20 @@ log("========================================");
 log("Running immediate catchup sync...");
 runFullSync().then(async () => {
   log("Startup sync complete.");
-  // Run strategies on startup too (in case container restarted after 9:50)
   try {
     await jobExecuteStrategies();
   } catch (err) {
     log(`Startup strategy error: ${err}`);
+  }
+  try {
+    await jobScanTrends();
+  } catch (err) {
+    log(`Startup trend scan error: ${err}`);
+  }
+  try {
+    await jobExecuteConfirmationStrategies();
+  } catch (err) {
+    log(`Startup confirmation strategy error: ${err}`);
   }
   log("Waiting for scheduled jobs...");
 }).catch(err => {

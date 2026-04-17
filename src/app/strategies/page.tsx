@@ -39,7 +39,7 @@ export default function StrategiesPage() {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<"ranking" | "grouped">("ranking");
   const [sortBy, setSortBy] = useState<"equity" | "realized" | "win_rate">("equity");
-  const [scope, setScope] = useState<"all" | "trading" | "analysis">("all");
+  const [scope, setScope] = useState<"all" | "trading" | "confirmation" | "analysis">("all");
   const [lastUpdate, setLastUpdate] = useState("");
 
   useEffect(() => {
@@ -83,7 +83,7 @@ export default function StrategiesPage() {
   const visibleStrategies = useMemo(() => {
     return strategies.filter((strategy) => {
       if (scope === "all") return true;
-      return scope === "trading" ? strategy.strategy_type === "TRADING" : strategy.strategy_type === "ANALYSIS";
+      return strategy.strategy_type === scope.toUpperCase();
     });
   }, [scope, strategies]);
 
@@ -135,7 +135,7 @@ export default function StrategiesPage() {
             Strategy Scenarios
           </h1>
           <p className="text-zinc-500 mt-1">
-            Compare live paper accounts and backtest history across 24 strategy variants.
+            Compare live paper accounts across trading, confirmation, and analysis strategies.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -144,11 +144,12 @@ export default function StrategiesPage() {
           </span>
           <select
             value={scope}
-            onChange={(e) => setScope(e.target.value as "all" | "trading" | "analysis")}
+            onChange={(e) => setScope(e.target.value as "all" | "trading" | "confirmation" | "analysis")}
             className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm"
           >
             <option value="all">All strategies</option>
             <option value="trading">Trading only</option>
+            <option value="confirmation">Confirmation only</option>
             <option value="analysis">Analysis only</option>
           </select>
           <select
