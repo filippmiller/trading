@@ -878,9 +878,13 @@ async function jobExecuteStrategiesImpl() {
       // Atomic: deduct cash FIRST (conditional on available balance), then
       // insert signal. If the cash UPDATE affects 0 rows (race with cleanup SQL
       // or concurrent deduction), rollback — signal never persists.
+      // If the INSERT violates UNIQUE KEY (errno 1062 — concurrent executor
+      // beat us to it despite the dup-check above), rollback auto-refunds
+      // cash and we skip this candidate rather than halt the loop.
       const entryPrice = Number(e.entry_price);
       const conn = await db.getConnection();
       let cashExhausted = false;
+      let dupeKey = false;
       try {
         await conn.beginTransaction();
         const [cashUpdate] = await conn.execute<mysql.ResultSetHeader>(
@@ -909,9 +913,18 @@ async function jobExecuteStrategiesImpl() {
         }
       } catch (err) {
         await conn.rollback();
-        throw err;
+        if ((err as { errno?: number }).errno === 1062) {
+          dupeKey = true;
+        } else {
+          throw err;
+        }
       } finally {
         conn.release();
+      }
+
+      if (dupeKey) {
+        log(`    ${strat.name}: SKIP ${e.symbol} — signal already exists (UX_signal_strat_entry race)`);
+        continue;
       }
 
       if (cashExhausted) {
@@ -1397,10 +1410,13 @@ async function jobExecuteConfirmationStrategiesImpl() {
       );
       if (dupCheck.length > 0) continue;
 
-      // Atomic: deduct cash FIRST (conditional), then insert signal.
-      // If cash UPDATE affects 0 rows, rollback — signal never persists.
+      // Atomic: deduct cash FIRST (conditional), then insert signal. If
+      // cash UPDATE affects 0 rows, rollback — signal never persists. If
+      // INSERT hits UX_signal_strat_entry (errno 1062), rollback refunds
+      // cash and we skip this candidate.
       const conn = await db.getConnection();
       let cashExhausted = false;
+      let dupeKey = false;
       try {
         await conn.beginTransaction();
         const [cashUpdate] = await conn.execute<mysql.ResultSetHeader>(
@@ -1429,9 +1445,18 @@ async function jobExecuteConfirmationStrategiesImpl() {
         }
       } catch (err) {
         await conn.rollback();
-        throw err;
+        if ((err as { errno?: number }).errno === 1062) {
+          dupeKey = true;
+        } else {
+          throw err;
+        }
       } finally {
         conn.release();
+      }
+
+      if (dupeKey) {
+        log(`    ${strat.name}: SKIP ${e.symbol} — signal already exists (UX_signal_strat_entry race)`);
+        continue;
       }
 
       if (cashExhausted) {
