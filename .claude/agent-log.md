@@ -9,6 +9,58 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-17 23:55] — Internal Review + Adversarial Critic (5 follow-up fixes + dupe-key recovery)
+
+**Area:** Trading/Cron, Trading/API, Trading/Schema, Trading/Lib
+**Type:** bugfix (review-pass follow-up)
+
+### Files Changed
+- `docker/init-db.sql` — UNIQUE KEY UX_signal_strat_entry on paper_signals(strategy_id, reversal_entry_id)
+- `scripts/migration-2026-04-17-unique-signal.sql` — **new** idempotent migration (APPLIED to prod)
+- `src/lib/surveillance.ts` — ET-safe d-column iteration (same P0-4 fix as cron) + corrected MARKET_HOLIDAYS list + ET-explicit DATE_SUB
+- `src/lib/strategy-engine.ts` — direction-aware PositionState, evaluateExit, computePnL
+- `scripts/backtest-strategies.ts` — direction-aware inline exit loop + direction-aware maxPnlPct/minPnlPct watermarks
+- `src/lib/migrations.ts` — memoized schemaReadyPromise to run ensureSchema() once per process
+- `scripts/surveillance-cron.ts` — errno 1062 graceful recovery in both executor functions
+
+### Database Tables
+- `paper_signals` — **UX_signal_strat_entry** UNIQUE KEY added with idempotent migration (APPLIED LIVE, 0 duplicate collapses needed)
+
+### Summary
+Dispatched two independent review passes against the 19-fix PR #2:
+1. **Reviewer** (code-reviewer subagent) — confirmed all P0 fixes correct-as-written except for one gap: the dup-check SELECT runs OUTSIDE the P0-2 transaction, so the constraint should be enforced at the DB level. Also flagged CONVERT_TZ dependency on mysql tz tables for future fresh containers.
+2. **Critic** (bug-hunter subagent, adversarial) — found 21 NEW findings in files the first audit missed. Dominant classes:
+   - **4× auth/trust boundary**: mutating API routes are unauthenticated (deferred — web app not publicly deployed yet)
+   - **3× direction-aware math outside the cron**: strategy-engine + backtest were entirely LONG-only, every SHORT backtest silently inverted
+   - **1× same TZ bug in HTTP path**: src/lib/surveillance.ts had identical P0-4 code the cron had
+   - **1× state inconsistency**: paper_trades vs paper_signals split (deferred)
+   - **1× ensureSchema per-request**: metadata lock contention risk
+
+Shipped 4 correctness fixes as PR #3 + a follow-up dupe-key graceful-recovery fix as PR #4. Both squash-merged to master. The UNIQUE KEY migration was applied live to prod MySQL; the cron container was rebuilt and redeployed on VPS with the new errno 1062 handler. All other constraints (FK cascade on paper_position_prices from earlier, plus pre-existing UXs) verified still live via information_schema query.
+
+Deferred (out of scope for live trading safety; web app not publicly deployed):
+- Auth on mutating API routes (5 findings)
+- Voice route rate-limits + LLM prompt-injection hardening
+- /api/paper double-click race
+- /api/reversal pagination
+- Yahoo timeout helpers in src/lib (only /api/surveillance/sync would benefit)
+- paper_trades/paper_signals equity union (UI display)
+
+Prod-state changes this session:
+- **UX_signal_strat_entry migration applied**: verified via `information_schema.STATISTICS`
+- **Cron rebuilt and redeployed**: container came up clean in 11s, startup catchup completed, "Waiting for scheduled jobs..." reached
+- **Monday's 09:50 ET tick now hardened**: any rare UNIQUE KEY race will rollback cash + skip candidate instead of aborting the whole tick
+
+### Commits (merged to master)
+- `1d407c8` — fix: second-pass review + adversarial-critic findings (4 fixes) (#3)
+- `44a4a90` — fix(cron): graceful recovery from UNIQUE KEY race (errno 1062) (#4)
+
+### Session Notes
+- `.claude/sessions/2026-04-17-internal-review.md` — reviewer report (11 verdicts)
+- `.claude/sessions/2026-04-17-critic-pass.md` — adversarial critic 21 findings
+
+---
+
 ## [2026-04-17 23:30] — Opus 4.7 Fresh-Eye Audit: 20 findings, 19 shipped to prod
 
 **Area:** Trading/Cron, Trading/API, Trading/Schema, Trading/Deploy
