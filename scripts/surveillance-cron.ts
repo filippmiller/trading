@@ -310,6 +310,9 @@ for (let d = 1; d <= 10; d++) {
 
 let syncRunning = false;
 let enrollRunning = false;
+let monitorRunning = false;
+let executeStrategiesRunning = false;
+let executeConfirmationRunning = false;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -560,8 +563,17 @@ async function jobSyncPrices() {
  *   5. Deduct investment from strategy's dedicated account
  */
 async function jobExecuteStrategies() {
+  if (executeStrategiesRunning) { log("  SKIP: execute strategies already running"); return; }
   if (!isTradingDay()) return;
+  executeStrategiesRunning = true;
+  try {
+    await jobExecuteStrategiesImpl();
+  } finally {
+    executeStrategiesRunning = false;
+  }
+}
 
+async function jobExecuteStrategiesImpl() {
   const db = getPool();
   const today = todayET();
 
@@ -572,13 +584,22 @@ async function jobExecuteStrategies() {
 
   if (strategies.length === 0) { log("  Strategies: none enabled"); return; }
 
-  // Load today's reversal entries
+  // Load recent ACTIVE reversal entries (last 7 trading-calendar days).
+  // MOVERS cohort_date = today (enrolled 9:45 AM). TREND cohort_date = lastBar.date
+  // (yesterday or older via weekends/holidays). The 7-day window acts as a
+  // catch-up: if the cron was down or a strategy was disabled, pending entries
+  // still enter on the next run. Dup-check on (strategy_id, reversal_entry_id)
+  // below prevents any double-fire.
   const [entries] = await db.execute<mysql.RowDataPacket[]>(
-    "SELECT * FROM reversal_entries WHERE cohort_date = ?",
-    [today]
+    `SELECT * FROM reversal_entries
+     WHERE status = 'ACTIVE'
+       AND cohort_date >= DATE_SUB(?, INTERVAL 7 DAY)
+       AND cohort_date <= ?
+     ORDER BY cohort_date DESC`,
+    [today, today]
   );
 
-  if (entries.length === 0) { log("  Strategies: no entries for today"); return; }
+  if (entries.length === 0) { log("  Strategies: no recent active entries"); return; }
 
   let totalSignals = 0;
 
@@ -652,29 +673,46 @@ async function jobExecuteStrategies() {
       );
       if (dupCheck.length > 0) continue;
 
-      // Create signal
+      // Atomic: deduct cash FIRST (conditional on available balance), then
+      // insert signal. If the cash UPDATE affects 0 rows (race with cleanup SQL
+      // or concurrent deduction), rollback — signal never persists.
       const entryPrice = Number(e.entry_price);
-      await db.execute(
-        `INSERT INTO paper_signals
-         (strategy_id, reversal_entry_id, symbol, direction, status,
-          entry_price, entry_at, investment_usd, leverage, effective_exposure,
-          max_price, min_price, max_pnl_pct, min_pnl_pct)
-         VALUES (?, ?, ?, ?, 'EXECUTED',
-                 ?, CURRENT_TIMESTAMP(6), ?, ?, ?,
-                 ?, ?, 0, 0)`,
-        [
-          strat.id, e.id, e.symbol, e.direction,
-          entryPrice, investmentPerTrade, leverage, investmentPerTrade * leverage,
-          entryPrice, entryPrice,
-        ]
-      );
+      const conn = await db.getConnection();
+      let cashExhausted = false;
+      try {
+        await conn.beginTransaction();
+        const [cashUpdate] = await conn.execute<mysql.ResultSetHeader>(
+          "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
+          [investmentPerTrade, strat.account_id, investmentPerTrade]
+        );
+        if (cashUpdate.affectedRows === 0) {
+          cashExhausted = true;
+          await conn.rollback();
+        } else {
+          await conn.execute(
+            `INSERT INTO paper_signals
+             (strategy_id, reversal_entry_id, symbol, direction, status,
+              entry_price, entry_at, investment_usd, leverage, effective_exposure,
+              max_price, min_price, max_pnl_pct, min_pnl_pct)
+             VALUES (?, ?, ?, ?, 'EXECUTED',
+                     ?, CURRENT_TIMESTAMP(6), ?, ?, ?,
+                     ?, ?, 0, 0)`,
+            [
+              strat.id, e.id, e.symbol, e.direction,
+              entryPrice, investmentPerTrade, leverage, investmentPerTrade * leverage,
+              entryPrice, entryPrice,
+            ]
+          );
+          await conn.commit();
+        }
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
 
-      // Deduct from strategy account
-      const [cashUpdate] = await db.execute<mysql.ResultSetHeader>(
-        "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
-        [investmentPerTrade, strat.account_id, investmentPerTrade]
-      );
-      if (cashUpdate.affectedRows === 0) {
+      if (cashExhausted) {
         log(`    ${strat.name}: cash exhausted before filling ${e.symbol}`);
         break;
       }
@@ -705,8 +743,17 @@ async function jobExecuteStrategies() {
  * - Updates max/min watermarks on paper_signals
  */
 async function jobMonitorPositions() {
+  if (monitorRunning) { log("  SKIP: monitor already running"); return; }
   if (!isTradingDay()) return;
+  monitorRunning = true;
+  try {
+    await jobMonitorPositionsImpl();
+  } finally {
+    monitorRunning = false;
+  }
+}
 
+async function jobMonitorPositionsImpl() {
   const db = getPool();
 
   // 1. Fetch all open signals (from paper_signals WHERE status = 'EXECUTED' AND exit_at IS NULL)
@@ -864,14 +911,21 @@ async function jobMonitorPositions() {
         ? Math.round((Date.now() - new Date(sig.entry_at).getTime()) / 60000)
         : null;
 
-      await db.execute(
+      // Conditional UPDATE — only exits a signal still in EXECUTED state.
+      // Prevents double cash credit if a concurrent monitor tick already exited this row.
+      const [exitUpdate] = await db.execute<mysql.ResultSetHeader>(
         `UPDATE paper_signals SET
            status = CASE WHEN ? > 0 THEN 'WIN' ELSE 'LOSS' END,
            exit_price = ?, exit_at = CURRENT_TIMESTAMP(6), exit_reason = ?,
            pnl_usd = ?, pnl_pct = ?, holding_minutes = ?
-         WHERE id = ?`,
+         WHERE id = ? AND status = 'EXECUTED' AND exit_at IS NULL`,
         [pnlUsd, price, exitReason, pnlUsd, leveragedPctFinal, holdMinutes, sig.id]
       );
+
+      if (exitUpdate.affectedRows === 0) {
+        // Already exited by another process; do NOT credit cash a second time.
+        continue;
+      }
 
       // Return cash to strategy account
       const proceeds = investment + pnlUsd;
@@ -977,8 +1031,17 @@ async function jobMonitorPositions() {
  *   4. Enter at the latest close price (d1 or d2 close depending on strategy)
  */
 async function jobExecuteConfirmationStrategies() {
+  if (executeConfirmationRunning) { log("  SKIP: execute confirmation already running"); return; }
   if (!isTradingDay()) return;
+  executeConfirmationRunning = true;
+  try {
+    await jobExecuteConfirmationStrategiesImpl();
+  } finally {
+    executeConfirmationRunning = false;
+  }
+}
 
+async function jobExecuteConfirmationStrategiesImpl() {
   const db = getPool();
   const today = todayET();
 
@@ -1104,33 +1167,49 @@ async function jobExecuteConfirmationStrategies() {
       );
       if (dupCheck.length > 0) continue;
 
-      // Create signal
-      await db.execute(
-        `INSERT INTO paper_signals
-         (strategy_id, reversal_entry_id, symbol, direction, status,
-          entry_price, entry_at, investment_usd, leverage, effective_exposure,
-          max_price, min_price, max_pnl_pct, min_pnl_pct)
-         VALUES (?, ?, ?, ?, 'EXECUTED',
-                 ?, CURRENT_TIMESTAMP(6), ?, ?, ?,
-                 ?, ?, 0, 0)`,
-        [
-          strat.id, e.id, e.symbol, e.direction,
-          entryPrice, investmentPerTrade, leverage, investmentPerTrade * leverage,
-          entryPrice, entryPrice,
-        ]
-      );
+      // Atomic: deduct cash FIRST (conditional), then insert signal.
+      // If cash UPDATE affects 0 rows, rollback — signal never persists.
+      const conn = await db.getConnection();
+      let cashExhausted = false;
+      try {
+        await conn.beginTransaction();
+        const [cashUpdate] = await conn.execute<mysql.ResultSetHeader>(
+          "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
+          [investmentPerTrade, strat.account_id, investmentPerTrade]
+        );
+        if (cashUpdate.affectedRows === 0) {
+          cashExhausted = true;
+          await conn.rollback();
+        } else {
+          await conn.execute(
+            `INSERT INTO paper_signals
+             (strategy_id, reversal_entry_id, symbol, direction, status,
+              entry_price, entry_at, investment_usd, leverage, effective_exposure,
+              max_price, min_price, max_pnl_pct, min_pnl_pct)
+             VALUES (?, ?, ?, ?, 'EXECUTED',
+                     ?, CURRENT_TIMESTAMP(6), ?, ?, ?,
+                     ?, ?, 0, 0)`,
+            [
+              strat.id, e.id, e.symbol, e.direction,
+              entryPrice, investmentPerTrade, leverage, investmentPerTrade * leverage,
+              entryPrice, entryPrice,
+            ]
+          );
+          await conn.commit();
+        }
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        conn.release();
+      }
 
-      log(`    ${strat.name}: ENTER ${e.direction} ${e.symbol} @ $${entryPrice.toFixed(2)} ($${investmentPerTrade} × ${leverage}x)`);
-
-      // Deduct from strategy account
-      const [cashUpdate] = await db.execute<mysql.ResultSetHeader>(
-        "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
-        [investmentPerTrade, strat.account_id, investmentPerTrade]
-      );
-      if (cashUpdate.affectedRows === 0) {
+      if (cashExhausted) {
         log(`    ${strat.name}: cash exhausted before filling ${e.symbol}`);
         break;
       }
+
+      log(`    ${strat.name}: ENTER ${e.direction} ${e.symbol} @ $${entryPrice.toFixed(2)} ($${investmentPerTrade} × ${leverage}x)`);
 
       remainingCash -= investmentPerTrade;
       currentOpen++;
