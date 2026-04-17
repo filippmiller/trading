@@ -9,6 +9,76 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-17 23:30] — Opus 4.7 Fresh-Eye Audit: 20 findings, 19 shipped to prod
+
+**Area:** Trading/Cron, Trading/API, Trading/Schema, Trading/Deploy
+**Type:** bugfix (comprehensive audit + remediation) + deploy
+
+### Files Changed
+- `scripts/surveillance-cron.ts` — 14 distinct fixes across P0/P1/P2 (see below)
+- `src/app/api/strategies/route.ts` — direction-aware `open_market_value` SQL
+- `src/app/strategies/page.tsx` — consolidated duplicate `loadData`, added refreshKey pattern
+- `docker/init-db.sql` — FK cascade on paper_position_prices → paper_signals
+- `scripts/migration-2026-04-17-fk-cascade.sql` — **new** idempotent migration (APPLIED to prod)
+- `scripts/smoke-test-p0.js`, `scripts/smoke-test-p0-456.js` — **new** prod-DB verification scripts
+
+### Functions/Symbols Modified
+- `jobMonitorPositions` — added `monitorRunning` guard + status-gated cash credit (P0-1)
+- `jobExecuteStrategies`, `jobExecuteConfirmationStrategies` — transaction-wrapped cash-first signal insert + `executeStrategiesRunning` / `executeConfirmationRunning` guards (P0-2, P1-8 partial)
+- `jobExecuteStrategies` — cohort_date filter widened to 7-day catch-up window (P0-3)
+- d-column iteration loop — rewritten with ET-safe `addCalendarDaysET` / `isWeekendET` / `mysqlDateToETStr` helpers (P0-4)
+- `forceCloseExpiredSignals` — **new**, runs after 14-day auto-close (P0-5)
+- `/api/strategies` SQL — SHORT-aware multiplier on price-return calc (P0-6)
+- `fetchWithTimeout` — **new** helper, wraps all Yahoo/Twelve Data calls (P1-1, P1-9)
+- `jobPruneOldPrices` — **new**, 03:00 ET nightly retention (P1-4)
+- Watermark `|| sentinel` → null-check (P1-5)
+- TREND_UNIVERSE load — `process.exit(1)` on parse failure (P1-6)
+- Universe path — `process.cwd()`-relative instead of `import.meta.url` (P1-7)
+- Trend-scan guard — widened to 9:30-16:15 ET (was 16:05) to exclude partial-bar window (P1-2)
+- Monitor batching — single config prefetch + multi-row price INSERT (P1-10)
+- MARKET_HOLIDAYS — fixed Good Friday 2027 (was 2028's date), added Juneteenth 2026/2027, extended to 2028 (P2-2)
+- SQL time-zone comparisons — `CURRENT_DATE`/`DATE(generated_at)` replaced with `todayET()` params + `CONVERT_TZ` (P1-3)
+
+### Database Tables
+- `paper_position_prices` — **FK_pos_price_signal** added with ON DELETE CASCADE (migration applied live)
+- All reads/writes unchanged structurally; timestamp comparisons now ET-explicit via `CONVERT_TZ`
+
+### Summary
+Comprehensive fresh-eye audit of the live trading cron (deployed Thu 4/16) against the previous model's work. Bug-hunter subagent produced 20 findings across 6 P0 / 10 P1 / 4 P2. All 6 P0s and all 10 P1s implemented; 3 of 4 P2s implemented (P2-4 style-only, consciously deferred).
+
+Shipped as PR #2 in 6 commits on `fix/p0-trading-cron-safety`, squash-merged to master as commit 498d253. Code deployed to VPS via scp + `docker compose build` of the surveillance-cron container. Container came up cleanly in 22s; startup catchup completed in ~38s with no errors; "Waiting for scheduled jobs..." reached.
+
+Two notable side-discoveries during the audit:
+1. The holiday list had **two data bugs** — 2027 Good Friday was 3 weeks wrong (Apr 16 instead of Mar 26, which is actually 2028's date) and both 2026 and 2027 were missing Juneteenth entirely. These would have silently affected trading-day detection on 3 real dates.
+2. The P0-3 fix unlocked **164 TREND entries** previously invisible to TRADING strategies — the scanner had been running daily but its output was never consumed by the trading path (only by CONFIRMATION strategies). Monday's 09:50 ET tick will see these as fresh candidates for the first time, capped by per-strategy `max_new_per_day=3` / `max_concurrent=15`.
+
+Also the P0-6 fix measurably corrected inflated equity on prod: 2 strategies showed $13.09 of phantom SHORT-gap-up "gains" that are now accurately accounted for.
+
+Prod-state changes this session:
+- **FK migration applied** via `scripts/migration-2026-04-17-fk-cascade.sql` (0 orphan rows cleaned, CASCADE now enforced).
+- **Cron container rebuilt** with new code; verified via startup log (`Retention prune (>30d paper_position_prices, daily)` schedule line proves new code is running).
+- **All smoke tests re-ran green** post-deploy: schema ok, transaction path ok, 264-entry cohort window, 84 open signals direction-split (79 LONG / 5 SHORT), 0 orphan signals, ET date arithmetic, SHORT-aware SQL all validated.
+
+Files on VPS (post-deploy):
+- `/opt/trading-surveillance/scripts/surveillance-cron.ts` (new)
+- `/opt/trading-surveillance/scripts/trend-universe.json` (unchanged)
+- `/opt/trading-surveillance/docker/Dockerfile.cron` (unchanged)
+- `/opt/trading-surveillance/docker/docker-compose.surveillance.yml` (unchanged)
+- `/opt/trading-surveillance/docker/init-db.sql` (new — FK cascade)
+
+### Session Notes
+→ `.claude/sessions/2026-04-17-opus47-audit.md` (full audit report with 20 findings)
+
+### Commits (PR #2, squash-merged as 498d253)
+- `9a30d12` — cascade bug fixes + confirmation engine + trend scanner (prior-session bundle)
+- `51d074a` — P0-1 monitor guard, P0-2 transaction cash-first, P0-3 TREND visibility
+- `6b62412` — P0-4 TZ d-column fix, P0-5 orphan force-close, P0-6 SHORT-aware SQL
+- `bc91017` — P1-1/9 fetch timeouts, P1-4 price retention
+- `6d4c20b` — P1-2 guard window, P1-5 sentinels, P1-6 loud fail, P1-10 batch, P2-2 holidays
+- `01133ca` — P1-3 CONVERT_TZ, P1-7 cwd path, P2-1 FK cascade, P2-3 loadData consolidate
+
+---
+
 ## [2026-04-17 06:27] — First Live Trading Day Results Monitoring
 
 **Area:** Trading/Analysis, Trading/Monitoring
