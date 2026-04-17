@@ -326,6 +326,109 @@ function todayET(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
 }
 
+/**
+ * Parse a MySQL DATE value into YYYY-MM-DD using ET-calendar semantics.
+ * mysql2 with `timezone: "Z"` returns DATE columns as Date objects at UTC
+ * midnight — using UTC accessors preserves the stored calendar date, because
+ * interpreting UTC-midnight in ET would shift to the prior day (-4/-5 hours).
+ */
+function mysqlDateToETStr(v: unknown): string {
+  if (typeof v === "string") return v.slice(0, 10);
+  if (v instanceof Date) {
+    const y = v.getUTCFullYear();
+    const m = String(v.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(v.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  return String(v);
+}
+
+/**
+ * Add `days` calendar days to a YYYY-MM-DD string using ET-calendar semantics.
+ * Anchor at 12:00 UTC (= 07:00 EST / 08:00 EDT) so DST transitions never push
+ * the date backward across midnight.
+ */
+function addCalendarDaysET(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const base = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  base.setUTCDate(base.getUTCDate() + days);
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(base);
+}
+
+/** Returns true if the given YYYY-MM-DD date string lands on Sat/Sun in ET. */
+function isWeekendET(dateStr: string): boolean {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const base = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  const dow = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short" }).format(base);
+  return dow === "Sat" || dow === "Sun";
+}
+
+/**
+ * Force-close paper_signals still open against reversal_entries that the
+ * 14-day auto-close just marked COMPLETED. Without this, signals on delisted
+ * tickers or symbols the monitor can't price-fetch stay EXECUTED forever,
+ * locking investment USD in the strategy's account in perpetuity.
+ *
+ * Exit price: last recorded paper_position_prices sample, falling back to
+ * entry_price (flat P&L) when no price has ever been recorded. Direction-aware
+ * P&L matches jobMonitorPositions. Conditional UPDATE makes this idempotent
+ * with any concurrent monitor tick.
+ */
+async function forceCloseExpiredSignals() {
+  const db = getPool();
+
+  const [orphans] = await db.execute<mysql.RowDataPacket[]>(
+    `SELECT ps.*,
+            COALESCE(
+              (SELECT pp.price FROM paper_position_prices pp
+               WHERE pp.signal_id = ps.id ORDER BY pp.fetched_at DESC LIMIT 1),
+              ps.entry_price
+            ) AS last_price
+     FROM paper_signals ps
+     JOIN reversal_entries re ON ps.reversal_entry_id = re.id
+     WHERE re.status = 'COMPLETED'
+       AND ps.status = 'EXECUTED'
+       AND ps.exit_at IS NULL`
+  );
+
+  if (orphans.length === 0) return;
+
+  let closed = 0;
+  for (const sig of orphans) {
+    const isShort = sig.direction === "SHORT";
+    const entryPrice = Number(sig.entry_price);
+    const lastPrice = Number(sig.last_price);
+    const leverage = Number(sig.leverage || 1);
+    const investment = Number(sig.investment_usd);
+
+    const rawPct = entryPrice > 0 ? ((lastPrice - entryPrice) / entryPrice) * 100 : 0;
+    const pnlPct = isShort ? -rawPct : rawPct;
+    const leveragedPct = Math.max(pnlPct * leverage, -100);
+    const pnlUsd = investment * (leveragedPct / 100);
+
+    const [upd] = await db.execute<mysql.ResultSetHeader>(
+      `UPDATE paper_signals SET
+         status = CASE WHEN ? > 0 THEN 'WIN' ELSE 'LOSS' END,
+         exit_price = ?, exit_at = CURRENT_TIMESTAMP(6), exit_reason = 'COHORT_EXPIRED',
+         pnl_usd = ?, pnl_pct = ?
+       WHERE id = ? AND status = 'EXECUTED' AND exit_at IS NULL`,
+      [pnlUsd, lastPrice, pnlUsd, leveragedPct, sig.id]
+    );
+    if (upd.affectedRows === 0) continue;
+
+    const proceeds = investment + pnlUsd;
+    if (proceeds > 0) {
+      await db.execute(
+        "UPDATE paper_accounts SET cash = cash + ? WHERE id = (SELECT account_id FROM paper_strategies WHERE id = ?)",
+        [proceeds, sig.strategy_id]
+      );
+    }
+    closed++;
+  }
+
+  if (closed > 0) log(`  Force-closed ${closed} orphan signal(s) from expired cohorts`);
+}
+
 // US market holidays (NYSE/NASDAQ closures) — update annually
 const MARKET_HOLIDAYS = new Set([
   // 2026
@@ -470,6 +573,11 @@ async function jobSyncPrices() {
       "UPDATE reversal_entries SET status = 'COMPLETED' WHERE status = 'ACTIVE' AND cohort_date < DATE_SUB(CURRENT_DATE, INTERVAL 14 DAY)"
     );
 
+    // Force-close any paper_signals still open against just-expired cohorts.
+    // Delisted tickers / perpetually-failing price fetches would otherwise
+    // leave cash locked in the strategy account indefinitely.
+    await forceCloseExpiredSignals();
+
     const [entries] = await db.execute<mysql.RowDataPacket[]>(
       "SELECT * FROM reversal_entries WHERE status = 'ACTIVE' ORDER BY cohort_date DESC LIMIT 500"
     );
@@ -479,15 +587,19 @@ async function jobSyncPrices() {
     const barCache: SymbolBarCache = new Map();
 
     for (const row of entries) {
-      const entryDate = new Date(row.cohort_date);
-
-      // Iterate trading days (skip weekends + holidays), map to d1..d10 columns
+      // Iterate trading days (skip weekends + holidays) in ET-calendar space.
+      // Previous implementation mixed UTC and local semantics: `new Date(mysql_date)`
+      // parses as UTC midnight, `getDay()` used local TZ, and `toISOString()` gave
+      // UTC date. In ET-container deployments this produced a dateStr 1 day ahead
+      // of what getDay() reported, landing on Saturday for d1 of Friday cohorts
+      // (silent Yahoo-null failure) and similar off-by-ones on other boundaries.
+      const cohortStr = mysqlDateToETStr(row.cohort_date);
       let tradingDay = 0;
-      const obsDate = new Date(entryDate);
+      let cursor = cohortStr;
       while (tradingDay < 10) {
-        obsDate.setDate(obsDate.getDate() + 1);
-        if (obsDate.getDay() === 0 || obsDate.getDay() === 6) continue;
-        const dateStr = obsDate.toISOString().split("T")[0];
+        cursor = addCalendarDaysET(cursor, 1);
+        if (isWeekendET(cursor)) continue;
+        const dateStr = cursor;
         if (isMarketHoliday(dateStr)) continue;
         tradingDay++;
         const nowStr = todayET();
