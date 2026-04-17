@@ -9,6 +9,91 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-17 06:27] — First Live Trading Day Results Monitoring
+
+**Area:** Trading/Analysis, Trading/Monitoring
+**Type:** docs (monitoring, no code changes)
+
+### Files Changed
+No files changed — live monitoring and results review.
+
+### Functions/Symbols Modified
+N/A
+
+### Database Tables
+- `paper_signals` — Read-only: queried trading results
+- `reversal_entries` — Read-only: verified enrollment state
+
+### Summary
+First live trading day (Thursday 4/16) verified after pipeline fixes. Pre-market guard correctly blocked stale enrollment. 9:45 AM MOVERS enrollment fired cleanly (20 tickers). QLYS banked +$1,535.73 (trailing stop at 10x = +96%). Confirmation strategies lost -$111.68 — 4/4 SHORT positions (Gainer Fade) gap-stopped at market open due to overnight tech rally (+$49.69 worst on PSKY). SHORT exit logic proven working correctly. 5 positions still open. Net realized: +$1,424. Gap risk identified as key tuning concern for leveraged SHORT strategies.
+
+### Session Notes
+→ `.claude/sessions/2026-04-17-062713.md`
+
+---
+
+## [2026-04-16 11:26] — Trend Scanner + Confirmation Strategies + Cascade Bug Fixes
+
+**Area:** Trading/Cron, Trading/Strategies, Trading/Analysis
+**Type:** feature + bugfix (7 bugs across 3 review rounds)
+
+### Files Changed
+- `scripts/surveillance-cron.ts` — Added jobExecuteConfirmationStrategies, jobScanTrends, direction-aware jobMonitorPositions, pre-market guards, lastBar.date cohort logic, 8s fetch timeout
+- `scripts/setup-confirmation-strategies.sql` — Created: 5 CONFIRMATION strategies ($5K each, $100/trade, 5x leverage)
+- `scripts/setup-trend-strategies.sql` — Created: 3 TREND-based CONFIRMATION strategies
+- `scripts/trend-universe.json` — Created: 517 liquid US symbols for trend scanner
+- `scripts/smoke-test-confirmation.js` — Created: 83-check pipeline verification
+- `scripts/smoke-test-trend.js` — Created: 75-check trend pipeline verification
+- `scripts/cleanup-stale-2026-04-16.sql` — Created: cascade bug cleanup (refund cash, cancel signals, delete stale entries)
+- `docker/Dockerfile.cron` — Added COPY for trend-universe.json
+- `docker/init-db.sql` — Added direction column to paper_signals, enrollment_source column to reversal_entries
+- `src/app/strategies/page.tsx` — Added "Confirmation only" scope filter
+
+### Functions/Symbols Modified
+- `jobExecuteConfirmationStrategies()` — new: d1/d2 confirmation-based entry engine
+- `jobScanTrends()` — new: scans 517-symbol universe for 3+ consecutive day streaks
+- `jobMonitorPositions()` — rewrote: direction-aware PnL, trailing stops, watermarks for SHORT
+- `jobEnrollMovers()` — modified: added pre-market guard (skip before 9:45 AM ET), source-filtered idempotency
+- `fetchDailyBars()` — modified: added AbortController with 8s timeout
+
+### Database Tables
+- `paper_signals` — Added direction column, backfilled 55 SHORT signals
+- `reversal_entries` — Added enrollment_source column (MOVERS/TREND)
+- `paper_strategies` + `paper_accounts` — 8 new strategies, cash refunded for cleanup
+
+### Summary
+Built confirmation strategy engine (waits for d1/d2 price confirmation before entry) with 5 initial strategies based on statistical analysis showing 90%+ win rates on "double confirmation" patterns. Expanded trading universe beyond Yahoo's top 20 movers by adding a trend scanner that detects 3+ day directional streaks in 517 liquid US stocks, with 3 trend-specific strategies. Two rounds of code review found 7 bugs (SHORT PnL inversion, missing direction column, cron race, no fetch timeout, source-blind idempotency, flat-day streak handling, market-hours guard). Third ultrathink self-review uncovered the most severe: a cascade bug where pre-market container startup enrolled 164 stale entries and placed 69 paper_signals, which would have silently blocked Thursday's entire MOVERS enrollment via idempotency. Fixed with cohort_date=lastBar.date logic + pre-market time guards + cleanup SQL. Pipeline verified ready for tomorrow's 9:45/16:15/16:30 ET triggers.
+
+### Session Notes
+→ `.claude/sessions/2026-04-16-112658.md`
+
+---
+
+## [2026-04-16 08:11] — Reversal Trading Statistical Analysis: Finding >70% Probability Edges
+
+**Area:** Trading/Analysis, Trading/Cron
+**Type:** docs (research & analysis)
+
+### Files Changed
+- `scripts/trend-analysis.js` — Created: 3-day streak reversal analysis
+- `scripts/trend-analysis-d2.js` — Created: Day 2 direction change analysis
+- `scripts/mega-analysis.js` — Created: 500-line comprehensive analysis testing 4,684 filter combinations
+
+### Functions/Symbols Modified
+- No production code modified — analysis scripts only
+
+### Database Tables
+- `reversal_entries` — Read-only: queried all 520 entries with d1-d10 price columns
+- `surveillance_logs` — Read-only: verified cron execution history
+
+### Summary
+Verified production cron is healthy (all 5 daily jobs firing correctly on VPS). Then conducted a deep statistical analysis of reversal trading data across 520 entries (2026-03-10 to 2026-04-15). Tested 4,684 scenarios combining type, magnitude, day-1 pattern, day-2 pattern, entry timing, and exit day. Found **790 scenarios with ≥70% win rate**. The #1 discovery: "Double Confirmation Bounce" — when a top loser bounces on d1 AND d2, it continues at **88-100% win rate** through d3-d5 with avg returns of 6-12% and max drawdown of only -1%. The 8-12% drop magnitude bucket showed the strongest reversal signal (75.8% by d5). LONG (buying losers) vastly outperforms SHORT (fading gainers). Close entry beats morning entry by 3-5%.
+
+### Session Notes
+→ `.claude/sessions/2026-04-16-081145.md`
+
+---
+
 ## [2026-04-10 08:00] — Strategy Dashboard, Auto-Trade Cron, Position Monitor, Sell Button Fix
 
 **Area:** Trading/Strategy, Trading/Paper, Trading/Cron

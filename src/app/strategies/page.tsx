@@ -39,51 +39,43 @@ export default function StrategiesPage() {
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<"ranking" | "grouped">("ranking");
   const [sortBy, setSortBy] = useState<"equity" | "realized" | "win_rate">("equity");
-  const [scope, setScope] = useState<"all" | "trading" | "analysis">("all");
+  const [scope, setScope] = useState<"all" | "trading" | "confirmation" | "analysis">("all");
   const [lastUpdate, setLastUpdate] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
 
+  // Single effect handles initial load, 60s polling, and explicit refresh
+  // (via refreshKey bump). The `cancelled` closure prevents setState after
+  // unmount OR after a newer load has been scheduled — fixes the React
+  // "setState on unmounted" warning that the duplicate loader caused.
   useEffect(() => {
     let cancelled = false;
-
     const loadData = async () => {
       try {
         const res = await fetch("/api/strategies");
         const data = await res.json();
-        if (!cancelled) {
-          setStrategies(data.strategies || []);
-          setGrouped(data.grouped || {});
-          setLastUpdate(new Date().toLocaleTimeString());
-          setLoading(false);
-        }
+        if (cancelled) return;
+        setStrategies(data.strategies || []);
+        setGrouped(data.grouped || {});
+        setLastUpdate(new Date().toLocaleTimeString());
+        setLoading(false);
       } catch {
         if (!cancelled) setLoading(false);
       }
     };
-
     void loadData();
     const interval = setInterval(loadData, 60000);
     return () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [refreshKey]);
 
-  const loadData = async () => {
-    try {
-      const res = await fetch("/api/strategies");
-      const data = await res.json();
-      setStrategies(data.strategies || []);
-      setGrouped(data.grouped || {});
-      setLastUpdate(new Date().toLocaleTimeString());
-    } catch {
-      // ignore
-    }
-  };
+  const refresh = () => setRefreshKey((k) => k + 1);
 
   const visibleStrategies = useMemo(() => {
     return strategies.filter((strategy) => {
       if (scope === "all") return true;
-      return scope === "trading" ? strategy.strategy_type === "TRADING" : strategy.strategy_type === "ANALYSIS";
+      return strategy.strategy_type === scope.toUpperCase();
     });
   }, [scope, strategies]);
 
@@ -135,7 +127,7 @@ export default function StrategiesPage() {
             Strategy Scenarios
           </h1>
           <p className="text-zinc-500 mt-1">
-            Compare live paper accounts and backtest history across 24 strategy variants.
+            Compare live paper accounts across trading, confirmation, and analysis strategies.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -144,11 +136,12 @@ export default function StrategiesPage() {
           </span>
           <select
             value={scope}
-            onChange={(e) => setScope(e.target.value as "all" | "trading" | "analysis")}
+            onChange={(e) => setScope(e.target.value as "all" | "trading" | "confirmation" | "analysis")}
             className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm"
           >
             <option value="all">All strategies</option>
             <option value="trading">Trading only</option>
+            <option value="confirmation">Confirmation only</option>
             <option value="analysis">Analysis only</option>
           </select>
           <select
@@ -166,7 +159,7 @@ export default function StrategiesPage() {
           >
             {view === "ranking" ? "By Strategy" : "Ranking"}
           </button>
-          <button onClick={loadData} className="flex items-center gap-1 px-3 py-2 text-sm bg-zinc-100 hover:bg-zinc-200 rounded-lg">
+          <button onClick={refresh} className="flex items-center gap-1 px-3 py-2 text-sm bg-zinc-100 hover:bg-zinc-200 rounded-lg">
             <RefreshCw className="h-4 w-4" />
           </button>
         </div>

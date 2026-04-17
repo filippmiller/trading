@@ -38,8 +38,10 @@ export async function GET() {
                  ps.investment_usd * GREATEST(
                    (
                      (
-                       COALESCE(lp.price, ps.entry_price) - ps.entry_price
-                     ) / NULLIF(ps.entry_price, 0)
+                       (COALESCE(lp.price, ps.entry_price) - ps.entry_price)
+                       / NULLIF(ps.entry_price, 0)
+                     )
+                     * (CASE WHEN ps.direction = 'SHORT' THEN -1 ELSE 1 END)
                    ) * ps.leverage,
                    -1
                  )

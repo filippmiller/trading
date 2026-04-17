@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS reversal_entries (
   cohort_date DATE NOT NULL,
   symbol VARCHAR(16) NOT NULL,
   direction VARCHAR(8) NOT NULL,
+  enrollment_source VARCHAR(16) NOT NULL DEFAULT 'MOVERS',
   day_change_pct DECIMAL(10,4) NOT NULL,
   entry_price DECIMAL(18,6) NOT NULL,
   consecutive_days INT NULL,
@@ -201,6 +202,7 @@ CREATE TABLE IF NOT EXISTS paper_signals (
   strategy_id INT NOT NULL,
   reversal_entry_id INT NULL,
   symbol VARCHAR(16) NOT NULL,
+  direction VARCHAR(8) NOT NULL DEFAULT 'LONG',
   generated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
   entry_price DECIMAL(18,6) NULL,
@@ -231,7 +233,10 @@ CREATE TABLE IF NOT EXISTS paper_position_prices (
   signal_id INT NOT NULL,
   price DECIMAL(18,6) NOT NULL,
   fetched_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  INDEX IX_pos_price_signal (signal_id, fetched_at)
+  INDEX IX_pos_price_signal (signal_id, fetched_at),
+  CONSTRAINT FK_pos_price_signal
+    FOREIGN KEY (signal_id) REFERENCES paper_signals(id)
+    ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 INSERT IGNORE INTO paper_accounts (name, initial_cash, cash)

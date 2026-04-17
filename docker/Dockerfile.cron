@@ -6,8 +6,9 @@ WORKDIR /app
 COPY docker/package.cron.json package.json
 RUN npm install --production
 
-# Copy the cron script
+# Copy the cron script + universe file
 COPY scripts/surveillance-cron.ts scripts/
+COPY scripts/trend-universe.json scripts/
 COPY tsconfig.json ./
 
 # Run as non-root
