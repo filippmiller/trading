@@ -71,12 +71,19 @@ export type ScenarioSummary = {
   totalPnlUsd: number;
   avgPnlUsd: number;
   avgPnlPct: number;
+  medianPnlUsd: number;
   bestTrade: { symbol: string; pnl: number } | null;
   worstTrade: { symbol: string; pnl: number } | null;
   maxDrawdownUsd: number;      // running equity curve drawdown
   totalCommissionUsd: number;
   totalInterestUsd: number;
   roiPct: number;              // totalPnl / (tradedEntries * investmentUsd)
+  // Advanced metrics:
+  profitFactor: number;        // gross wins / |gross losses|, Infinity if no losses
+  sharpeRatio: number;         // mean(pnl_pct) / std(pnl_pct), annualized by sqrt(252/avgHoldDays)
+  avgHoldDays: number;         // mean of actual hold days
+  exitReasonCounts: Record<ExitReasonStr, number>;
+  pnlHistogram: Array<{ binStart: number; binEnd: number; count: number }>;
 };
 
 export type EquityCurvePoint = {
@@ -375,6 +382,59 @@ export async function runScenario(
     }
   }
 
+  // Advanced metrics
+  const grossWins = simulated.filter(t => t.netPnlUsd > 0).reduce((s, t) => s + t.netPnlUsd, 0);
+  const grossLosses = simulated.filter(t => t.netPnlUsd <= 0).reduce((s, t) => s + Math.abs(t.netPnlUsd), 0);
+  const profitFactor = grossLosses > 0 ? grossWins / grossLosses : (grossWins > 0 ? Infinity : 0);
+
+  // Sharpe: mean / std of pnl_pct, annualized assuming avg hold period.
+  const pctReturns = simulated.map(t => t.netPnlPct);
+  const meanReturn = pctReturns.length > 0 ? pctReturns.reduce((s, v) => s + v, 0) / pctReturns.length : 0;
+  const variance = pctReturns.length > 1
+    ? pctReturns.reduce((s, v) => s + Math.pow(v - meanReturn, 2), 0) / (pctReturns.length - 1)
+    : 0;
+  const stdReturn = Math.sqrt(variance);
+  const avgHoldDays = simulated.length > 0
+    ? simulated.reduce((s, t) => s + t.holdDays, 0) / simulated.length
+    : 0;
+  const periodsPerYear = avgHoldDays > 0 ? 252 / avgHoldDays : 0;
+  const sharpeRatio = stdReturn > 0 ? (meanReturn / stdReturn) * Math.sqrt(periodsPerYear) : 0;
+
+  // Median
+  const sortedPnl = pctReturns.map(v => v).sort((a, b) => a - b).map(v => v);
+  const sortedUsd = simulated.map(t => t.netPnlUsd).sort((a, b) => a - b);
+  const medianPnlUsd = sortedUsd.length === 0 ? 0
+    : sortedUsd.length % 2 === 0
+      ? (sortedUsd[sortedUsd.length / 2 - 1] + sortedUsd[sortedUsd.length / 2]) / 2
+      : sortedUsd[Math.floor(sortedUsd.length / 2)];
+
+  // Exit reason counts
+  const exitReasonCounts: Record<ExitReasonStr, number> = {
+    TIME: 0, HARD_STOP: 0, TAKE_PROFIT: 0, TRAIL_STOP: 0, DATA_MISSING: 0,
+  };
+  for (const t of trades) exitReasonCounts[t.exitReason]++;
+
+  // PnL histogram — 12 buckets spanning min..max pnl_pct
+  const pnlHistogram: Array<{ binStart: number; binEnd: number; count: number }> = [];
+  if (sortedPnl.length > 0) {
+    const minP = sortedPnl[0];
+    const maxP = sortedPnl[sortedPnl.length - 1];
+    const range = maxP - minP;
+    if (range > 0) {
+      const binCount = 12;
+      const binWidth = range / binCount;
+      for (let i = 0; i < binCount; i++) {
+        const binStart = minP + i * binWidth;
+        const binEnd = i === binCount - 1 ? maxP : binStart + binWidth;
+        const count = pctReturns.filter(v => v >= binStart && (i === binCount - 1 ? v <= binEnd : v < binEnd)).length;
+        pnlHistogram.push({ binStart, binEnd, count });
+      }
+    } else {
+      // Edge case: all trades had identical pnl_pct
+      pnlHistogram.push({ binStart: minP, binEnd: maxP, count: sortedPnl.length });
+    }
+  }
+
   const summary: ScenarioSummary = {
     totalEntries: trades.length,
     tradedEntries: simulated.length,
@@ -384,9 +444,8 @@ export async function runScenario(
     winRate: simulated.length > 0 ? (wins / simulated.length) * 100 : 0,
     totalPnlUsd: totalPnl,
     avgPnlUsd: simulated.length > 0 ? totalPnl / simulated.length : 0,
-    avgPnlPct: simulated.length > 0
-      ? simulated.reduce((s, t) => s + t.netPnlPct, 0) / simulated.length
-      : 0,
+    avgPnlPct: meanReturn,
+    medianPnlUsd,
     bestTrade: best,
     worstTrade: worst,
     maxDrawdownUsd: maxDd,
@@ -395,6 +454,11 @@ export async function runScenario(
     roiPct: simulated.length > 0
       ? (totalPnl / (simulated.length * trade.investmentUsd)) * 100
       : 0,
+    profitFactor,
+    sharpeRatio,
+    avgHoldDays,
+    exitReasonCounts,
+    pnlHistogram,
   };
 
   return { trades, summary, equityCurve: curve };
