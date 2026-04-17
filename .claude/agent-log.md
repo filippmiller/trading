@@ -9,6 +9,38 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-18 01:15] — Strategy Research polish: Sharpe, histogram, presets, CSV, persistence
+
+**Area:** Trading/Research, Trading/UI
+**Type:** feat (autonomous v2 polish)
+
+### Files Changed
+- `src/lib/scenario-simulator.ts` — ScenarioSummary extended with profitFactor, sharpeRatio, medianPnlUsd, avgHoldDays, exitReasonCounts, pnlHistogram (12 buckets)
+- `src/app/research/page.tsx` — 4 quick preset buttons, localStorage persistence, advanced metrics row, exit reason stacked bar, PnL histogram SVG, CSV export
+
+### Summary
+Autonomous polish pass per пользовательской инструкции «сделай сам всё что можешь». Six polish features shipped in one PR:
+
+1. **Quick presets** — 4 кнопки из data-driven analysis (Baseline UP, Monster Rider, Dip Bounce, Gainer Fade контр-пример). Один клик → filters + trade params заполняются.
+2. **Form persistence** — localStorage key `research:lastForm`. Refresh страницы не теряет форму.
+3. **Reset to defaults** — кнопка сбрасывает в безопасные дефолты.
+4. **Advanced metrics** — profit factor, Sharpe ratio (annualized по sqrt(252/avgHoldDays)), MaxDD, costs breakdown. Colour-coded thresholds.
+5. **Exit reason breakdown** — горизонтальный stacked bar показывающий proportion TIME/HARD_STOP/TAKE_PROFIT/TRAIL_STOP/DATA_MISSING.
+6. **PnL histogram** — pure SVG 12-bucket распределение P&L % по сделкам. Отрицательные бины красные, положительные зелёные.
+7. **Export CSV** — download всех сделок в CSV с timestamp в filename.
+
+All additive — `/api/research/run` shape обратно-совместимый (новые поля добавлены, существующие без изменений).
+
+### Verification
+- `npx tsc --noEmit`: clean
+- `npx eslint`: clean
+- `npm run build`: PASSES
+
+### Commits
+- `32126cf` — feat(research): polish — Sharpe, histogram, presets, CSV export, persistence (#6)
+
+---
+
 ## [2026-04-18 00:45] — Strategy Research — интерактивный проигрыватель сценариев
 
 **Area:** Trading/Research, Trading/UI, Trading/API, Trading/Schema
