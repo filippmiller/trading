@@ -3,6 +3,8 @@
 import React, { useEffect, useState } from "react";
 import { Activity, Filter, DollarSign, Zap, Play, Save, Trash2, FolderOpen, Workflow, Download, Sparkles, RotateCcw } from "lucide-react";
 
+import { GridSweepSection } from "@/components/GridSweepSection";
+
 type Filters = {
   cohortDateFrom?: string;
   cohortDateTo?: string;
@@ -579,7 +581,16 @@ export default function ResearchPage() {
         </div>
       )}
 
-      {/* Parameter Sweep */}
+      {/* Grid Sweep — multi-dimensional strategy search */}
+      <GridSweepSection
+        filters={filters}
+        investmentUsd={trade.investmentUsd}
+        leverage={trade.leverage}
+        tradeDirection={trade.tradeDirection}
+        costs={costs}
+      />
+
+      {/* Parameter Sweep — 1D walk, kept for focused drill-down after grid finds a winner */}
       <div className="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
         <div className="flex items-center gap-2 mb-4">
           <Workflow className="h-4 w-4 text-cyan-500" />
