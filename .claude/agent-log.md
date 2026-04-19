@@ -9,6 +9,55 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-19 14:00] — Grid Sweep: multi-dimensional strategy search on /research
+
+**Area:** Trading/Research, Trading/UI, Trading/API
+**Type:** feat (strategy research primitive)
+
+### Files Changed
+- `src/lib/scenario-simulator.ts` — `ExitStrategy` gains `exitBar` + `breakevenAtPct`; `TradeParams` gains `entryDelayDays` + `entryBar`; `evaluateExitWalk` now walks all 3 bars/day (30 ticks over 10 days) with a `startDay` param for entry-delay support; new `runGridSweep` expands axis cross-product in-memory against a single DB load
+- `src/app/api/research/grid/route.ts` — **new** POST endpoint with 10,000-combo hard cap
+- `src/components/GridSweepSection.tsx` — **new** self-contained UI (5 presets, advanced axis editor, sortable top-25 results table)
+- `src/app/research/page.tsx` — integrates `<GridSweepSection />` above the existing 1-D Parameter Sweep
+- `scripts/analyze-delayed-entry.ts`, `analyze-momentum-carry.ts`, `analyze-strategy-grid.ts` — **new** CLI probes that surfaced the hypotheses the UI now automates
+
+### Database Tables
+- `reversal_entries` — read-only usage; selects all 30 bar columns (d1..d10 × morning/midday/close) instead of the previous 10 close columns
+
+### Summary
+Pre-existing `/research` page could run ONE scenario at a time, so finding the winning config across hold-days × exit-time × entry-delay × hard-stop × take-profit × trailing-stop × breakeven meant hours of manual scenario edits. The Grid Sweep primitive collapses that to one button click:
+
+- User picks a preset (or edits axis values manually).
+- Endpoint loads matching rows once, replays each combo in-memory.
+- Returns top-25 configs sorted by the chosen metric.
+
+Smoke numbers on 271-entry MOVERS gainers sample: 48-combo sweep runs in 1.4s. Top config — `hold=5d · exit=morning · trail=15%` — delivers **64% WR / +$5,687 / +21% avg per trade** at 5× leverage, vs the previous "hold 10 days close-exit" baseline of +$70 total.
+
+Engineering choices:
+- **In-memory replay over separate SQL queries** — one SELECT hydrates ~400 rows with all 30 bar columns (~100KB), each combo's simulation is pure arithmetic → ~30ms/combo regardless of DB state.
+- **`startDay` param on `evaluateExitWalk`** — threads the entry-delay state through without duplicating the walk logic.
+- **Hard 10k-combo cap** — prevents UI/server from combinatorial explosion (e.g. full 8-axis cross-product of 5 values each = 390k).
+- **Breakeven arm as a first-class exit** — common real-world stop that wasn't expressible with hard_stop+trail alone.
+
+### Verification
+- `npx tsc --noEmit`: clean
+- Backend smoke: `curl POST /api/research/grid` with 48 combos returns 200 in 1.4s
+- UI smoke: Basic-hold-×-exit preset click → top-12 table renders with emerald highlight on winner
+- Manual test of all 5 presets: each returns valid sorted output
+
+### Commits
+- (pending merge) — `feat/grid-sweep-strategy-search` branch, PR #9
+
+### Open follow-ups (deliberately deferred)
+- **Apply-to-form from grid row** — click a result row → populate main scenario form for drill-down with full trade list
+- **Concentration filter** — cap max N occurrences of a single ticker (XNDU appeared 4× in top results, skewing stats)
+- **ATR-based stops** — requires per-symbol volatility column
+- **Regime filter** — requires SPY/VIX daily join (enable "skip trading when SPY red"-type filters)
+- **Pair trades** (LONG top-5 + SHORT bottom-5) — structural second leg, not a simple axis
+- **Vol-adjusted sizing** — needs historical vol per symbol
+
+---
+
 ## [2026-04-18 21:10] — Move MOVERS enrollment 09:45 AM → 16:05 ET (post-close)
 
 **Area:** Trading/Cron, Trading/Data migration
