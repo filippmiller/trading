@@ -56,6 +56,60 @@ Engineering choices:
 - **Pair trades** (LONG top-5 + SHORT bottom-5) — structural second leg, not a simple axis
 - **Vol-adjusted sizing** — needs historical vol per symbol
 
+## [2026-04-19 07:00] — Full tab audit + 11 fixes (header lies, silent failures, stale KPIs, HTML nesting)
+
+**Area:** Trading/UI (all 11 tabs), Trading/Cron (auto-close), Trading/DB (PnL backfill)
+**Type:** critical-cleanup + data backfill
+
+### Files Changed
+- `src/components/AppShell.tsx` — live NYSE phase detection (Open/Pre/After/Closed); clock is mount-only to fix hydration mismatch; "Strategy Auto: 09:50 ET" → "Enroll: 16:05 ET"
+- `src/components/TickerDownloader.tsx` — **new**, inline ticker-download affordance replacing 3 dead "Add one on the Dashboard first" references
+- `src/components/ScenariosSection.tsx` — tri-state preview (`spec` / `error` / `notReady`) replacing misleading "Invalid parameters" default; `<CardDescription>` wrapping `<div>` fixed (was HTML-nesting hydration error); inline downloader integrated
+- `src/app/page.tsx` — stale "Next sync window starts at 09:45 AM ET" → corrected "09:45 ET price-sync · 16:05 ET post-close MOVERS enrollment"
+- `src/app/strategies/page.tsx` — `h1` "Strategy Scenarios" → "Strategy Dashboard" (was colliding with /scenarios); silent `catch {}` → visible error-state + retry
+- `src/app/settings/page.tsx` — silent "Loading..." forever → try/catch + error+retry + proper loading UI
+- `src/app/markets/page.tsx` — flat 60s refresh → market-phase-aware cadence (30s open, 90s pre/after, paused closed)
+- `src/app/prices/page.tsx`, `src/app/voice/page.tsx` — inline `TickerDownloader` integration; `loadSymbols` promoted to returned-promise for downloader callback
+- `src/lib/data.ts` — `loadPrices` mysql2 LIMIT prepared-statement bug (`ECONNREFUSED`-looking 500 on `/api/prices`) → `pool.query` with inlined int
+- `src/lib/surveillance.ts` — 14-day auto-close now computes `final_pnl_usd`/`final_pnl_pct` in the same UPDATE via direction-adjusted CASE (was only flipping status, leaving PnL NULL forever)
+- `scripts/backfill-completed-pnl.ts` — **new** one-time backfill for 400 COMPLETED entries with NULL PnL
+- `docker/docker-compose.override.yml` — **new**, local-dev port remap (3320 → 3319) to match existing `.env.local`
+- `package.json` — `@playwright/test` 1.58.1 → 1.59.1
+- `.gitignore` — audit screenshots, `.claude/shots/`, `docker/.env`
+
+### Database Tables
+- `reversal_entries` — 400 COMPLETED rows backfilled with `final_pnl_usd`/`final_pnl_pct` via direction-adjusted close-to-entry on latest available d-close. Post-backfill: **186 wins / 213 losses / 1 scratch = 46.5% win rate, +$70.72 total PnL, avg +0.177% per trade**. Before: all 400 had `final_pnl_usd=NULL` → Overview and Reversal KPIs read $0 / 0% forever.
+
+### Summary
+Comprehensive critical audit across all 11 tabs (Overview, Markets, Mean Reversion, Strategy Dashboard, Strategy Scenarios, Strategy Research, Market Signals, Price Surveillance, Voice Intelligence, Simulation Runs, Paper Trading, System Settings). Initial visible symptoms were mostly "empty / broken" — root cause analysis revealed two underlying issues masquerading as many:
+
+1. **SSH tunnel (3319→VPS 3320) had dropped** during the audit → every API endpoint started returning 500, every page's silent `catch {}` swallowed the error and rendered empty state ("$0", "0 strategies", "No entries"). Restoring the tunnel fixed the visible symptoms; adding loud error-state + retry pattern prevents regressions.
+
+2. **User-facing trust lies** hardcoded in the shell — "Market Live" pulsing green on Sunday 01:00, "Strategy Auto: 09:50 ET" reflecting a schedule that was moved to 16:05 on 2026-04-18. Replaced with live market-phase detection and accurate cron schedule.
+
+3. **Stale `final_pnl_usd=NULL` on 400 COMPLETED entries** — auto-close path only flipped status, never computed PnL. Both paths now fixed: one-off backfill script + forward-looking SQL CASE in `syncActiveSurveillance`.
+
+4. **Minor HTML-validity issue** — `<CardDescription>` (renders as `<p>`) wrapping `<div>` nested-element children caused one persistent hydration warning; replaced with plain styled `<div>`.
+
+### Verification
+- All 11 tabs screenshotted pre/post-fix — visual confirmation for each
+- Final cross-tab console sweep: **0 errors, 0 warnings, 0 hydration mismatches** across all 11 pages (previously 21+ errors total)
+- `backfill-completed-pnl.ts` dry-run followed by apply: 400/400 rows updated, 0 skipped
+- Overview KPI confirmed: "Win Rate 46.5%" (was 0.0%), "Strategy Win Rate 46.5%" (was 0.0%)
+- `/api/prices?symbol=SPY&limit=5` now 200 (was 500 `Incorrect arguments to mysqld_stmt_execute`)
+- Playwright 1.59.1 upgrade verified via one full navigation loop
+
+### Deploy
+Not deployed — local-dev only. Changes merged via PR after push.
+
+### Open follow-ups (not in this PR)
+- **TREND cohort pollution in matrix** — user spotted during commit that cohort sizes vary wildly (13/23/124/38 vs expected 20/day). Root cause: `enrollment_source='TREND'` adds streak-based rows alongside the strict top-10/top-10 `MOVERS`. Proposed next PR: matrix filter defaulting to MOVERS-only with opt-in "Show TREND" toggle; separate decision on whether TREND cron stays alive.
+- `.claude/deploy-instructions.md` "Last Verified: 2026-04-09" — stale, should be refreshed.
+- `docker/.env.example` has `MYSQL_ROOT_PASSWORD=changeme` while `.env.local` uses `trading123` — alignment when someone audits secrets.
+
+### Commits
+- (pending) — `fix/tab-audit-critical-cleanup` branch, PR to follow
+
 ---
 
 ## [2026-04-18 21:10] — Move MOVERS enrollment 09:45 AM → 16:05 ET (post-close)

@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import { StrategyChat } from "@/components/StrategyChat";
+import { TickerDownloader } from "@/components/TickerDownloader";
 
 const SYMBOL_STORAGE_KEY = "symbols:last";
 
@@ -23,24 +24,27 @@ export default function VoicePage() {
   const getErrorMessage = (err: unknown) =>
     err instanceof Error ? err.message : "Unexpected error.";
 
-  useEffect(() => {
-    const loadSymbols = async () => {
-      try {
-        const response = await fetch("/api/symbols");
-        const payload = await response.json();
-        const items = Array.isArray(payload.items) ? payload.items : [];
-        setSymbols(items);
-        if (typeof window === "undefined") return;
-        const saved = window.localStorage.getItem(SYMBOL_STORAGE_KEY);
-        if (saved && items.includes(saved)) {
-          setSymbol(saved);
-        } else if (items.length) {
-          setSymbol(items[0]);
-        }
-      } catch {
-        setSymbols([]);
+  const loadSymbols = async () => {
+    try {
+      const response = await fetch("/api/symbols");
+      const payload = await response.json();
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      setSymbols(items);
+      if (typeof window === "undefined") return items;
+      const saved = window.localStorage.getItem(SYMBOL_STORAGE_KEY);
+      if (saved && items.includes(saved)) {
+        setSymbol(saved);
+      } else if (items.length) {
+        setSymbol(items[0]);
       }
-    };
+      return items;
+    } catch {
+      setSymbols([]);
+      return [];
+    }
+  };
+
+  useEffect(() => {
     loadSymbols();
   }, []);
 
@@ -159,8 +163,15 @@ export default function VoicePage() {
               Selected ticker overrides the parsed StrategySpec on run.
             </div>
             {!symbols.length && (
-              <div className="text-xs text-zinc-500">
-                No tickers downloaded yet. Add one on the Dashboard first.
+              <div className="mt-2 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-3 space-y-2">
+                <div className="text-xs text-zinc-600">No tickers downloaded yet.</div>
+                <TickerDownloader
+                  hint="A downloaded ticker lets the parsed StrategySpec run on real bars."
+                  onDownloaded={async (sym) => {
+                    await loadSymbols();
+                    setSymbol(sym);
+                  }}
+                />
               </div>
             )}
           </div>

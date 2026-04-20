@@ -17,7 +17,7 @@ import {
   DollarSign,
   ChevronRight
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { cn } from "@/lib/utils";
 
 const navigation = [
@@ -45,6 +45,49 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     if (!query) return navigation;
     return navigation.filter((item) => item.name.toLowerCase().includes(query) || item.href.toLowerCase().includes(query));
   }, [quickNav]);
+
+  // Clock + live market phase. Mount-only so SSR and first client paint agree;
+  // without this, `new Date()` on the server vs client mismatches at hydration.
+  // NYSE regular session = 09:30–16:00 ET Mon–Fri. Pre-market = 04:00–09:30, after-hours = 16:00–20:00.
+  // Holiday calendar is deliberately NOT handled here — a wrongly-lit "Live" on a federal
+  // holiday is better than pretending to know every NYSE closure; worst case ~9 days/year
+  // of amber instead of zinc, never the other way around.
+  const [marketNow, setMarketNow] = useState<{ clock: string; phase: 'OPEN' | 'PRE' | 'AFTER' | 'CLOSED' } | null>(null);
+  useEffect(() => {
+    const tick = () => {
+      const now = new Date();
+      const clock = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York' });
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        weekday: 'short',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).formatToParts(now);
+      const weekday = parts.find(p => p.type === 'weekday')?.value ?? '';
+      const hh = Number(parts.find(p => p.type === 'hour')?.value ?? '0');
+      const mm = Number(parts.find(p => p.type === 'minute')?.value ?? '0');
+      const mins = hh * 60 + mm;
+      const isWeekday = !['Sat', 'Sun'].includes(weekday);
+      let phase: 'OPEN' | 'PRE' | 'AFTER' | 'CLOSED' = 'CLOSED';
+      if (isWeekday) {
+        if (mins >= 570 && mins < 960) phase = 'OPEN';        // 09:30–16:00
+        else if (mins >= 240 && mins < 570) phase = 'PRE';    // 04:00–09:30
+        else if (mins >= 960 && mins < 1200) phase = 'AFTER'; // 16:00–20:00
+      }
+      setMarketNow({ clock, phase });
+    };
+    tick();
+    const id = setInterval(tick, 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const phaseStyle = {
+    OPEN:   { dot: 'bg-emerald-500 animate-pulse', text: 'text-emerald-700', label: 'Market Open' },
+    PRE:    { dot: 'bg-amber-500 animate-pulse',   text: 'text-amber-700',   label: 'Pre-Market' },
+    AFTER:  { dot: 'bg-amber-500',                 text: 'text-amber-700',   label: 'After-Hours' },
+    CLOSED: { dot: 'bg-zinc-400',                  text: 'text-zinc-500',    label: 'Market Closed' },
+  } as const;
 
   return (
     <div className="flex min-h-screen bg-zinc-50">
@@ -179,14 +222,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
           </div>
           <div className="flex items-center gap-4 text-xs font-medium text-zinc-500">
-            <div className="flex items-center gap-1.5">
-              <div className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-              Market Live
+            <div className={`flex items-center gap-1.5 ${marketNow ? phaseStyle[marketNow.phase].text : ''}`} suppressHydrationWarning>
+              <div className={`h-2 w-2 rounded-full ${marketNow ? phaseStyle[marketNow.phase].dot : 'bg-zinc-300'}`} />
+              {marketNow ? phaseStyle[marketNow.phase].label : '—'}
             </div>
             <div className="h-4 w-px bg-zinc-200" />
-            <span>Strategy Auto: 09:50 ET</span>
+            <span>Enroll: 16:05 ET</span>
             <div className="h-4 w-px bg-zinc-200" />
-            <span>UTC-5: {new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York' })}</span>
+            <span suppressHydrationWarning>ET: {marketNow?.clock ?? '—:—'}</span>
           </div>
         </header>
 

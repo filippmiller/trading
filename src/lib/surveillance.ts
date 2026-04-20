@@ -211,12 +211,37 @@ async function enhanceWithTrend(mover: Mover): Promise<Mover> {
 export async function syncActiveSurveillance() {
   const pool = await getPool();
 
-  // Auto-close logic: Mark anything older than 14 days as COMPLETED
-  // (10 business days ≈ 14 calendar days). Pass ET today explicitly — MySQL
-  // CURRENT_DATE runs in server TZ (UTC in this deployment) which diverges
-  // from ET after 20:00 ET.
+  // Auto-close logic: Mark anything older than 14 days as COMPLETED and
+  // simultaneously compute final_pnl_usd / final_pnl_pct from the latest
+  // available d-close. Previous implementation only flipped status, leaving
+  // final_pnl_usd NULL, which made Overview's Total P&L and Win Rate KPIs
+  // read $0 / 0% forever — silent false-empty stats that would make a user
+  // think the strategy never made money.
+  //
+  // PnL convention: direction-adjusted (close − entry) / entry, on a $100
+  // notional position (matches DEFAULT_SETTINGS in the reversal dashboard).
+  // At $100 notional the USD amount equals the percent amount numerically,
+  // so one CASE feeds both columns. Costs/commissions are not applied here —
+  // UI recomputes the full net PnL with live settings; this baseline is only
+  // for the Overview/Reversal aggregate KPIs.
+  // COALESCE picks the latest available d-close; entries with no d-data at all
+  // (cohort auto-closing at 14 days because pricing never landed) stay NULL.
   await pool.execute(
-    "UPDATE reversal_entries SET status = 'COMPLETED' WHERE status = 'ACTIVE' AND cohort_date < DATE_SUB(?, INTERVAL 14 DAY)",
+    `UPDATE reversal_entries
+        SET status = 'COMPLETED',
+            final_pnl_pct = CASE WHEN entry_price > 0 THEN
+              (CASE WHEN direction = 'SHORT' THEN -1 ELSE 1 END) *
+              ((COALESCE(d10_close, d9_close, d8_close, d7_close, d6_close,
+                         d5_close, d4_close, d3_close, d2_close, d1_close) - entry_price)
+               / entry_price) * 100
+              ELSE NULL END,
+            final_pnl_usd = CASE WHEN entry_price > 0 THEN
+              (CASE WHEN direction = 'SHORT' THEN -1 ELSE 1 END) *
+              ((COALESCE(d10_close, d9_close, d8_close, d7_close, d6_close,
+                         d5_close, d4_close, d3_close, d2_close, d1_close) - entry_price)
+               / entry_price) * 100
+              ELSE NULL END
+      WHERE status = 'ACTIVE' AND cohort_date < DATE_SUB(?, INTERVAL 14 DAY)`,
     [todayET()]
   );
 

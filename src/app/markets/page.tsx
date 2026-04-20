@@ -230,12 +230,36 @@ export default function MarketsPage() {
     }
   }, [selectedRange]);
 
+  // Auto-refresh cadence is market-aware so we don't burn Yahoo quota on
+  // unchanging weekend data. Regular session → 30s, pre/after-hours → 90s,
+  // market closed → manual refresh only. Previously a flat 60s interval fired
+  // around the clock, producing 1440 req/day even when price data was frozen.
   useEffect(() => {
     void loadOverview();
-    const interval = setInterval(() => {
-      void loadOverview();
-    }, 60000);
-    return () => clearInterval(interval);
+    const computeDelay = () => {
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York', weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+      }).formatToParts(new Date());
+      const weekday = parts.find(p => p.type === 'weekday')?.value ?? '';
+      const mins = Number(parts.find(p => p.type === 'hour')?.value ?? 0) * 60
+                 + Number(parts.find(p => p.type === 'minute')?.value ?? 0);
+      if (['Sat', 'Sun'].includes(weekday)) return null;
+      if (mins >= 570 && mins < 960) return 30_000;       // 09:30–16:00 regular
+      if (mins >= 240 && mins < 570) return 90_000;       // 04:00–09:30 pre
+      if (mins >= 960 && mins < 1200) return 90_000;      // 16:00–20:00 after
+      return null;                                        // overnight closed
+    };
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const schedule = () => {
+      const delay = computeDelay();
+      if (delay == null) return;
+      timeoutId = setTimeout(async () => {
+        await loadOverview();
+        schedule();
+      }, delay);
+    };
+    schedule();
+    return () => { if (timeoutId) clearTimeout(timeoutId); };
   }, [loadOverview]);
 
   useEffect(() => {

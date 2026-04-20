@@ -116,9 +116,10 @@ export async function loadPrices(lookbackDays: number, symbol: string) {
   const normalized = normalizeSymbol(symbol);
   const pool = await getPool();
   const limit = Math.min(260, Math.max(1, Math.floor(lookbackDays)));
-  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT date, open, high, low, close, volume FROM prices_daily WHERE symbol = ? ORDER BY date DESC LIMIT ?",
-    [normalized, limit]
+  // MySQL 8 prepared statements reject string-bound LIMIT; inline the already-clamped integer instead of using `execute()` with a bound param.
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT date, open, high, low, close, volume FROM prices_daily WHERE symbol = ? ORDER BY date DESC LIMIT ${limit}`,
+    [normalized]
   );
   return rows
     .map((row) => ({

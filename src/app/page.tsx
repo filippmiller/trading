@@ -152,7 +152,7 @@ export default function DashboardPage() {
             <div className="pt-4 flex items-center justify-between border-t border-zinc-100">
               <span className="text-sm font-medium text-zinc-500 flex items-center gap-2">
                 <div className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-                Next sync window starts at 09:45 AM ET
+                09:45 ET price-sync · 16:05 ET post-close MOVERS enrollment
               </span>
               <Link href="/reversal" className="text-emerald-600 text-sm font-bold flex items-center gap-1 hover:gap-2 transition-all">
                 View Command Center <ArrowRight className="h-4 w-4" />
