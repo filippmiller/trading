@@ -9,6 +9,46 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-20 11:15] — Recovery, docs refresh, PR #8 merge, merged-state verification
+
+**Area:** Trading/Ops, Trading/Docs, Trading/Git, Trading/Verification
+**Type:** maintenance + merge + docs
+
+### Files Changed
+- `.claude/agent-log.md` — added this entry
+- `.claude/deploy-instructions.md` — rewritten to reflect tunnel-based local operation and current verification workflow
+- `docs/FEATURES.md` — rewritten from obsolete voice-simulator framing to current trading research platform
+- `.claude/sessions/2026-04-20-111500.md` — new session record
+
+### Functions/Symbols Modified
+- N/A — no application code changed in this pass beyond merging the already-reviewed PR #8 branch into `master`
+
+### Database Tables
+- None
+
+### Summary
+Picked up from a crashed session after Grid Sweep had already been merged into remote `master`. Reconstructed state from the screenshot plus `.claude` session notes, restored the SSH DB tunnel, and verified merged `master` by hitting `/research` and `/api/research/grid`. Then rebased `fix/tab-audit-critical-cleanup` onto current `master`, force-pushed the rebased branch, created a clean integration worktree, and merged PR #8 into `master`.
+
+Also refreshed the two stale docs that were materially out of date:
+- deployment notes were still pinned to 2026-04-09 and did not mention the SSH tunnel or Grid Sweep verification path
+- feature documentation still described the product as a voice strategy simulator instead of the current multi-page trading research + paper execution app
+
+### Verification
+- confirmed `origin/master` already contained Grid Sweep merge (`f6e3cd7`)
+- restored tunnel on local `3319`
+- verified `/research` returned `200`
+- verified `/api/research/grid` returned valid JSON once DB connectivity was restored
+- rebased PR #8 with one expected conflict in `.claude/agent-log.md` only
+- post-merge build verification remains subject to Google Fonts reachability during `next build`
+
+### Commits
+- `f6e3cd7` — existing Grid Sweep merge on `master`
+- `0fb0c20` — rebased `fix/tab-audit-critical-cleanup`
+- integration `master` now includes PR #8 merge after this pass
+
+### Session Notes
+- `.claude/sessions/2026-04-20-111500.md`
+
 ## [2026-04-19 14:00] — Grid Sweep: multi-dimensional strategy search on /research
 
 **Area:** Trading/Research, Trading/UI, Trading/API
