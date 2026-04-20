@@ -37,29 +37,35 @@ export default function StrategiesPage() {
   const [strategies, setStrategies] = useState<StrategyData[]>([]);
   const [grouped, setGrouped] = useState<Record<string, StrategyData[]>>({});
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [view, setView] = useState<"ranking" | "grouped">("ranking");
   const [sortBy, setSortBy] = useState<"equity" | "realized" | "win_rate">("equity");
   const [scope, setScope] = useState<"all" | "trading" | "confirmation" | "analysis">("all");
   const [lastUpdate, setLastUpdate] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
 
-  // Single effect handles initial load, 60s polling, and explicit refresh
-  // (via refreshKey bump). The `cancelled` closure prevents setState after
-  // unmount OR after a newer load has been scheduled — fixes the React
-  // "setState on unmounted" warning that the duplicate loader caused.
+  // Single effect handles initial load, 60s polling, and explicit refresh.
+  // Failures now surface a visible error state — the previous silent `catch {}`
+  // presented "0 strategies / $0 equity" indistinguishably from "DB tunnel dropped",
+  // misleading users into thinking the system was actually empty.
   useEffect(() => {
     let cancelled = false;
     const loadData = async () => {
       try {
         const res = await fetch("/api/strategies");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (cancelled) return;
         setStrategies(data.strategies || []);
         setGrouped(data.grouped || {});
         setLastUpdate(new Date().toLocaleTimeString());
+        setLoadError(null);
         setLoading(false);
-      } catch {
-        if (!cancelled) setLoading(false);
+      } catch (err) {
+        if (!cancelled) {
+          setLoadError(err instanceof Error ? err.message : String(err));
+          setLoading(false);
+        }
       }
     };
     void loadData();
@@ -118,13 +124,25 @@ export default function StrategiesPage() {
     return <div className="flex items-center justify-center h-96 text-zinc-400">Loading strategies...</div>;
   }
 
+  if (loadError) {
+    return (
+      <div className="max-w-xl mx-auto mt-20 rounded-xl ring-1 ring-rose-200 bg-rose-50 p-6">
+        <h2 className="text-lg font-bold text-rose-700 mb-2">Failed to load strategies</h2>
+        <p className="font-mono text-xs text-rose-600 mb-4">{loadError}</p>
+        <button onClick={refresh} className="px-4 py-2 bg-rose-600 text-white rounded-lg text-sm font-medium hover:bg-rose-700">
+          Retry
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-7xl mx-auto space-y-6 pb-20">
       <div className="border-b pb-4 flex items-start justify-between">
         <div>
           <h1 className="text-3xl font-bold tracking-tight text-zinc-900 flex items-center gap-3">
             <BarChart3 className="text-indigo-500 h-8 w-8" />
-            Strategy Scenarios
+            Strategy Dashboard
           </h1>
           <p className="text-zinc-500 mt-1">
             Compare live paper accounts across trading, confirmation, and analysis strategies.

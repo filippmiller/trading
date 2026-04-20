@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { TickerDownloader } from "@/components/TickerDownloader";
 
 const formatNumber = (value: number, digits = 2) => value.toFixed(digits);
 const SYMBOL_STORAGE_KEY = "symbols:last";
@@ -48,24 +49,27 @@ export default function PricesPage() {
     }
   };
 
-  useEffect(() => {
-    const loadSymbols = async () => {
-      try {
-        const response = await fetch("/api/symbols");
-        const payload = await response.json();
-        const items = Array.isArray(payload.items) ? payload.items : [];
-        setSymbols(items);
-        if (typeof window === "undefined") return;
-        const saved = window.localStorage.getItem(SYMBOL_STORAGE_KEY);
-        if (saved && items.includes(saved)) {
-          setSymbol(saved);
-        } else if (items.length) {
-          setSymbol(items[0]);
-        }
-      } catch {
-        setSymbols([]);
+  const loadSymbols = async () => {
+    try {
+      const response = await fetch("/api/symbols");
+      const payload = await response.json();
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      setSymbols(items);
+      if (typeof window === "undefined") return items;
+      const saved = window.localStorage.getItem(SYMBOL_STORAGE_KEY);
+      if (saved && items.includes(saved)) {
+        setSymbol(saved);
+      } else if (items.length) {
+        setSymbol(items[0]);
       }
-    };
+      return items;
+    } catch {
+      setSymbols([]);
+      return [];
+    }
+  };
+
+  useEffect(() => {
     loadSymbols();
   }, []);
 
@@ -144,8 +148,15 @@ export default function PricesPage() {
       </CardHeader>
       <CardContent>
         {symbols.length === 0 && (
-          <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600">
-            No tickers downloaded yet. Add one on the Dashboard first.
+          <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-3 space-y-2">
+            <div className="text-sm text-zinc-600">No tickers downloaded yet.</div>
+            <TickerDownloader
+              hint="Pull OHLC for a symbol (e.g. SPY, AAPL) to populate this view."
+              onDownloaded={async (sym) => {
+                await loadSymbols();
+                setSymbol(sym);
+              }}
+            />
           </div>
         )}
         <div className="overflow-auto">

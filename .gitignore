@@ -82,3 +82,10 @@ e2e-production-proof.png
 final-demo.js
 paper-simulator-*.png
 tradier-*.png
+
+# Audit screenshots / local-dev artifacts (do not commit)
+/audit/
+/.claude/shots/
+/.claude/settings.local.json
+/docker/.env
+/strategies-*.png

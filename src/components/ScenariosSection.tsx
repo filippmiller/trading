@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { TickerDownloader } from "@/components/TickerDownloader";
 
 const STORAGE_KEY = "scenarios:last";
 const SYMBOL_STORAGE_KEY = "symbols:last";
@@ -64,28 +65,31 @@ export function ScenariosSection({
     }
   }, [active]);
 
-  useEffect(() => {
+  const loadSymbols = async () => {
     if (isSymbolsControlled) {
       setSymbols(symbolsOverride ?? []);
-      return;
+      return symbolsOverride ?? [];
     }
-    const loadSymbols = async () => {
-      try {
-        const response = await fetch("/api/symbols");
-        const payload = await response.json();
-        const items = Array.isArray(payload.items) ? payload.items : [];
-        setSymbols(items);
-        if (typeof window === "undefined") return;
-        const saved = window.localStorage.getItem(SYMBOL_STORAGE_KEY);
-        if (saved && items.includes(saved)) {
-          setSymbol(saved);
-        } else if (items.length) {
-          setSymbol(items[0]);
-        }
-      } catch {
-        setSymbols([]);
+    try {
+      const response = await fetch("/api/symbols");
+      const payload = await response.json();
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      setSymbols(items);
+      if (typeof window === "undefined") return items;
+      const saved = window.localStorage.getItem(SYMBOL_STORAGE_KEY);
+      if (saved && items.includes(saved)) {
+        setSymbol(saved);
+      } else if (items.length) {
+        setSymbol(items[0]);
       }
-    };
+      return items;
+    } catch {
+      setSymbols([]);
+      return [];
+    }
+  };
+
+  useEffect(() => {
     loadSymbols();
   }, [isSymbolsControlled, symbolsOverride]);
 
@@ -100,12 +104,20 @@ export function ScenariosSection({
   const activeScenario = scenarios.find((item) => item.id === active) ?? scenarios[0];
   const activeValues = valuesMap[activeScenario.id];
 
-  const specPreview = useMemo(() => {
+  // Tri-state: { spec } → valid; { error } → buildSpec rejected the form values;
+  // { notReady: true } → waiting on a ticker selection. Previously all three collapsed
+  // to "Invalid parameters." which misled users into hunting for form mistakes
+  // when the real issue was "no ticker downloaded yet."
+  const specPreview = useMemo<
+    | { spec: ReturnType<typeof activeScenario.buildSpec> }
+    | { error: string }
+    | { notReady: true }
+  >(() => {
+    if (!effectiveSymbol) return { notReady: true };
     try {
-      if (!effectiveSymbol) return null;
-      return activeScenario.buildSpec(activeValues, 60, effectiveSymbol);
-    } catch {
-      return null;
+      return { spec: activeScenario.buildSpec(activeValues, 60, effectiveSymbol) };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
     }
   }, [activeScenario, activeValues, effectiveSymbol]);
 
@@ -183,8 +195,18 @@ export function ScenariosSection({
       </div>
 
       {effectiveSymbols.length === 0 && (
-        <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600">
-          No tickers downloaded yet. Add one on the Dashboard to run scenarios.
+        <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-3 space-y-2">
+          <div className="text-sm text-zinc-600">No tickers downloaded yet.</div>
+          <TickerDownloader
+            hint="Pick any US ticker — pulls ~60d OHLC and enables every scenario."
+            onDownloaded={async (sym) => {
+              const items = await loadSymbols();
+              if (!isSymbolControlled && items.includes(sym)) {
+                setSymbol(sym);
+                onSymbolChange?.(sym);
+              }
+            }}
+          />
         </div>
       )}
 
@@ -203,10 +225,13 @@ export function ScenariosSection({
               <Card>
                 <CardHeader>
                   <CardTitle className="text-lg">{scenario.name}</CardTitle>
-                  <CardDescription>
+                  {/* Using a plain div instead of CardDescription (which is a <p>)
+                      because nested <div> inside <p> is invalid HTML and produces
+                      a hydration error. */}
+                  <div className="text-sm text-zinc-500">
                     <div>{scenario.description_en}</div>
                     <div>{scenario.description_ru}</div>
-                  </CardDescription>
+                  </div>
                 </CardHeader>
                 <CardContent className="space-y-4">
                   {scenario.riskWarning && (
@@ -277,9 +302,20 @@ export function ScenariosSection({
                     <div className="mb-2 text-xs font-semibold text-zinc-600">
                       StrategySpec preview
                     </div>
-                    <pre className="whitespace-pre-wrap">
-                      {specPreview ? JSON.stringify(specPreview, null, 2) : "Invalid parameters."}
-                    </pre>
+                    {"spec" in specPreview && (
+                      <pre className="whitespace-pre-wrap">{JSON.stringify(specPreview.spec, null, 2)}</pre>
+                    )}
+                    {"error" in specPreview && (
+                      <div className="text-rose-600">
+                        <div className="font-semibold mb-1">Invalid parameters</div>
+                        <div className="font-mono text-[11px]">{specPreview.error}</div>
+                      </div>
+                    )}
+                    {"notReady" in specPreview && (
+                      <div className="text-zinc-500 italic">
+                        Select a ticker above to preview the StrategySpec.
+                      </div>
+                    )}
                   </div>
                 </CardContent>
               </Card>

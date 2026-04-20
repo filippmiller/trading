@@ -16,16 +16,28 @@ type Defaults = {
 
 export default function SettingsPage() {
   const [defaults, setDefaults] = useState<Defaults | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
-  useEffect(() => {
-    const load = async () => {
+  // Previous version silently hung on "Loading..." whenever the DB tunnel dropped —
+  // fetch rejected, nothing caught it, user never knew. Now any failure surfaces
+  // an actionable error state with a retry button instead of an infinite spinner.
+  const loadDefaults = async () => {
+    setLoadError(null);
+    try {
       const response = await fetch("/api/settings");
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json();
+      if (!payload?.defaults) throw new Error("Malformed response: missing `defaults` key");
       setDefaults(payload.defaults);
-    };
-    load();
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  useEffect(() => {
+    loadDefaults();
   }, []);
 
   const updateField = (key: keyof Defaults, value: number) => {
@@ -50,7 +62,27 @@ export default function SettingsPage() {
     }
   };
 
-  if (!defaults) return <div>Loading...</div>;
+  if (loadError) {
+    return (
+      <Card className="max-w-xl">
+        <CardHeader>
+          <CardTitle className="text-rose-600">Failed to load settings</CardTitle>
+          <CardDescription className="font-mono text-xs">{loadError}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Button onClick={loadDefaults}>Retry</Button>
+        </CardContent>
+      </Card>
+    );
+  }
+  if (!defaults) {
+    return (
+      <div className="flex items-center gap-3 text-zinc-500 text-sm">
+        <div className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+        Loading settings…
+      </div>
+    );
+  }
 
   return (
     <Card>

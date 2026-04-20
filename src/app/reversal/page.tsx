@@ -37,7 +37,11 @@ export default function ReversalDashboard() {
   const [settings, setSettings] = useState<ReversalSettings>(DEFAULT_SETTINGS);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<'active' | 'history' | 'matrix'>('active');
+  const [view, setView] = useState<'active' | 'history' | 'matrix'>(() => {
+    if (typeof window === 'undefined') return 'active';
+    const q = new URLSearchParams(window.location.search).get('view');
+    return q === 'matrix' || q === 'history' ? q : 'active';
+  });
 
   // ... (rest of loadData and runSync)
 
@@ -330,10 +334,32 @@ function addBusinessDays(dateStr: string, days: number): string {
 }
 
 function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], settings: any }) {
-  // Group by cohort_date, newest first
-  const grouped = useMemo(() => {
-    const map: Record<string, ReversalEntry[]> = {};
+  const [sideFilter, setSideFilter] = useState<'all' | 'gainers' | 'losers'>(() => {
+    if (typeof window === 'undefined') return 'all';
+    const q = new URLSearchParams(window.location.search).get('filter');
+    return q === 'gainers' || q === 'losers' ? q : 'all';
+  });
+
+  // Totals across all cohorts (for toggle labels — these don't shift when the filter changes)
+  const totals = useMemo(() => {
+    let gainers = 0;
+    let losers = 0;
     for (const e of entries) {
+      if (e.day_change_pct > 0) gainers++;
+      else if (e.day_change_pct < 0) losers++;
+    }
+    return { all: entries.length, gainers, losers };
+  }, [entries]);
+
+  // Group by cohort_date, newest first — apply gainer/loser filter before grouping
+  const grouped = useMemo(() => {
+    const filtered = entries.filter(e => {
+      if (sideFilter === 'gainers') return e.day_change_pct > 0;
+      if (sideFilter === 'losers') return e.day_change_pct < 0;
+      return true;
+    });
+    const map: Record<string, ReversalEntry[]> = {};
+    for (const e of filtered) {
       const d = typeof e.cohort_date === 'string' ? e.cohort_date.slice(0, 10) : new Date(e.cohort_date).toISOString().slice(0, 10);
       (map[d] ??= []).push(e);
     }
@@ -342,20 +368,50 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
       arr.sort((a, b) => Math.abs(b.day_change_pct) - Math.abs(a.day_change_pct));
     }
     return Object.entries(map).sort(([a], [b]) => b.localeCompare(a));
-  }, [entries]);
+  }, [entries, sideFilter]);
 
   // Use the first cohort date for header dates (they shift per cohort, but header is generic)
   const refDate = grouped[0]?.[0] || new Date().toISOString().slice(0, 10);
 
   return (
     <Card className="border-none shadow-xl ring-1 ring-zinc-200/50 overflow-hidden">
-      <div className="text-[9px] text-zinc-400 px-3 py-1.5 bg-zinc-50 border-b border-zinc-100 flex gap-4">
-        <span>Values = <b className="text-zinc-600">% change from entry price</b> (positive = profitable for the direction)</span>
-        <span>M = <b className="text-zinc-600">Morning open +5min</b></span>
-        <span>D = <b className="text-zinc-600">Midday</b></span>
-        <span>E = <b className="text-zinc-600">Evening close</b></span>
-        <span className="inline-block w-3 h-3 rounded" style={{ backgroundColor: 'rgba(16,185,129,0.25)' }} /> = profit
-        <span className="inline-block w-3 h-3 rounded" style={{ backgroundColor: 'rgba(239,68,68,0.25)' }} /> = loss
+      <div className="px-3 py-2 bg-zinc-50 border-b border-zinc-100 flex items-center justify-between gap-4 flex-wrap">
+        <div className="inline-flex items-center gap-1 rounded-lg bg-white ring-1 ring-zinc-200 p-0.5">
+          {([
+            { key: 'all', label: 'All', count: totals.all, dot: 'bg-zinc-400' },
+            { key: 'gainers', label: 'Gainers', count: totals.gainers, dot: 'bg-emerald-500' },
+            { key: 'losers', label: 'Losers', count: totals.losers, dot: 'bg-rose-500' },
+          ] as const).map(opt => (
+            <button
+              key={opt.key}
+              onClick={() => setSideFilter(opt.key)}
+              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-semibold tracking-wide transition-all ${
+                sideFilter === opt.key
+                  ? 'bg-zinc-900 text-white shadow-sm'
+                  : 'text-zinc-500 hover:text-zinc-800'
+              }`}
+              title={opt.key === 'gainers'
+                ? 'Tickers that moved UP on the trigger day (day_change_pct > 0)'
+                : opt.key === 'losers'
+                ? 'Tickers that moved DOWN on the trigger day (day_change_pct < 0)'
+                : 'All enrolled tickers'}
+            >
+              <span className={`inline-block w-1.5 h-1.5 rounded-full ${opt.dot}`} />
+              <span>{opt.label}</span>
+              <span className={`text-[10px] font-mono ${sideFilter === opt.key ? 'text-zinc-400' : 'text-zinc-400'}`}>
+                {opt.count}
+              </span>
+            </button>
+          ))}
+        </div>
+        <div className="text-[9px] text-zinc-400 flex gap-4 flex-wrap">
+          <span>Values = <b className="text-zinc-600">% change from entry price</b> (positive = profitable for the direction)</span>
+          <span>M = <b className="text-zinc-600">Morning open +5min</b></span>
+          <span>D = <b className="text-zinc-600">Midday</b></span>
+          <span>E = <b className="text-zinc-600">Evening close</b></span>
+          <span className="inline-block w-3 h-3 rounded" style={{ backgroundColor: 'rgba(16,185,129,0.25)' }} /> = profit
+          <span className="inline-block w-3 h-3 rounded" style={{ backgroundColor: 'rgba(239,68,68,0.25)' }} /> = loss
+        </div>
       </div>
       <div className="overflow-auto" style={{ maxHeight: 'calc(100vh - 160px)' }}>
         <table className="border-collapse text-xs" style={{ minWidth: '2400px' }}>
@@ -384,6 +440,18 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
             </tr>
           </thead>
           <tbody>
+            {grouped.length === 0 && (
+              <tr>
+                <td colSpan={33} className="px-6 py-16 text-center text-zinc-400 text-xs">
+                  No {sideFilter === 'gainers' ? 'gainers' : sideFilter === 'losers' ? 'losers' : 'entries'} in the current data.
+                  {sideFilter !== 'all' && (
+                    <button onClick={() => setSideFilter('all')} className="ml-2 underline text-zinc-600 hover:text-zinc-900">
+                      Show all
+                    </button>
+                  )}
+                </td>
+              </tr>
+            )}
             {grouped.map(([date, group]) => (
               <React.Fragment key={date}>
                 <tr className="bg-zinc-100">
