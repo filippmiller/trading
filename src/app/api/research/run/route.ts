@@ -1,6 +1,26 @@
 import { NextResponse } from "next/server";
 import { ensureSchema } from "@/lib/migrations";
-import { runScenario, type ScenarioFilters, type TradeParams, type CostParams } from "@/lib/scenario-simulator";
+import { BAR_TIMES, runScenario, type ScenarioFilters, type TradeParams, type CostParams } from "@/lib/scenario-simulator";
+
+function describeError(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === "object" && err !== null) {
+    const maybe = err as {
+      code?: unknown;
+      errno?: unknown;
+      sqlMessage?: unknown;
+      cause?: unknown;
+    };
+    const parts = [
+      typeof maybe.code === "string" ? maybe.code : null,
+      typeof maybe.errno === "number" ? `errno ${maybe.errno}` : null,
+      typeof maybe.sqlMessage === "string" && maybe.sqlMessage.length > 0 ? maybe.sqlMessage : null,
+      maybe.cause instanceof Error && maybe.cause.message ? maybe.cause.message : null,
+    ].filter(Boolean);
+    if (parts.length > 0) return parts.join(" | ");
+  }
+  return String(err);
+}
 
 type RequestBody = {
   filters?: ScenarioFilters;
@@ -35,17 +55,28 @@ export async function POST(req: Request) {
     if (!trade.exit || typeof trade.exit.holdDays !== "number" || trade.exit.holdDays < 1 || trade.exit.holdDays > 10) {
       return NextResponse.json({ error: "exit.holdDays must be 1..10 (d1..d10)" }, { status: 400 });
     }
+    if (trade.exit.exitBar != null && !BAR_TIMES.includes(trade.exit.exitBar)) {
+      return NextResponse.json({ error: "exit.exitBar must be morning, midday, or close" }, { status: 400 });
+    }
     if (trade.exit.kind !== "TIME" && trade.exit.kind !== "STOP") {
       return NextResponse.json({ error: "exit.kind must be TIME or STOP" }, { status: 400 });
     }
     if (trade.tradeDirection !== "LONG" && trade.tradeDirection !== "SHORT") {
       return NextResponse.json({ error: "tradeDirection must be LONG or SHORT" }, { status: 400 });
     }
+    if (trade.entryBar != null && !BAR_TIMES.includes(trade.entryBar)) {
+      return NextResponse.json({ error: "entryBar must be morning, midday, or close" }, { status: 400 });
+    }
+    if (trade.entryDelayDays != null && (!Number.isInteger(trade.entryDelayDays) || trade.entryDelayDays < 0 || trade.entryDelayDays >= trade.exit.holdDays)) {
+      return NextResponse.json({ error: "entryDelayDays must be an integer >= 0 and < exit.holdDays" }, { status: 400 });
+    }
+    if (trade.exit.hardStopPct != null && trade.exit.hardStopPct > 0) {
+      return NextResponse.json({ error: "exit.hardStopPct must be <= 0" }, { status: 400 });
+    }
 
     const result = await runScenario(filters, trade, costs);
     return NextResponse.json(result);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return NextResponse.json({ error: describeError(err) }, { status: 500 });
   }
 }

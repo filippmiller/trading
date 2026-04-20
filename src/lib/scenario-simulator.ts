@@ -16,6 +16,7 @@ export type ScenarioFilters = {
 };
 
 export type BarTime = "morning" | "midday" | "close";
+export const BAR_TIMES: readonly BarTime[] = ["morning", "midday", "close"] as const;
 
 export type ExitStrategy = {
   kind: "TIME" | "STOP";
@@ -115,7 +116,7 @@ function dCol(n: number, bar: BarTime = "close"): string {
 const ALL_BAR_COLS: Array<{ col: string; day: number; bar: BarTime }> = (() => {
   const out: Array<{ col: string; day: number; bar: BarTime }> = [];
   for (let d = 1; d <= 10; d++) {
-    for (const b of ["morning", "midday", "close"] as const) {
+    for (const b of BAR_TIMES) {
       out.push({ col: `d${d}_${b}`, day: d, bar: b });
     }
   }
@@ -248,6 +249,23 @@ export async function runScenario(
   if (trade.investmentUsd <= 0) throw new Error("investmentUsd must be > 0");
   if (trade.leverage < 1 || trade.leverage > 100) throw new Error("leverage must be 1..100");
   if (trade.exit.holdDays < 1 || trade.exit.holdDays > 10) throw new Error("exit.holdDays must be 1..10");
+  if (trade.exit.exitBar != null && !BAR_TIMES.includes(trade.exit.exitBar)) {
+    throw new Error("exit.exitBar must be morning, midday, or close");
+  }
+  if (trade.entryBar != null && !BAR_TIMES.includes(trade.entryBar)) {
+    throw new Error("entryBar must be morning, midday, or close");
+  }
+  if (trade.entryDelayDays != null) {
+    if (!Number.isInteger(trade.entryDelayDays) || trade.entryDelayDays < 0 || trade.entryDelayDays > 9) {
+      throw new Error("entryDelayDays must be an integer 0..9");
+    }
+    if (trade.entryDelayDays >= trade.exit.holdDays) {
+      throw new Error("entryDelayDays must be < exit.holdDays");
+    }
+  }
+  if (trade.exit.hardStopPct != null && trade.exit.hardStopPct > 0) {
+    throw new Error("exit.hardStopPct must be <= 0");
+  }
 
   const pool = await getPool();
 
@@ -299,7 +317,7 @@ export async function runScenario(
   // every intraday tick and the entryDelay path can use any bar as entry.
   const dayCols: string[] = [];
   for (let d = 1; d <= trade.exit.holdDays; d++) {
-    for (const b of ["morning", "midday", "close"] as const) dayCols.push(`d${d}_${b}`);
+    for (const b of BAR_TIMES) dayCols.push(`d${d}_${b}`);
   }
   const selectCols = [
     "id", "symbol", "cohort_date", "direction", "day_change_pct", "entry_price",
@@ -330,6 +348,26 @@ export async function runScenario(
       const delayedRaw = r[`d${delay}_${entryBar}`];
       if (delayedRaw == null) {
         skippedNoData++;
+        trades.push({
+          entryId: Number(r.id),
+          symbol: String(r.symbol),
+          cohortDate: cohortStr,
+          coohortDirection: String(r.direction),
+          dayChangePct: Number(r.day_change_pct),
+          consecutiveDays: r.consecutive_days != null ? Number(r.consecutive_days) : null,
+          enrollmentSource: String(r.enrollment_source),
+          tradeDirection: trade.tradeDirection,
+          entryPrice,
+          exitPrice: null,
+          exitDay: null,
+          exitReason: "DATA_MISSING",
+          holdDays: trade.exit.holdDays,
+          rawPnlUsd: 0,
+          commissionUsd: 0,
+          interestUsd: 0,
+          netPnlUsd: 0,
+          netPnlPct: 0,
+        });
         continue;
       }
       entryPrice = Number(delayedRaw);
@@ -564,6 +602,63 @@ export type GridSweepResult = {
   sampleSize: number;    // how many DB entries the filter matched
 };
 
+type GridSweepCombo = {
+  holdDays: number;
+  exitBar: BarTime;
+  entryDelayDays: number;
+  entryBar: BarTime;
+  hardStopPct: number | null;
+  takeProfitPct: number | null;
+  trailingStopPct: number | null;
+  breakevenAtPct: number | null;
+};
+
+export function buildGridSweepCombos(trade: GridSweepRequest["trade"]): GridSweepCombo[] {
+  const nullableAxis = <T>(a: GridAxis<T | null> | undefined, fallback: (T | null)[]) =>
+    (a?.values ?? fallback);
+
+  const holdValues = trade.holdDays.values;
+  const exitBarValues = trade.exitBar.values;
+  const entryDelayValues = trade.entryDelayDays?.values ?? [0];
+  const entryBarValues = trade.entryBar?.values ?? ["close" as BarTime];
+  const slValues = nullableAxis(trade.hardStopPct, [null]);
+  const tpValues = nullableAxis(trade.takeProfitPct, [null]);
+  const trailValues = nullableAxis(trade.trailingStopPct, [null]);
+  const beValues = nullableAxis(trade.breakevenAtPct, [null]);
+
+  const combos: GridSweepCombo[] = [];
+  for (const hd of holdValues) {
+    for (const eb of exitBarValues) {
+      for (const ed of entryDelayValues) {
+        if (ed >= hd) continue;
+        const effectiveEntryBars = ed > 0 ? entryBarValues : (["close"] as const);
+        for (const enb of effectiveEntryBars) {
+          for (const sl of slValues) {
+            for (const tp of tpValues) {
+              for (const tr of trailValues) {
+                for (const be of beValues) {
+                  combos.push({
+                    holdDays: hd,
+                    exitBar: eb,
+                    entryDelayDays: ed,
+                    entryBar: enb,
+                    hardStopPct: sl,
+                    takeProfitPct: tp,
+                    trailingStopPct: tr,
+                    breakevenAtPct: be,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return combos;
+}
+
 export async function runGridSweep(req: GridSweepRequest): Promise<GridSweepResult> {
   const pool = await getPool();
 
@@ -602,48 +697,7 @@ export async function runGridSweep(req: GridSweepRequest): Promise<GridSweepResu
   const [rows] = await pool.execute<mysql.RowDataPacket[]>(sql, params);
 
   // Build all combinations of the grid axes.
-  const axes = req.trade;
-  const nullableAxis = <T>(a: GridAxis<T | null> | undefined, fallback: (T | null)[]) =>
-    (a?.values ?? fallback);
-
-  const holdValues = axes.holdDays.values;
-  const exitBarValues = axes.exitBar.values;
-  const entryDelayValues = (axes.entryDelayDays?.values ?? [0]);
-  const entryBarValues = (axes.entryBar?.values ?? ["close" as BarTime]);
-  const slValues = nullableAxis(axes.hardStopPct, [null]);
-  const tpValues = nullableAxis(axes.takeProfitPct, [null]);
-  const trailValues = nullableAxis(axes.trailingStopPct, [null]);
-  const beValues = nullableAxis(axes.breakevenAtPct, [null]);
-
-  const combos: Array<{
-    holdDays: number; exitBar: BarTime;
-    entryDelayDays: number; entryBar: BarTime;
-    hardStopPct: number | null; takeProfitPct: number | null;
-    trailingStopPct: number | null; breakevenAtPct: number | null;
-  }> = [];
-  for (const hd of holdValues) {
-    for (const eb of exitBarValues) {
-      for (const ed of entryDelayValues) {
-        for (const enb of entryBarValues) {
-          for (const sl of slValues) {
-            for (const tp of tpValues) {
-              for (const tr of trailValues) {
-                for (const be of beValues) {
-                  if (ed >= hd) continue; // nonsensical: delay must be < hold
-                  combos.push({
-                    holdDays: hd, exitBar: eb,
-                    entryDelayDays: ed, entryBar: enb,
-                    hardStopPct: sl, takeProfitPct: tp,
-                    trailingStopPct: tr, breakevenAtPct: be,
-                  });
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  const combos = buildGridSweepCombos(req.trade);
 
   const borrowed = req.trade.investmentUsd * (req.trade.leverage - 1);
   const dailyInterest = borrowed * (req.costs.marginApyPct / 100) / 252;

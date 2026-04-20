@@ -3,6 +3,12 @@
 import { useState } from "react";
 
 type BarTime = "morning" | "midday" | "close";
+const BAR_TIMES: readonly BarTime[] = ["morning", "midday", "close"] as const;
+const BAR_LABELS: Record<BarTime, string> = {
+  morning: "AM",
+  midday: "MD",
+  close: "CL",
+};
 
 type GridRow = {
   holdDays: number;
@@ -32,12 +38,15 @@ type GridResult = {
 };
 
 type Filters = {
+  cohortDateFrom?: string;
+  cohortDateTo?: string;
   direction?: "UP" | "DOWN" | "BOTH";
   minDayChangePct?: number;
   maxDayChangePct?: number;
   minStreak?: number;
   maxStreak?: number;
   enrollmentSources?: Array<"MOVERS" | "TREND">;
+  symbols?: string[];
 };
 
 type Preset = {
@@ -46,6 +55,7 @@ type Preset = {
   holdDays: number[];
   exitBar: BarTime[];
   entryDelayDays: number[];
+  entryBar: BarTime[];
   hardStopPct: (number | null)[];
   takeProfitPct: (number | null)[];
   trailingStopPct: (number | null)[];
@@ -59,6 +69,7 @@ const PRESETS: Preset[] = [
     holdDays: [1, 2, 3, 5],
     exitBar: ["morning", "midday", "close"],
     entryDelayDays: [0],
+    entryBar: ["close"],
     hardStopPct: [null],
     takeProfitPct: [null],
     trailingStopPct: [null],
@@ -70,6 +81,7 @@ const PRESETS: Preset[] = [
     holdDays: [2, 3, 5],
     exitBar: ["close"],
     entryDelayDays: [0],
+    entryBar: ["close"],
     hardStopPct: [null],
     takeProfitPct: [null],
     trailingStopPct: [null, 3, 5, 10, 15],
@@ -81,7 +93,8 @@ const PRESETS: Preset[] = [
     holdDays: [1],
     exitBar: ["close"],
     entryDelayDays: [0],
-    hardStopPct: [null, 3, 5, 10],
+    entryBar: ["close"],
+    hardStopPct: [null, -3, -5, -10],
     takeProfitPct: [null, 5, 10, 20],
     trailingStopPct: [null],
     breakevenAtPct: [null],
@@ -92,6 +105,7 @@ const PRESETS: Preset[] = [
     holdDays: [3, 5],
     exitBar: ["close"],
     entryDelayDays: [0, 1, 2],
+    entryBar: ["morning", "midday", "close"],
     hardStopPct: [null],
     takeProfitPct: [null],
     trailingStopPct: [null, 5, 10],
@@ -103,7 +117,8 @@ const PRESETS: Preset[] = [
     holdDays: [1, 2, 3, 5, 10],
     exitBar: ["morning", "midday", "close"],
     entryDelayDays: [0, 1, 2],
-    hardStopPct: [null, 5, 10],
+    entryBar: ["morning", "midday", "close"],
+    hardStopPct: [null, -5, -10],
     takeProfitPct: [null, 10, 20],
     trailingStopPct: [null, 5, 10, 15],
     breakevenAtPct: [null, 3, 5],
@@ -128,6 +143,7 @@ export function GridSweepSection(props: Props) {
   const run = async () => {
     setLoading(true);
     setError(null);
+    setResult(null);
     try {
       const body = {
         filters: props.filters,
@@ -138,6 +154,7 @@ export function GridSweepSection(props: Props) {
           holdDays: { values: preset.holdDays },
           exitBar: { values: preset.exitBar },
           entryDelayDays: { values: preset.entryDelayDays },
+          entryBar: { values: preset.entryBar },
           hardStopPct: { values: preset.hardStopPct },
           takeProfitPct: { values: preset.takeProfitPct },
           trailingStopPct: { values: preset.trailingStopPct },
@@ -162,14 +179,7 @@ export function GridSweepSection(props: Props) {
     }
   };
 
-  const combos =
-    preset.holdDays.length *
-    preset.exitBar.length *
-    preset.entryDelayDays.length *
-    preset.hardStopPct.length *
-    preset.takeProfitPct.length *
-    preset.trailingStopPct.length *
-    preset.breakevenAtPct.length;
+  const combos = countCombos(preset);
 
   const fmtNum = (v: number | null) => (v == null ? "—" : `${v}%`);
 
@@ -203,13 +213,14 @@ export function GridSweepSection(props: Props) {
       <details className="text-xs">
         <summary className="cursor-pointer text-zinc-600 hover:text-zinc-900 select-none">Edit axis values (advanced)</summary>
         <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-3 p-3 bg-zinc-50 rounded-lg">
-          <AxisEditor label="Hold days" value={preset.holdDays} onChange={(v) => setPreset({ ...preset, holdDays: v as number[] })} />
-          <AxisEditor label="Exit bar" value={preset.exitBar} onChange={(v) => setPreset({ ...preset, exitBar: v as BarTime[] })} isString />
-          <AxisEditor label="Entry delay (days)" value={preset.entryDelayDays} onChange={(v) => setPreset({ ...preset, entryDelayDays: v as number[] })} />
-          <AxisEditor label="Hard stop %" value={preset.hardStopPct} onChange={(v) => setPreset({ ...preset, hardStopPct: v as (number | null)[] })} allowNull />
-          <AxisEditor label="Take profit %" value={preset.takeProfitPct} onChange={(v) => setPreset({ ...preset, takeProfitPct: v as (number | null)[] })} allowNull />
-          <AxisEditor label="Trailing %" value={preset.trailingStopPct} onChange={(v) => setPreset({ ...preset, trailingStopPct: v as (number | null)[] })} allowNull />
-          <AxisEditor label="Breakeven at %" value={preset.breakevenAtPct} onChange={(v) => setPreset({ ...preset, breakevenAtPct: v as (number | null)[] })} allowNull />
+          <AxisEditor key={axisKey("holdDays", preset.holdDays)} label="Hold days" value={preset.holdDays} onChange={(v) => setPreset({ ...preset, holdDays: v as number[] })} />
+          <AxisEditor key={axisKey("exitBar", preset.exitBar)} label="Exit bar" value={preset.exitBar} onChange={(v) => setPreset({ ...preset, exitBar: v as BarTime[] })} allowedStrings={BAR_TIMES} />
+          <AxisEditor key={axisKey("entryDelayDays", preset.entryDelayDays)} label="Entry delay (days)" value={preset.entryDelayDays} onChange={(v) => setPreset({ ...preset, entryDelayDays: v as number[] })} />
+          <AxisEditor key={axisKey("entryBar", preset.entryBar)} label="Entry bar" value={preset.entryBar} onChange={(v) => setPreset({ ...preset, entryBar: v as BarTime[] })} allowedStrings={BAR_TIMES} />
+          <AxisEditor key={axisKey("hardStopPct", preset.hardStopPct)} label="Hard stop % (use negatives)" value={preset.hardStopPct} onChange={(v) => setPreset({ ...preset, hardStopPct: v as (number | null)[] })} allowNull />
+          <AxisEditor key={axisKey("takeProfitPct", preset.takeProfitPct)} label="Take profit %" value={preset.takeProfitPct} onChange={(v) => setPreset({ ...preset, takeProfitPct: v as (number | null)[] })} allowNull />
+          <AxisEditor key={axisKey("trailingStopPct", preset.trailingStopPct)} label="Trailing %" value={preset.trailingStopPct} onChange={(v) => setPreset({ ...preset, trailingStopPct: v as (number | null)[] })} allowNull />
+          <AxisEditor key={axisKey("breakevenAtPct", preset.breakevenAtPct)} label="Breakeven at %" value={preset.breakevenAtPct} onChange={(v) => setPreset({ ...preset, breakevenAtPct: v as (number | null)[] })} allowNull />
         </div>
       </details>
 
@@ -254,6 +265,7 @@ export function GridSweepSection(props: Props) {
                   <th className="px-2 py-2 text-right">Hold</th>
                   <th className="px-2 py-2 text-center">Exit bar</th>
                   <th className="px-2 py-2 text-right">Entry delay</th>
+                  <th className="px-2 py-2 text-center">Entry bar</th>
                   <th className="px-2 py-2 text-right">SL</th>
                   <th className="px-2 py-2 text-right">TP</th>
                   <th className="px-2 py-2 text-right">Trail</th>
@@ -273,8 +285,9 @@ export function GridSweepSection(props: Props) {
                   <tr key={i} className={`border-b border-zinc-100 hover:bg-violet-50/30 ${i === 0 ? "bg-emerald-50/30" : ""}`}>
                     <td className="px-3 py-1.5 font-mono text-zinc-500">{i + 1}</td>
                     <td className="px-2 py-1.5 text-right font-mono">{r.holdDays}d</td>
-                    <td className="px-2 py-1.5 text-center text-zinc-600">{r.exitBar[0].toUpperCase()}</td>
+                    <td className="px-2 py-1.5 text-center text-zinc-600">{BAR_LABELS[r.exitBar]}</td>
                     <td className="px-2 py-1.5 text-right font-mono">{r.entryDelayDays}d</td>
+                    <td className="px-2 py-1.5 text-center text-zinc-600">{r.entryDelayDays > 0 ? BAR_LABELS[r.entryBar] : "—"}</td>
                     <td className="px-2 py-1.5 text-right font-mono text-zinc-500">{fmtNum(r.hardStopPct)}</td>
                     <td className="px-2 py-1.5 text-right font-mono text-zinc-500">{fmtNum(r.takeProfitPct)}</td>
                     <td className="px-2 py-1.5 text-right font-mono text-zinc-500">{fmtNum(r.trailingStopPct)}</td>
@@ -287,7 +300,9 @@ export function GridSweepSection(props: Props) {
                     <td className={`px-2 py-1.5 text-right font-mono ${r.avgPnlPct >= 0 ? "text-emerald-700" : "text-rose-700"}`}>
                       {r.avgPnlPct >= 0 ? "+" : ""}{r.avgPnlPct.toFixed(1)}%
                     </td>
-                    <td className="px-2 py-1.5 text-right font-mono text-emerald-600">+{r.bestPct.toFixed(0)}%</td>
+                    <td className={`px-2 py-1.5 text-right font-mono ${r.bestPct >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                      {r.bestPct >= 0 ? "+" : ""}{r.bestPct.toFixed(0)}%
+                    </td>
                     <td className="px-2 py-1.5 text-right font-mono text-rose-600">{r.worstPct.toFixed(0)}%</td>
                     <td className="px-2 py-1.5 text-right font-mono">{isFinite(r.profitFactor) ? r.profitFactor.toFixed(2) : "∞"}</td>
                     <td className="px-2 py-1.5 text-right font-mono">{r.sharpeRatio.toFixed(2)}</td>
@@ -303,15 +318,20 @@ export function GridSweepSection(props: Props) {
 }
 
 function AxisEditor<T extends number | string | null>({
-  label, value, onChange, isString = false, allowNull = false,
+  label, value, onChange, allowNull = false, allowedStrings,
 }: {
-  label: string; value: T[]; onChange: (v: T[]) => void; isString?: boolean; allowNull?: boolean;
+  label: string;
+  value: T[];
+  onChange: (v: T[]) => void;
+  allowNull?: boolean;
+  allowedStrings?: readonly string[];
 }) {
   const [text, setText] = useState(value.map((v) => v == null ? "null" : String(v)).join(", "));
+
   const commit = (raw: string) => {
     const parsed = raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0).map((s) => {
       if (s === "null") return allowNull ? null : undefined;
-      if (isString) return s as unknown;
+      if (allowedStrings) return allowedStrings.includes(s) ? (s as unknown) : undefined;
       const n = Number(s);
       return isNaN(n) ? undefined : n;
     }).filter((v) => v !== undefined) as T[];
@@ -330,4 +350,38 @@ function AxisEditor<T extends number | string | null>({
       />
     </div>
   );
+}
+
+function countCombos(preset: Preset): number {
+  let count = 0;
+  for (const holdDays of preset.holdDays) {
+    for (const _exitBar of preset.exitBar) {
+      for (const entryDelayDays of preset.entryDelayDays) {
+        if (entryDelayDays >= holdDays) continue;
+        const entryBars = entryDelayDays > 0 ? preset.entryBar : ["close"];
+        for (const _entryBar of entryBars) {
+          for (const _hardStopPct of preset.hardStopPct) {
+            for (const _takeProfitPct of preset.takeProfitPct) {
+              for (const _trailingStopPct of preset.trailingStopPct) {
+                for (const _breakevenAtPct of preset.breakevenAtPct) {
+                  void _exitBar;
+                  void _entryBar;
+                  void _hardStopPct;
+                  void _takeProfitPct;
+                  void _trailingStopPct;
+                  void _breakevenAtPct;
+                  count++;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return count;
+}
+
+function axisKey(label: string, value: Array<number | string | null>): string {
+  return `${label}:${value.map((v) => v == null ? "null" : String(v)).join("|")}`;
 }

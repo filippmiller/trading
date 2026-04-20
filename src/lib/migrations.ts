@@ -271,6 +271,16 @@ async function runSchemaMigrations() {
   await ensureColumn("strategy_runs", "preset_name", "VARCHAR(64) NULL");
   await ensureColumn("reversal_entries", "consecutive_days", "INT NULL");
   await ensureColumn("reversal_entries", "cumulative_change_pct", "DECIMAL(10,4) NULL");
+  // Old surveillance runs could write duplicate (entry_id, field_name) rows.
+  // Deduplicate first so the unique key can be added safely on existing data.
+  await pool.execute(`
+    DELETE older
+    FROM surveillance_failures AS older
+    INNER JOIN surveillance_failures AS newer
+      ON older.entry_id = newer.entry_id
+     AND older.field_name = newer.field_name
+     AND older.id < newer.id
+  `);
   // Ensure unique constraint on surveillance_failures (matches init-db.sql)
   try {
     await pool.execute("ALTER TABLE surveillance_failures ADD UNIQUE KEY UX_fail_entry_field (entry_id, field_name)");
