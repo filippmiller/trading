@@ -15,15 +15,20 @@ export type ScenarioFilters = {
   symbols?: string[];        // optional: filter to these symbols only
 };
 
+export type BarTime = "morning" | "midday" | "close";
+export const BAR_TIMES: readonly BarTime[] = ["morning", "midday", "close"] as const;
+
 export type ExitStrategy = {
   kind: "TIME" | "STOP";
-  // TIME: sell at d{holdDays}_close. No stop/take/trail.
-  // STOP: walk through d1..holdDays close prices, exit when ANY condition triggers.
+  // TIME: sell at d{holdDays}_{exitBar}. No stop/take/trail.
+  // STOP: walk through bars up to holdDays, exit when ANY condition triggers.
   holdDays: number;             // 1..10. For TIME: exact exit. For STOP: max hold.
+  exitBar?: BarTime;            // "morning"|"midday"|"close" — defaults to "close" for TIME; STOP walks all 3 bars/day
   hardStopPct?: number;         // e.g. -5 → exit if direction-aware PnL <= -5
   takeProfitPct?: number;       // e.g. 8 → exit if direction-aware PnL >= 8
   trailingStopPct?: number;     // e.g. 3 → exit when price retraces 3% from best
   trailingActivateAtPct?: number; // activate trailing only after this much profit (default 0)
+  breakevenAtPct?: number;      // e.g. 3 → after +3% favorable, tighten SL to entry (belt-and-suspenders)
 };
 
 export type TradeParams = {
@@ -31,6 +36,8 @@ export type TradeParams = {
   leverage: number;          // 1, 5, 10, etc.
   tradeDirection: "LONG" | "SHORT";   // what we actually trade (independent of movers direction)
   exit: ExitStrategy;
+  entryDelayDays?: number;   // 0 = trigger-day close (default); 1..10 = enter at d{N}_close instead
+  entryBar?: BarTime;        // which bar of the entry-delay day to use (default: close)
 };
 
 export type CostParams = {
@@ -100,10 +107,21 @@ export type ScenarioResult = {
 
 // ─── Simulator ──────────────────────────────────────────────────────────────
 
-function dCol(n: number): string {
+function dCol(n: number, bar: BarTime = "close"): string {
   if (n < 1 || n > 10) throw new Error(`day must be 1..10, got ${n}`);
-  return `d${n}_close`;
+  return `d${n}_${bar}`;
 }
+
+// All column names for full intraday walk (3 bars × 10 days = 30 columns)
+const ALL_BAR_COLS: Array<{ col: string; day: number; bar: BarTime }> = (() => {
+  const out: Array<{ col: string; day: number; bar: BarTime }> = [];
+  for (let d = 1; d <= 10; d++) {
+    for (const b of BAR_TIMES) {
+      out.push({ col: `d${d}_${b}`, day: d, bar: b });
+    }
+  }
+  return out;
+})();
 
 /**
  * Walk through d1..dMax close prices for this entry. Evaluate exit rules at
@@ -115,45 +133,59 @@ function evaluateExitWalk(
   entryPrice: number,
   tradeDirection: "LONG" | "SHORT",
   leverage: number,
-  exit: ExitStrategy
+  exit: ExitStrategy,
+  startDay: number = 1  // begin evaluation from this day (supports entryDelay)
 ): { exitPrice: number | null; exitDay: number | null; reason: ExitReasonStr } {
   const isShort = tradeDirection === "SHORT";
   let maxPrice = entryPrice;  // best for LONG
   let minPrice = entryPrice;  // best for SHORT
   let trailActive = false;
   let trailStop: number | null = null;
+  let breakevenArmed = false;
   let lastAvailable: { price: number; day: number } | null = null;
 
-  for (let d = 1; d <= exit.holdDays; d++) {
-    const raw = row[dCol(d)];
+  // STOP mode walks every bar (M/D/E) to catch intraday trigger conditions.
+  // TIME mode still walks for data-fallback purposes but only exits at the target bar.
+  for (const { col, day } of ALL_BAR_COLS) {
+    if (day < startDay) continue;
+    if (day > exit.holdDays) break;
+    const raw = row[col];
     if (raw == null) continue;
     const price = Number(raw);
-    lastAvailable = { price, day: d };
+    lastAvailable = { price, day };
 
     if (price > maxPrice) maxPrice = price;
     if (price < minPrice) minPrice = price;
 
     if (exit.kind === "STOP") {
-      // Direction-aware PnL
       const rawPct = ((price - entryPrice) / entryPrice) * 100;
       const pnlPct = isShort ? -rawPct : rawPct;
 
-      // 1. Hard stop (typically negative: -5 means "exit if down 5%")
+      // 1. Breakeven arm — after reaching +X% favorable, any return to entry = exit.
+      //    Protects runners that gave back gains without needing a full trailing stop.
+      if (exit.breakevenAtPct != null && !breakevenArmed && pnlPct >= exit.breakevenAtPct) {
+        breakevenArmed = true;
+      }
+      if (breakevenArmed && pnlPct <= 0) {
+        return { exitPrice: price, exitDay: day, reason: "HARD_STOP" };
+      }
+
+      // 2. Hard stop (typically negative: -5 means "exit if down 5%")
       if (exit.hardStopPct != null && pnlPct <= exit.hardStopPct) {
-        return { exitPrice: price, exitDay: d, reason: "HARD_STOP" };
+        return { exitPrice: price, exitDay: day, reason: "HARD_STOP" };
       }
 
-      // 2. Leverage liquidation (down -90% or more of leveraged capital)
+      // 3. Leverage liquidation (down -90% or more of leveraged capital)
       if (leverage > 1 && pnlPct * leverage <= -90) {
-        return { exitPrice: price, exitDay: d, reason: "HARD_STOP" };
+        return { exitPrice: price, exitDay: day, reason: "HARD_STOP" };
       }
 
-      // 3. Take profit
+      // 4. Take profit
       if (exit.takeProfitPct != null && pnlPct >= exit.takeProfitPct) {
-        return { exitPrice: price, exitDay: d, reason: "TAKE_PROFIT" };
+        return { exitPrice: price, exitDay: day, reason: "TAKE_PROFIT" };
       }
 
-      // 4. Trailing stop
+      // 5. Trailing stop
       if (exit.trailingStopPct != null) {
         const activateAt = exit.trailingActivateAtPct ?? 0;
         if (!trailActive && pnlPct >= activateAt) {
@@ -164,18 +196,16 @@ function evaluateExitWalk(
         }
         if (trailActive) {
           if (isShort) {
-            // SHORT: best = minPrice. Stop goes above it. Tighter = lower.
             const newStop = minPrice * (1 + exit.trailingStopPct / 100);
             if (trailStop == null || newStop < trailStop) trailStop = newStop;
             if (trailStop != null && price >= trailStop) {
-              return { exitPrice: price, exitDay: d, reason: "TRAIL_STOP" };
+              return { exitPrice: price, exitDay: day, reason: "TRAIL_STOP" };
             }
           } else {
-            // LONG: best = maxPrice. Stop goes below. Tighter = higher.
             const newStop = maxPrice * (1 - exit.trailingStopPct / 100);
             if (trailStop == null || newStop > trailStop) trailStop = newStop;
             if (trailStop != null && price <= trailStop) {
-              return { exitPrice: price, exitDay: d, reason: "TRAIL_STOP" };
+              return { exitPrice: price, exitDay: day, reason: "TRAIL_STOP" };
             }
           }
         }
@@ -183,13 +213,13 @@ function evaluateExitWalk(
     }
   }
 
-  // TIME exit — use dMax's price if available, otherwise last price we saw.
-  const targetCol = row[dCol(exit.holdDays)];
-  if (targetCol != null) {
-    return { exitPrice: Number(targetCol), exitDay: exit.holdDays, reason: "TIME" };
+  // TIME exit — use d{holdDays}_{exitBar} price if available.
+  const exitBar = exit.exitBar ?? "close";
+  const targetRaw = row[dCol(exit.holdDays, exitBar)];
+  if (targetRaw != null) {
+    return { exitPrice: Number(targetRaw), exitDay: exit.holdDays, reason: "TIME" };
   }
   if (lastAvailable) {
-    // Partial data — exit at last known price (informational)
     return { exitPrice: lastAvailable.price, exitDay: lastAvailable.day, reason: "TIME" };
   }
   return { exitPrice: null, exitDay: null, reason: "DATA_MISSING" };
@@ -219,6 +249,23 @@ export async function runScenario(
   if (trade.investmentUsd <= 0) throw new Error("investmentUsd must be > 0");
   if (trade.leverage < 1 || trade.leverage > 100) throw new Error("leverage must be 1..100");
   if (trade.exit.holdDays < 1 || trade.exit.holdDays > 10) throw new Error("exit.holdDays must be 1..10");
+  if (trade.exit.exitBar != null && !BAR_TIMES.includes(trade.exit.exitBar)) {
+    throw new Error("exit.exitBar must be morning, midday, or close");
+  }
+  if (trade.entryBar != null && !BAR_TIMES.includes(trade.entryBar)) {
+    throw new Error("entryBar must be morning, midday, or close");
+  }
+  if (trade.entryDelayDays != null) {
+    if (!Number.isInteger(trade.entryDelayDays) || trade.entryDelayDays < 0 || trade.entryDelayDays > 9) {
+      throw new Error("entryDelayDays must be an integer 0..9");
+    }
+    if (trade.entryDelayDays >= trade.exit.holdDays) {
+      throw new Error("entryDelayDays must be < exit.holdDays");
+    }
+  }
+  if (trade.exit.hardStopPct != null && trade.exit.hardStopPct > 0) {
+    throw new Error("exit.hardStopPct must be <= 0");
+  }
 
   const pool = await getPool();
 
@@ -266,9 +313,12 @@ export async function runScenario(
     params.push(...filters.symbols);
   }
 
-  // Select all d1..d{holdDays} close columns so STOP walk can evaluate each.
+  // Select all d{1..holdDays} bar columns (M/D/E) so STOP walk can evaluate
+  // every intraday tick and the entryDelay path can use any bar as entry.
   const dayCols: string[] = [];
-  for (let d = 1; d <= trade.exit.holdDays; d++) dayCols.push(dCol(d));
+  for (let d = 1; d <= trade.exit.holdDays; d++) {
+    for (const b of BAR_TIMES) dayCols.push(`d${d}_${b}`);
+  }
   const selectCols = [
     "id", "symbol", "cohort_date", "direction", "day_change_pct", "entry_price",
     "consecutive_days", "enrollment_source",
@@ -286,10 +336,45 @@ export async function runScenario(
   let skippedNoData = 0;
 
   for (const r of rows) {
-    const entryPrice = Number(r.entry_price);
+    let entryPrice = Number(r.entry_price);
     const cohortStr = dateToStr(r.cohort_date);
 
-    const exitResult = evaluateExitWalk(r, entryPrice, trade.tradeDirection, trade.leverage, trade.exit);
+    // Entry-delay path: re-anchor entry to d{delay}_{entryBar} if requested.
+    // This lets users test "what if I wait N days before buying" — the core
+    // strategy search question.
+    const delay = trade.entryDelayDays ?? 0;
+    const entryBar = trade.entryBar ?? "close";
+    if (delay > 0) {
+      const delayedRaw = r[`d${delay}_${entryBar}`];
+      if (delayedRaw == null) {
+        skippedNoData++;
+        trades.push({
+          entryId: Number(r.id),
+          symbol: String(r.symbol),
+          cohortDate: cohortStr,
+          coohortDirection: String(r.direction),
+          dayChangePct: Number(r.day_change_pct),
+          consecutiveDays: r.consecutive_days != null ? Number(r.consecutive_days) : null,
+          enrollmentSource: String(r.enrollment_source),
+          tradeDirection: trade.tradeDirection,
+          entryPrice,
+          exitPrice: null,
+          exitDay: null,
+          exitReason: "DATA_MISSING",
+          holdDays: trade.exit.holdDays,
+          rawPnlUsd: 0,
+          commissionUsd: 0,
+          interestUsd: 0,
+          netPnlUsd: 0,
+          netPnlPct: 0,
+        });
+        continue;
+      }
+      entryPrice = Number(delayedRaw);
+    }
+    const walkStart = delay + 1;
+
+    const exitResult = evaluateExitWalk(r, entryPrice, trade.tradeDirection, trade.leverage, trade.exit, walkStart);
 
     if (exitResult.exitPrice == null || exitResult.exitDay == null) {
       skippedNoData++;
@@ -462,4 +547,242 @@ export async function runScenario(
   };
 
   return { trades, summary, equityCurve: curve };
+}
+
+// ─── Grid sweep ─────────────────────────────────────────────────────────────
+// Run all combinations of axis-ranges in a single SQL load + in-memory replay.
+// This is the core research primitive: one DB read, N simulations.
+
+export type GridAxis<T> = { values: T[] };
+
+export type GridSweepRequest = {
+  filters: ScenarioFilters;
+  trade: Omit<TradeParams, "exit" | "entryDelayDays" | "entryBar"> & {
+    // These three axes sweep; everything else stays fixed.
+    holdDays: GridAxis<number>;
+    exitBar: GridAxis<BarTime>;
+    entryDelayDays?: GridAxis<number>;
+    entryBar?: GridAxis<BarTime>;
+    hardStopPct?: GridAxis<number | null>;      // null = no hard stop
+    takeProfitPct?: GridAxis<number | null>;    // null = no take profit
+    trailingStopPct?: GridAxis<number | null>;  // null = no trailing
+    breakevenAtPct?: GridAxis<number | null>;   // null = no breakeven arm
+  };
+  costs: CostParams;
+  topN?: number;           // return top-N configs by totalPnl (default 20)
+  sortBy?: "totalPnl" | "winRate" | "sharpe" | "profitFactor";
+};
+
+export type GridSweepRow = {
+  // Axis values
+  holdDays: number;
+  exitBar: BarTime;
+  entryDelayDays: number;
+  entryBar: BarTime;
+  hardStopPct: number | null;
+  takeProfitPct: number | null;
+  trailingStopPct: number | null;
+  breakevenAtPct: number | null;
+  // Metrics
+  n: number;              // trades simulated
+  winRate: number;
+  totalPnlUsd: number;
+  avgPnlPct: number;
+  bestPct: number;
+  worstPct: number;
+  profitFactor: number;
+  sharpeRatio: number;
+  avgHoldDays: number;
+};
+
+export type GridSweepResult = {
+  totalCombinations: number;
+  evaluated: number;
+  rows: GridSweepRow[];  // sorted by sortBy, limited to topN
+  sampleSize: number;    // how many DB entries the filter matched
+};
+
+type GridSweepCombo = {
+  holdDays: number;
+  exitBar: BarTime;
+  entryDelayDays: number;
+  entryBar: BarTime;
+  hardStopPct: number | null;
+  takeProfitPct: number | null;
+  trailingStopPct: number | null;
+  breakevenAtPct: number | null;
+};
+
+export function buildGridSweepCombos(trade: GridSweepRequest["trade"]): GridSweepCombo[] {
+  const nullableAxis = <T>(a: GridAxis<T | null> | undefined, fallback: (T | null)[]) =>
+    (a?.values ?? fallback);
+
+  const holdValues = trade.holdDays.values;
+  const exitBarValues = trade.exitBar.values;
+  const entryDelayValues = trade.entryDelayDays?.values ?? [0];
+  const entryBarValues = trade.entryBar?.values ?? ["close" as BarTime];
+  const slValues = nullableAxis(trade.hardStopPct, [null]);
+  const tpValues = nullableAxis(trade.takeProfitPct, [null]);
+  const trailValues = nullableAxis(trade.trailingStopPct, [null]);
+  const beValues = nullableAxis(trade.breakevenAtPct, [null]);
+
+  const combos: GridSweepCombo[] = [];
+  for (const hd of holdValues) {
+    for (const eb of exitBarValues) {
+      for (const ed of entryDelayValues) {
+        if (ed >= hd) continue;
+        const effectiveEntryBars = ed > 0 ? entryBarValues : (["close"] as const);
+        for (const enb of effectiveEntryBars) {
+          for (const sl of slValues) {
+            for (const tp of tpValues) {
+              for (const tr of trailValues) {
+                for (const be of beValues) {
+                  combos.push({
+                    holdDays: hd,
+                    exitBar: eb,
+                    entryDelayDays: ed,
+                    entryBar: enb,
+                    hardStopPct: sl,
+                    takeProfitPct: tp,
+                    trailingStopPct: tr,
+                    breakevenAtPct: be,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return combos;
+}
+
+export async function runGridSweep(req: GridSweepRequest): Promise<GridSweepResult> {
+  const pool = await getPool();
+
+  // Load every candidate row ONCE (filter applied at SQL level).
+  const where: string[] = ["d1_morning IS NOT NULL", "entry_price > 0"];
+  const params: (string | number)[] = [];
+  const f = req.filters;
+  if (f.cohortDateFrom) { where.push("cohort_date >= ?"); params.push(f.cohortDateFrom); }
+  if (f.cohortDateTo)   { where.push("cohort_date <= ?"); params.push(f.cohortDateTo); }
+  if (f.direction === "UP")   where.push("day_change_pct > 0");
+  if (f.direction === "DOWN") where.push("day_change_pct < 0");
+  if (f.minDayChangePct != null) {
+    if (f.direction === "DOWN") { where.push("day_change_pct <= ?"); params.push(-f.minDayChangePct); }
+    else { where.push("day_change_pct >= ?"); params.push(f.minDayChangePct); }
+  }
+  if (f.maxDayChangePct != null) {
+    if (f.direction === "DOWN") { where.push("day_change_pct >= ?"); params.push(-f.maxDayChangePct); }
+    else { where.push("day_change_pct <= ?"); params.push(f.maxDayChangePct); }
+  }
+  if (f.minStreak != null) { where.push("consecutive_days >= ?"); params.push(f.minStreak); }
+  if (f.maxStreak != null) { where.push("consecutive_days <= ?"); params.push(f.maxStreak); }
+  if (f.enrollmentSources?.length) {
+    where.push(`enrollment_source IN (${f.enrollmentSources.map(() => "?").join(",")})`);
+    params.push(...f.enrollmentSources);
+  }
+  if (f.symbols?.length) {
+    where.push(`symbol IN (${f.symbols.map(() => "?").join(",")})`);
+    params.push(...f.symbols);
+  }
+
+  const allBarCols = ALL_BAR_COLS.map(b => b.col).join(", ");
+  const sql = `SELECT id, symbol, cohort_date, direction, day_change_pct, entry_price,
+                      consecutive_days, ${allBarCols}
+                 FROM reversal_entries WHERE ${where.join(" AND ")}
+                 ORDER BY cohort_date ASC, id ASC`;
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(sql, params);
+
+  // Build all combinations of the grid axes.
+  const combos = buildGridSweepCombos(req.trade);
+
+  const borrowed = req.trade.investmentUsd * (req.trade.leverage - 1);
+  const dailyInterest = borrowed * (req.costs.marginApyPct / 100) / 252;
+  const results: GridSweepRow[] = [];
+
+  for (const c of combos) {
+    const hasAnyStop = c.hardStopPct != null || c.takeProfitPct != null
+                    || c.trailingStopPct != null || c.breakevenAtPct != null;
+    const exit: ExitStrategy = {
+      kind: hasAnyStop ? "STOP" : "TIME",
+      holdDays: c.holdDays,
+      exitBar: c.exitBar,
+      hardStopPct: c.hardStopPct ?? undefined,
+      takeProfitPct: c.takeProfitPct ?? undefined,
+      trailingStopPct: c.trailingStopPct ?? undefined,
+      breakevenAtPct: c.breakevenAtPct ?? undefined,
+    };
+
+    let n = 0, wins = 0, totalUsd = 0;
+    let grossWins = 0, grossLosses = 0;
+    let bestPct = -Infinity, worstPct = Infinity;
+    const pctReturns: number[] = [];
+    let sumHold = 0;
+
+    for (const r of rows) {
+      let entryPrice = Number(r.entry_price);
+      if (c.entryDelayDays > 0) {
+        const v = r[`d${c.entryDelayDays}_${c.entryBar}`];
+        if (v == null) continue;
+        entryPrice = Number(v);
+      }
+      const walkStart = c.entryDelayDays + 1;
+      const exitResult = evaluateExitWalk(r, entryPrice, req.trade.tradeDirection, req.trade.leverage, exit, walkStart);
+      if (exitResult.exitPrice == null || exitResult.exitDay == null) continue;
+
+      const pnl = computePnL(entryPrice, exitResult.exitPrice, req.trade.investmentUsd, req.trade.leverage, req.trade.tradeDirection);
+      const commissionUsd = req.costs.commissionRoundTrip;
+      const interestUsd = dailyInterest * exitResult.exitDay;
+      const netPnlUsd = pnl.pnl_usd - commissionUsd - interestUsd;
+      const netPnlPct = (netPnlUsd / req.trade.investmentUsd) * 100;
+
+      n++;
+      totalUsd += netPnlUsd;
+      sumHold += exitResult.exitDay;
+      if (netPnlUsd > 0) { wins++; grossWins += netPnlUsd; }
+      else               { grossLosses += Math.abs(netPnlUsd); }
+      if (netPnlPct > bestPct)  bestPct = netPnlPct;
+      if (netPnlPct < worstPct) worstPct = netPnlPct;
+      pctReturns.push(netPnlPct);
+    }
+    if (n === 0) continue;
+
+    const winRate = (wins / n) * 100;
+    const avgPct = pctReturns.reduce((s, v) => s + v, 0) / n;
+    const variance = n > 1 ? pctReturns.reduce((s, v) => s + Math.pow(v - avgPct, 2), 0) / (n - 1) : 0;
+    const std = Math.sqrt(variance);
+    const avgHold = sumHold / n;
+    const sharpe = std > 0 ? (avgPct / std) * Math.sqrt(avgHold > 0 ? 252 / avgHold : 0) : 0;
+    const pf = grossLosses > 0 ? grossWins / grossLosses : (grossWins > 0 ? Infinity : 0);
+
+    results.push({
+      holdDays: c.holdDays, exitBar: c.exitBar,
+      entryDelayDays: c.entryDelayDays, entryBar: c.entryBar,
+      hardStopPct: c.hardStopPct, takeProfitPct: c.takeProfitPct,
+      trailingStopPct: c.trailingStopPct, breakevenAtPct: c.breakevenAtPct,
+      n, winRate, totalPnlUsd: totalUsd, avgPnlPct: avgPct,
+      bestPct: bestPct === -Infinity ? 0 : bestPct,
+      worstPct: worstPct === Infinity ? 0 : worstPct,
+      profitFactor: pf, sharpeRatio: sharpe, avgHoldDays: avgHold,
+    });
+  }
+
+  const sortBy = req.sortBy ?? "totalPnl";
+  results.sort((a, b) => {
+    if (sortBy === "winRate") return b.winRate - a.winRate;
+    if (sortBy === "sharpe") return b.sharpeRatio - a.sharpeRatio;
+    if (sortBy === "profitFactor") return (b.profitFactor === Infinity ? 999999 : b.profitFactor) - (a.profitFactor === Infinity ? 999999 : a.profitFactor);
+    return b.totalPnlUsd - a.totalPnlUsd;
+  });
+
+  const topN = req.topN ?? 20;
+  return {
+    totalCombinations: combos.length,
+    evaluated: results.length,
+    rows: results.slice(0, topN),
+    sampleSize: rows.length,
+  };
 }
