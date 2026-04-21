@@ -25,8 +25,15 @@ export async function GET() {
 
     const filled = await fillPendingOrders();
 
+    // Left join paper_strategies so the UI can render the strategy NAME
+    // (not just the denormalized VARCHAR label) for cron-generated trades.
+    // Manual trades have strategy_id=NULL so strategy_name stays NULL too.
     const [tradeRows] = await pool.execute<mysql.RowDataPacket[]>(
-      "SELECT * FROM paper_trades WHERE account_id = ? ORDER BY status ASC, created_at DESC",
+      `SELECT t.*, s.name AS strategy_name
+         FROM paper_trades t
+         LEFT JOIN paper_strategies s ON s.id = t.strategy_id
+        WHERE t.account_id = ?
+        ORDER BY t.status ASC, t.created_at DESC`,
       [account.id]
     );
 
@@ -70,6 +77,8 @@ export async function GET() {
         as_of: isOpen ? (live?.asOf?.toISOString() ?? null) : null,
         is_live: isOpen ? (live?.isLive ?? false) : true,
         strategy: r.strategy,
+        strategy_id: r.strategy_id != null ? Number(r.strategy_id) : null,
+        strategy_name: r.strategy_name ?? null,
         status: r.status,
         notes: r.notes,
         created_at: r.created_at,
@@ -98,10 +107,44 @@ export async function GET() {
       ? ((equity.equity - account.initial_cash) / account.initial_cash) * 100
       : 0;
 
+    // Win-rate math (W2, finding #14 + codex F3):
+    //
+    //   - `win_rate_pct` keeps its ORIGINAL denominator (`wins / closed_trades`)
+    //     for backward-compat. Any external consumer that joined the KPI to
+    //     `closed_trades` stays correct.
+    //   - `win_rate_excl_scratched_pct` is the new SCRATCHED-excluded variant
+    //     — the KPI we actually want to show in the UI, where a break-even
+    //     trade is treated as noise rather than a 0%-win dilution.
+    //   - profit_factor = gross_wins / |gross_losses|. If there were any
+    //     winning trades but no losers, returns `null` (JSON-safe sentinel
+    //     for infinity) — UI renders as "∞".
+    //   - scratched_count exposes the excluded count so UI can show
+    //     "X wins · Y losses · Z scratched" honestly.
     const closedTrades = tradeRows.filter(r => r.status === "CLOSED");
-    const wins = closedTrades.filter(r => Number(r.pnl_usd) > 0).length;
+    const scratchedCount = closedTrades.filter(r => Number(r.pnl_usd) === 0).length;
+    const nonScratched = closedTrades.filter(r => Number(r.pnl_usd) !== 0);
+    const wins = nonScratched.filter(r => Number(r.pnl_usd) > 0).length;
+    const losses = nonScratched.length - wins;
+    // Original (backward-compat) win rate: wins ÷ ALL closed trades.
     const winRate = closedTrades.length > 0 ? (wins / closedTrades.length) * 100 : 0;
+    // New (scratched-excluded) win rate: wins ÷ non-scratched closed trades.
+    const winRateExclScratched = nonScratched.length > 0 ? (wins / nonScratched.length) * 100 : 0;
     const realizedPnl = closedTrades.reduce((s, r) => s + Number(r.pnl_usd || 0), 0);
+
+    const grossWins = nonScratched
+      .filter(r => Number(r.pnl_usd) > 0)
+      .reduce((s, r) => s + Number(r.pnl_usd), 0);
+    const grossLosses = nonScratched
+      .filter(r => Number(r.pnl_usd) < 0)
+      .reduce((s, r) => s + Math.abs(Number(r.pnl_usd)), 0);
+    let profitFactor: number | null;
+    if (grossLosses > 0) {
+      profitFactor = grossWins / grossLosses;
+    } else if (grossWins > 0) {
+      profitFactor = null; // ∞ — all-winners case; UI renders "∞"
+    } else {
+      profitFactor = 0;    // no wins AND no losses (all scratched / empty)
+    }
 
     return NextResponse.json({
       account: {
@@ -116,8 +159,15 @@ export async function GET() {
         stale_positions: equity.stale_positions,
         total_return_pct: totalReturn,
         realized_pnl_usd: realizedPnl,
+        // Original (backward-compat) denominator = `closed_trades`.
         win_rate_pct: winRate,
+        // Scratched-excluded variant — prefer this in UI displays.
+        win_rate_excl_scratched_pct: winRateExclScratched,
         closed_trades: closedTrades.length,
+        wins_count: wins,
+        losses_count: losses,
+        scratched_count: scratchedCount,
+        profit_factor: profitFactor,
       },
       trades,
       pendingOrders,

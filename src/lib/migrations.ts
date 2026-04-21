@@ -251,6 +251,7 @@ const ALLOWED_TABLES = new Set([
   "paper_signals",
   "paper_accounts",
   "paper_orders",
+  "paper_equity_snapshots",
 ]);
 const COLUMN_REGEX = /^[a-z_][a-z0-9_]{0,63}$/;
 
@@ -331,6 +332,42 @@ async function runSchemaMigrations() {
   // check passes for all 20.
   await ensureColumn("paper_accounts", "reserved_cash", "DECIMAL(18,6) NOT NULL DEFAULT 0");
   await ensureColumn("paper_orders", "reserved_amount", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+
+  // W2 (2026-04-21) — data integrity.
+  //
+  // 1. paper_equity_snapshots gains `reserved_cash` and `realized_pnl` so an
+  //    equity-curve chart can plot unreserved cash + reservations + unrealized
+  //    + realized separately without re-aggregating paper_trades per point.
+  // 2. paper_trades gains `strategy_id` — real FK to paper_strategies. The
+  //    existing `strategy` VARCHAR(64) stays as a denormalized label (shown
+  //    as "MANUAL BUY" / "MANUAL SELL" for user-placed trades). We do NOT
+  //    reverse-parse historical "MARKET BUY" strings into strategy_id —
+  //    those rows stay NULL.
+  await ensureColumn("paper_equity_snapshots", "reserved_cash", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+  await ensureColumn("paper_equity_snapshots", "realized_pnl", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+  await ensureColumn("paper_trades", "strategy_id", "INT NULL");
+  // Index + FK are additive and idempotent via errno checks (1061 = dup key,
+  // 1826/1022 = FK already exists on some MySQL versions).
+  try {
+    await pool.execute("ALTER TABLE paper_trades ADD INDEX IX_paper_trades_strategy (strategy_id)");
+  } catch (err: unknown) {
+    if ((err as { errno?: number }).errno !== 1061) throw err;
+  }
+  // ON DELETE SET NULL (codex F5): preserves the trade row + denormalized
+  // `strategy` VARCHAR label when a strategy is deleted, BUT the exact FK
+  // is lost. That's the accepted trade-off to allow strategies to be
+  // garbage-collected without rewriting historical trade rows. If stricter
+  // audit attribution is needed, switch to RESTRICT and retire strategies
+  // via `enabled=0` rather than DELETE.
+  try {
+    await pool.execute(
+      "ALTER TABLE paper_trades ADD CONSTRAINT FK_paper_trades_strategy FOREIGN KEY (strategy_id) REFERENCES paper_strategies(id) ON DELETE SET NULL"
+    );
+  } catch (err: unknown) {
+    const errno = (err as { errno?: number }).errno;
+    // 1826 = dup FK, 1022 = dup key, 3780 = FK incompat. Ignore first two.
+    if (errno !== 1826 && errno !== 1022) throw err;
+  }
 
   // Seed default paper account
   await pool.execute(

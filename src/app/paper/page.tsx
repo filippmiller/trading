@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useEffect, useState, useCallback } from "react";
-import { Activity, DollarSign, Clock, XCircle, Plus, RefreshCw, Wallet } from "lucide-react";
+import React, { useEffect, useState, useCallback, useMemo } from "react";
+import { Activity, DollarSign, Clock, XCircle, Plus, RefreshCw, Wallet, Download } from "lucide-react";
 
 type Trade = {
   id: number;
@@ -18,6 +18,8 @@ type Trade = {
   as_of: string | null;
   is_live: boolean;
   strategy: string;
+  strategy_id: number | null;
+  strategy_name: string | null;
   status: string;
   notes: string;
 };
@@ -47,8 +49,16 @@ type AccountState = {
   stale_positions: number;
   total_return_pct: number;
   realized_pnl_usd: number;
+  /** Original (backward-compat) denominator = closed_trades. */
   win_rate_pct: number;
+  /** W2 / codex F3 — scratched-excluded denominator. Prefer in UI. */
+  win_rate_excl_scratched_pct: number;
   closed_trades: number;
+  wins_count: number;
+  losses_count: number;
+  scratched_count: number;
+  // W2: JSON null sentinel for +∞ (all wins, no losses). Numeric otherwise.
+  profit_factor: number | null;
 };
 
 export default function PaperTradingPage() {
@@ -62,9 +72,17 @@ export default function PaperTradingPage() {
   // Buy form
   const [buySymbol, setBuySymbol] = useState("");
   const [buyAmount, setBuyAmount] = useState("1000");
-  const [orderType, setOrderType] = useState<"MARKET" | "LIMIT">("MARKET");
+  const [orderType, setOrderType] = useState<"MARKET" | "LIMIT" | "STOP">("MARKET");
   const [limitPrice, setLimitPrice] = useState("");
+  const [stopPrice, setStopPrice] = useState("");
   const [buyError, setBuyError] = useState("");
+
+  // Trade history filters (local state — no API param, filtering is client-side)
+  const [filterSymbol, setFilterSymbol] = useState("");
+  const [filterDateFrom, setFilterDateFrom] = useState("");
+  const [filterDateTo, setFilterDateTo] = useState("");
+  const [filterOutcome, setFilterOutcome] = useState<"all" | "win" | "loss" | "scratched">("all");
+  const [filterStrategy, setFilterStrategy] = useState<string>("all");
 
   const loadData = useCallback(async () => {
     try {
@@ -97,6 +115,7 @@ export default function PaperTradingPage() {
     if (!symbol) { setBuyError("Enter a ticker."); return; }
     if (!(investment > 0)) { setBuyError("Amount must be greater than zero."); return; }
     if (orderType === "LIMIT" && !(parseFloat(limitPrice) > 0)) { setBuyError("Provide a valid limit price."); return; }
+    if (orderType === "STOP" && !(parseFloat(stopPrice) > 0)) { setBuyError("Provide a valid stop price."); return; }
 
     setBusy(true);
     try {
@@ -109,6 +128,7 @@ export default function PaperTradingPage() {
           order_type: orderType,
           investment_usd: investment,
           limit_price: orderType === "LIMIT" ? parseFloat(limitPrice) : undefined,
+          stop_price: orderType === "STOP" ? parseFloat(stopPrice) : undefined,
         }),
       });
       const data = await res.json();
@@ -121,6 +141,7 @@ export default function PaperTradingPage() {
       } else {
         setBuySymbol("");
         setLimitPrice("");
+        setStopPrice("");
         await loadData();
       }
     } catch (e) {
@@ -162,6 +183,84 @@ export default function PaperTradingPage() {
 
   const openTrades = trades.filter(t => t.status === "OPEN");
   const closedTrades = trades.filter(t => t.status === "CLOSED");
+
+  // Unique strategy values for the filter dropdown. Uses strategy_name when
+  // present (cron-attributed via FK), falls back to the free-form strategy
+  // VARCHAR otherwise (legacy rows + manual trades labeled "MANUAL BUY" etc).
+  const strategyOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of closedTrades) {
+      const label = t.strategy_name || t.strategy || "";
+      if (label) set.add(label);
+    }
+    return Array.from(set).sort();
+  }, [closedTrades]);
+
+  const filteredClosed = useMemo(() => {
+    const sym = filterSymbol.trim().toUpperCase();
+    const from = filterDateFrom ? new Date(filterDateFrom) : null;
+    const to = filterDateTo ? new Date(filterDateTo) : null;
+    if (to) to.setHours(23, 59, 59, 999); // inclusive end-of-day
+    return closedTrades.filter((t) => {
+      if (sym && !t.symbol.toUpperCase().includes(sym)) return false;
+      const sellDate = t.sell_date ? new Date(t.sell_date) : null;
+      if (from && sellDate && sellDate < from) return false;
+      if (to && sellDate && sellDate > to) return false;
+      const pnl = t.live_pnl_usd ?? 0;
+      if (filterOutcome === "win" && !(pnl > 0)) return false;
+      if (filterOutcome === "loss" && !(pnl < 0)) return false;
+      if (filterOutcome === "scratched" && pnl !== 0) return false;
+      if (filterStrategy !== "all") {
+        const label = t.strategy_name || t.strategy || "";
+        if (label !== filterStrategy) return false;
+      }
+      return true;
+    });
+  }, [closedTrades, filterSymbol, filterDateFrom, filterDateTo, filterOutcome, filterStrategy]);
+
+  const heldDays = (t: Trade): number | null => {
+    if (!t.sell_date) return null;
+    const buy = new Date(t.buy_date);
+    const sell = new Date(t.sell_date);
+    if (isNaN(buy.getTime()) || isNaN(sell.getTime())) return null;
+    return Math.max(0, Math.round((sell.getTime() - buy.getTime()) / 86_400_000));
+  };
+
+  const exportCsv = () => {
+    const header = [
+      "id", "symbol", "strategy", "side", "buy_date", "buy_price",
+      "quantity", "investment_usd", "sell_date", "sell_price",
+      "pnl_usd", "pnl_pct", "held_days", "status",
+    ];
+    const rows = filteredClosed.map((t) => [
+      t.id,
+      t.symbol,
+      // CSV-safe: quote strategy label because it can contain commas.
+      JSON.stringify(t.strategy_name || t.strategy || "(manual)"),
+      "LONG", // W3 will add SHORT — until then every trade is LONG
+      t.buy_date,
+      t.buy_price.toFixed(4),
+      t.quantity.toFixed(6),
+      t.investment_usd.toFixed(2),
+      t.sell_date ?? "",
+      t.sell_price != null ? t.sell_price.toFixed(4) : "",
+      t.live_pnl_usd != null ? t.live_pnl_usd.toFixed(4) : "",
+      t.live_pnl_pct != null ? t.live_pnl_pct.toFixed(4) : "",
+      heldDays(t) ?? "",
+      t.status,
+    ].join(","));
+    const csv = [header.join(","), ...rows].join("\n");
+    // Client-side download — no server round-trip, no extra endpoint.
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `paper-trades-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <div className="max-w-6xl mx-auto space-y-6 pb-20">
@@ -222,8 +321,24 @@ export default function PaperTradingPage() {
             <p className={`text-2xl font-bold ${account.realized_pnl_usd >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
               {account.realized_pnl_usd >= 0 ? "+" : ""}${account.realized_pnl_usd.toFixed(2)}
             </p>
+            {/* W2 / codex F3: surface wins / losses / scratched separately.
+                UI uses `win_rate_excl_scratched_pct` (SCRATCHED-excluded) as
+                the honest KPI; the legacy `win_rate_pct` field stays on the
+                API response for backward-compat with any external consumer.
+                profit_factor === null is the JSON-safe sentinel for "infinity"
+                — all winners and no losers — rendered as "∞". */}
             <p className="text-xs text-zinc-400 mt-1">
-              {account.closed_trades} closed trades · {account.win_rate_pct.toFixed(0)}% win
+              {account.wins_count}W · {account.losses_count}L
+              {account.scratched_count > 0 ? ` · ${account.scratched_count} scratched` : ""}
+              {(account.wins_count + account.losses_count) > 0 ? ` · ${account.win_rate_excl_scratched_pct.toFixed(0)}% win` : ""}
+            </p>
+            <p className="text-[10px] text-zinc-400 mt-0.5">
+              PF{" "}
+              <span className={account.profit_factor === null || (account.profit_factor !== null && account.profit_factor >= 1) ? "text-emerald-600" : "text-rose-600"}>
+                {account.profit_factor === null
+                  ? "∞"
+                  : account.profit_factor.toFixed(2)}
+              </span>
             </p>
           </div>
         </div>
@@ -259,21 +374,29 @@ export default function PaperTradingPage() {
             <label className="text-xs text-zinc-400 font-bold uppercase">Type</label>
             <select
               value={orderType}
-              onChange={e => setOrderType(e.target.value as "MARKET" | "LIMIT")}
+              onChange={e => setOrderType(e.target.value as "MARKET" | "LIMIT" | "STOP")}
               className="w-full px-3 py-2 border rounded-lg text-sm"
             >
               <option value="MARKET">Market</option>
               <option value="LIMIT">Limit</option>
+              <option value="STOP">Stop</option>
             </select>
           </div>
+          {/* One conditional price input — LIMIT uses it for limit price,
+              STOP reuses the same slot for stop price. MARKET disables it. */}
           <div>
-            <label className="text-xs text-zinc-400 font-bold uppercase">Limit price</label>
+            <label className="text-xs text-zinc-400 font-bold uppercase">
+              {orderType === "STOP" ? "Stop price" : "Limit price"}
+            </label>
             <input
               type="number"
-              value={limitPrice}
-              onChange={e => setLimitPrice(e.target.value)}
-              placeholder={orderType === "LIMIT" ? "100.00" : "—"}
-              disabled={orderType !== "LIMIT"}
+              value={orderType === "STOP" ? stopPrice : limitPrice}
+              onChange={e => {
+                if (orderType === "STOP") setStopPrice(e.target.value);
+                else setLimitPrice(e.target.value);
+              }}
+              placeholder={orderType === "MARKET" ? "—" : "100.00"}
+              disabled={orderType === "MARKET"}
               className="w-full px-3 py-2 border rounded-lg text-sm font-mono disabled:bg-zinc-50 disabled:text-zinc-300"
             />
           </div>
@@ -398,12 +521,81 @@ export default function PaperTradingPage() {
         )}
       </div>
 
-      {/* Closed Trades */}
+      {/* Closed Trades — W2: filters + CSV export + held_days column */}
       {closedTrades.length > 0 && (
         <div>
-          <h2 className="text-lg font-bold text-zinc-800 mb-3 flex items-center gap-2">
-            <XCircle className="h-5 w-5 text-zinc-400" /> Trade History
-          </h2>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg font-bold text-zinc-800 flex items-center gap-2">
+              <XCircle className="h-5 w-5 text-zinc-400" /> Trade History
+              <span className="text-xs font-normal text-zinc-400">
+                ({filteredClosed.length} of {closedTrades.length})
+              </span>
+            </h2>
+            <button
+              onClick={exportCsv}
+              className="flex items-center gap-1 px-3 py-1.5 text-xs bg-zinc-100 hover:bg-zinc-200 rounded-lg"
+            >
+              <Download className="h-3.5 w-3.5" /> Export CSV
+            </button>
+          </div>
+
+          {/* Filters. All local-state — no API round-trip. Changing any
+              filter immediately narrows the table + CSV export. */}
+          <div className="bg-zinc-50 rounded-lg p-3 mb-3 grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-bold mb-0.5">Symbol</label>
+              <input
+                type="text"
+                value={filterSymbol}
+                onChange={e => setFilterSymbol(e.target.value)}
+                placeholder="e.g. AAPL"
+                className="w-full px-2 py-1 border rounded text-xs font-mono"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-bold mb-0.5">From (sell)</label>
+              <input
+                type="date"
+                value={filterDateFrom}
+                onChange={e => setFilterDateFrom(e.target.value)}
+                className="w-full px-2 py-1 border rounded text-xs"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-bold mb-0.5">To (sell)</label>
+              <input
+                type="date"
+                value={filterDateTo}
+                onChange={e => setFilterDateTo(e.target.value)}
+                className="w-full px-2 py-1 border rounded text-xs"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-bold mb-0.5">Outcome</label>
+              <select
+                value={filterOutcome}
+                onChange={e => setFilterOutcome(e.target.value as "all" | "win" | "loss" | "scratched")}
+                className="w-full px-2 py-1 border rounded text-xs"
+              >
+                <option value="all">All</option>
+                <option value="win">Wins</option>
+                <option value="loss">Losses</option>
+                <option value="scratched">Scratched</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-[10px] text-zinc-500 uppercase font-bold mb-0.5">Strategy</label>
+              <select
+                value={filterStrategy}
+                onChange={e => setFilterStrategy(e.target.value)}
+                className="w-full px-2 py-1 border rounded text-xs"
+              >
+                <option value="all">All</option>
+                {strategyOptions.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+          </div>
+
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-zinc-400 text-xs uppercase border-b">
@@ -412,24 +604,38 @@ export default function PaperTradingPage() {
                 <th className="pb-2">Sell</th>
                 <th className="pb-2">P&L</th>
                 <th className="pb-2">%</th>
+                <th className="pb-2">Held</th>
                 <th className="pb-2">Strategy</th>
               </tr>
             </thead>
             <tbody>
-              {closedTrades.map(t => (
-                <tr key={t.id} className="border-b border-zinc-50">
-                  <td className="py-2 font-bold">{t.symbol}</td>
-                  <td className="py-2 font-mono">${t.buy_price.toFixed(2)}</td>
-                  <td className="py-2 font-mono">${t.sell_price?.toFixed(2)}</td>
-                  <td className={`py-2 font-bold ${(t.live_pnl_usd || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-                    {(t.live_pnl_usd || 0) >= 0 ? "+" : ""}${(t.live_pnl_usd || 0).toFixed(2)}
-                  </td>
-                  <td className={`py-2 ${(t.live_pnl_pct || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-                    {(t.live_pnl_pct || 0) >= 0 ? "+" : ""}{(t.live_pnl_pct || 0).toFixed(2)}%
-                  </td>
-                  <td className="py-2 text-xs text-zinc-500">{t.strategy}</td>
-                </tr>
-              ))}
+              {filteredClosed.map(t => {
+                const h = heldDays(t);
+                const label = t.strategy_name || t.strategy;
+                // Cron-attributed trades show their strategy.name via FK;
+                // manual trades (strategy_id IS NULL AND label = "MANUAL *")
+                // fall through to the italic "(manual)" display.
+                const isManual = t.strategy_id == null && (!label || /^manual\b/i.test(label));
+                return (
+                  <tr key={t.id} className="border-b border-zinc-50">
+                    <td className="py-2 font-bold">{t.symbol}</td>
+                    <td className="py-2 font-mono">${t.buy_price.toFixed(2)}</td>
+                    <td className="py-2 font-mono">${t.sell_price?.toFixed(2)}</td>
+                    <td className={`py-2 font-bold ${(t.live_pnl_usd || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                      {(t.live_pnl_usd || 0) >= 0 ? "+" : ""}${(t.live_pnl_usd || 0).toFixed(2)}
+                    </td>
+                    <td className={`py-2 ${(t.live_pnl_pct || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                      {(t.live_pnl_pct || 0) >= 0 ? "+" : ""}{(t.live_pnl_pct || 0).toFixed(2)}%
+                    </td>
+                    <td className="py-2 text-xs text-zinc-500">{h != null ? `${h}d` : "—"}</td>
+                    <td className="py-2 text-xs text-zinc-500">
+                      {isManual
+                        ? <span className="italic text-zinc-400">(manual)</span>
+                        : label}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

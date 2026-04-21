@@ -16,7 +16,7 @@
 import cron from "node-cron";
 import mysql from "mysql2/promise";
 import { ensureAppBootstrapReady } from "../src/lib/bootstrap";
-import { fillOrder as sharedFillOrder } from "../src/lib/paper-fill";
+import { fillOrder as sharedFillOrder, recordEquitySnapshotSafe } from "../src/lib/paper-fill";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -1233,7 +1233,19 @@ async function jobMonitorPositionsImpl() {
 
     if (!shouldFill) continue;
 
-    const result = await sharedFillOrder(db, Number(order.id), price);
+    // Cron-path fill. strategyId is DELIBERATELY NOT passed here — codex F2.
+    // These `pendingOrders` rows come from `paper_orders`, which is the user's
+    // UI-queued LIMIT/STOP book. The strategy engine writes to `paper_signals`
+    // (different table, different cash flow, handled above this block). So
+    // cron-generated trades from this call will store `paper_trades.strategy_id
+    // = NULL` — same as manual MARKET BUYs from the UI. That's CORRECT, not
+    // a bug: these orders have no strategy attribution by construction.
+    // When W3+ introduces strategy-emits-an-order (e.g. to route a signal
+    // through the same limit-fill machinery), add `paper_orders.strategy_id`
+    // and pass `{ strategyId: order.strategy_id }` here.
+    const result = await sharedFillOrder(db, Number(order.id), price, {
+      fillRationale: "SPOT",
+    });
     if (result.filled) {
       ordersFilled++;
       log(`    FILL ${order.symbol} ${type} ${side} at $${price.toFixed(2)}`);
@@ -1649,6 +1661,43 @@ async function jobScanTrends() {
   }
 }
 
+// ─── Hourly equity snapshot ─────────────────────────────────────────────────
+
+/**
+ * Take a paper_equity_snapshots row for every non-dormant paper account
+ * once per hour during RTH. "Non-dormant" = has at least one OPEN trade OR
+ * cash changed since the last snapshot (skipped: fully-closed idle accounts
+ * that would just write duplicate rows forever).
+ *
+ * This is the IDLE-time path — the fill-time path (see paper-fill.ts) writes
+ * a snapshot on every cash-moving fill so we always have a data point for
+ * every transaction. The hourly tick adds coverage for long positions with
+ * no trading activity so a chart doesn't have gaps.
+ */
+async function jobHourlyEquitySnapshots() {
+  const db = getPool();
+  const [accounts] = await db.execute<mysql.RowDataPacket[]>(
+    `SELECT a.id
+       FROM paper_accounts a
+       LEFT JOIN paper_trades t ON t.account_id = a.id AND t.status = 'OPEN'
+      GROUP BY a.id
+     HAVING COUNT(t.id) > 0
+         OR EXISTS (
+           SELECT 1 FROM paper_equity_snapshots s
+            WHERE s.account_id = a.id
+              AND s.snapshot_at > DATE_SUB(NOW(), INTERVAL 2 DAY)
+         )`
+  );
+  let written = 0;
+  for (const acct of accounts) {
+    // Safe variant: catches + logs per-account errors so one bad account
+    // (missing row, schema skew) can't poison the whole hourly batch.
+    const ok = await recordEquitySnapshotSafe(db, Number(acct.id));
+    if (ok) written++;
+  }
+  log(`  Hourly snapshots: wrote ${written} rows across ${accounts.length} non-dormant accounts`);
+}
+
 // ─── Schedule ───────────────────────────────────────────────────────────────
 
 /**
@@ -1724,6 +1773,14 @@ cron.schedule("0 18 * * 1-5", async () => {
 cron.schedule("*/15 9-16 * * 1-5", async () => {
   log("--- Monitor: checking positions + orders ---");
   try { await jobMonitorPositions(); } catch (err) { log(`ERROR monitoring: ${err}`); }
+}, CRON_OPTIONS);
+
+// Hourly equity snapshot — at :07 to avoid stepping on the :00 / :15 ticks.
+// Covers idle hours (positions held with no fills) so the equity curve has
+// no gaps. Runs 9-16 ET, Mon-Fri — no point snapshotting at 03:00 ET.
+cron.schedule("7 9-16 * * 1-5", async () => {
+  log("--- Hourly equity snapshot ---");
+  try { await jobHourlyEquitySnapshots(); } catch (err) { log(`ERROR hourly snapshot: ${err}`); }
 }, CRON_OPTIONS);
 
 // Retention — daily at 03:00 ET (well outside market + job windows)
