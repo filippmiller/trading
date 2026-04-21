@@ -23,6 +23,7 @@ import {
   type ExitInputs,
   type ExitReason,
 } from "../src/lib/paper-exits";
+import { isRTH } from "../src/lib/paper";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -1282,6 +1283,11 @@ let monitorPaperTradesRunning = false;
 async function jobMonitorPaperTrades() {
   if (monitorPaperTradesRunning) { log("  SKIP: paper-trades monitor already running"); return; }
   if (!isTradingDay()) return;
+  // C1 — gate outside regular trading hours. `isTradingDay()` only rules out
+  // weekends; the monitor ticks every 15 min and would otherwise fire at
+  // pre-market / after-hours when Yahoo feeds stale quotes. Match the
+  // behaviour of MARKET order acceptance (`paper.ts:isRTH`).
+  if (!isRTH(new Date())) { log("  SKIP: paper-trades monitor outside RTH"); return; }
   monitorPaperTradesRunning = true;
   try {
     await jobMonitorPaperTradesImpl();

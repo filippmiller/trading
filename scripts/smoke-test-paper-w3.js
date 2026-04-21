@@ -256,6 +256,12 @@ async function test4_hardStop(accountId) {
   assert(decision !== null, `decision non-null`);
   assert(decision && decision.reason === "HARD_STOP", `reason = HARD_STOP (got ${decision && decision.reason})`);
 
+  // C2 — auto-exit must record equity snapshot in-tx. Capture count before.
+  const [[snapBefore]] = await pool.execute(
+    "SELECT COUNT(*) AS c FROM paper_equity_snapshots WHERE account_id = ?",
+    [accountId]
+  );
+
   // Apply — closes the position.
   const applied = await paperExits.applyExitDecisionToTrade(pool, buyFill.tradeId, 94, decision);
   assert(applied.closed === true, `applied`);
@@ -265,6 +271,16 @@ async function test4_hardStop(accountId) {
   assert(Math.abs(Number(closedRows[0].sell_price) - 94) < PRECISION_EPS, `sell_price = 94 (got ${closedRows[0].sell_price})`);
   // pnl = (94-100)*10 = -60
   assert(Math.abs(Number(closedRows[0].pnl_usd) - (-60)) < PRECISION_EPS, `pnl = -$60 (got ${closedRows[0].pnl_usd})`);
+
+  // C2 assertion — snapshot count increased by exactly 1 for the auto-exit.
+  const [[snapAfter]] = await pool.execute(
+    "SELECT COUNT(*) AS c FROM paper_equity_snapshots WHERE account_id = ?",
+    [accountId]
+  );
+  assert(
+    Number(snapAfter.c) === Number(snapBefore.c) + 1,
+    `paper_equity_snapshots +1 after auto-exit (before=${snapBefore.c}, after=${snapAfter.c})`
+  );
 }
 
 // ── Test 5: Trailing stop ─────────────────────────────────────────────────
@@ -422,6 +438,42 @@ async function test8_orderModify(accountId) {
   assert(adjAfter.ok === false, `adjustReservation on non-PENDING rejected (got ${JSON.stringify(adjAfter)})`);
 }
 
+// ── Test 9b: PF2 — duplicate SHORT position rejection ────────────────────
+async function test9b_duplicateShort(accountId) {
+  console.log("\nTest 9b: PF2 — second SHORT on same (account, symbol) rejected as DUPLICATE_SHORT_POSITION");
+  await pool.execute("DELETE FROM paper_trades WHERE account_id = ?", [accountId]);
+  await pool.execute("DELETE FROM paper_orders WHERE account_id = ?", [accountId]);
+  await pool.execute("UPDATE paper_accounts SET cash = ?, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?", [TEST_INITIAL_CASH, accountId]);
+
+  // Open first SHORT on XYZ.
+  const o1 = await insertOrder(accountId, "XYZ", "SELL", "SHORT", "MARKET", { investment_usd: 500 });
+  const f1 = await paperFill.fillOrder(pool, o1, 50);
+  assert(f1.filled === true, `first SHORT open succeeded`);
+
+  // Attempt second SHORT on same symbol — must reject with DUPLICATE_SHORT_POSITION.
+  const o2 = await insertOrder(accountId, "XYZ", "SELL", "SHORT", "MARKET", { investment_usd: 300 });
+  const f2 = await paperFill.fillOrder(pool, o2, 55);
+  assert(f2.filled === false, `second SHORT rejected (got ${JSON.stringify(f2)})`);
+  assert(f2.rejection === "DUPLICATE_SHORT_POSITION", `rejection = DUPLICATE_SHORT_POSITION (got ${f2.rejection})`);
+
+  // Verify order row flipped to REJECTED with the right reason.
+  const [[orow]] = await pool.execute("SELECT status, rejection_reason FROM paper_orders WHERE id = ?", [o2]);
+  assert(orow.status === "REJECTED", `order 2 status = REJECTED`);
+  assert(String(orow.rejection_reason) === "DUPLICATE_SHORT_POSITION", `order 2 rejection_reason = DUPLICATE_SHORT_POSITION`);
+
+  // Cash untouched by the rejection.
+  const acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.cash) - (TEST_INITIAL_CASH - 500)) < PRECISION_EPS, `cash unchanged by rejection (got ${acct.cash})`);
+
+  // After covering the first SHORT, a new SHORT on XYZ is allowed again.
+  const oCover = await insertOrder(accountId, "XYZ", "BUY", "SHORT", "MARKET", { trade_id: f1.tradeId });
+  const fCover = await paperFill.fillOrder(pool, oCover, 50);
+  assert(fCover.filled === true, `cover succeeded`);
+  const o3 = await insertOrder(accountId, "XYZ", "SELL", "SHORT", "MARKET", { investment_usd: 200 });
+  const f3 = await paperFill.fillOrder(pool, o3, 40);
+  assert(f3.filled === true, `third SHORT (no open SHORT remaining) succeeded`);
+}
+
 // ── Test 9: Conservation invariant ───────────────────────────────────────
 async function test9_invariant(accountId) {
   console.log("\nTest 9: Conservation — cash + reserved_cash + reserved_short_margin + open_long_inv == initial + realized");
@@ -477,6 +529,7 @@ async function test9_invariant(accountId) {
     await test6_timeExit(accountId);
     await test7_partialClose(accountId);
     await test8_orderModify(accountId);
+    await test9b_duplicateShort(accountId);
     await test9_invariant(accountId);
 
     console.log(`\n== SUMMARY: ${passed} passed, ${failed} failed ==`);

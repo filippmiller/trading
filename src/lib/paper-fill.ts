@@ -121,6 +121,7 @@ const SOFT_REJECT = new Set([
   "INSUFFICIENT_CASH",
   "TRADE_MISMATCH",
   "NO_OPEN_POSITION",
+  "DUPLICATE_SHORT_POSITION",
 ]);
 
 /**
@@ -372,6 +373,20 @@ async function fillOrderCore(
     if (!Number.isFinite(quantity) || quantity <= 0) {
       await rejectOrder(conn, orderId, "INVALID_QUANTITY");
       return { filled: false, rejection: "INVALID_QUANTITY" };
+    }
+
+    // PF2 — reject new SHORT if an OPEN SHORT already exists for this
+    // (account, symbol). The cover path resolves "which position to close"
+    // via `trade_id` OR `LIMIT 1` on OPEN SHORTs — allowing a second OPEN
+    // SHORT for the same symbol would make the LIMIT 1 cover ambiguous.
+    // Users that want multiple legs per symbol must pass `trade_id` on cover.
+    const [dupRows] = await conn.execute(
+      "SELECT id FROM paper_trades WHERE account_id=? AND symbol=? AND side='SHORT' AND status='OPEN' LIMIT 1 FOR UPDATE",
+      [accountId, symbol]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (dupRows.length > 0) {
+      await rejectOrder(conn, orderId, "DUPLICATE_SHORT_POSITION");
+      return { filled: false, rejection: "DUPLICATE_SHORT_POSITION" };
     }
 
     // Short margin: held in paper_accounts.reserved_short_margin. If the order

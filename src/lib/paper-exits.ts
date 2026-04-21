@@ -23,6 +23,7 @@
  */
 
 import type mysqlTypes from "mysql2/promise";
+import { recordEquitySnapshotInTx } from "./paper-fill";
 
 export type Side = "LONG" | "SHORT";
 
@@ -427,6 +428,14 @@ export async function applyExitDecisionToTrade(
         return { closed: false, pnlUsd: 0, remainingQty: 0 };
       }
     }
+
+    // C2 — record equity snapshot in-transaction, mirroring the manual-exit
+    // path in `fillOrder`. Auto-exits (hard stop / trailing / time / TP)
+    // trigger real cash movement and must leave an equity curve data point,
+    // otherwise the hourly snapshot cron produces a gap that looks like a
+    // dead hour rather than a known close event. Throws on error so the
+    // caller rolls back — no committing a closed trade without its snapshot.
+    await recordEquitySnapshotInTx(conn, accountId);
 
     await conn.commit();
     return { closed: true, pnlUsd, remainingQty: 0 };
