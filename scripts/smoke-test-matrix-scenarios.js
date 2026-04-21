@@ -275,7 +275,10 @@ const cohort = [
   { symbol: "UP6", entryPrice: 100, dayChangePct: 6, consecutiveDays: 6 }, // UP 6-day (extreme)
 ];
 const flatFuture = [{ key: "d1_close", price: 105 }]; // +5% on d1 close
-const comparison = compareAllScenarios(cohort, () => flatFuture, params1x);
+const comparison = compareAllScenarios(
+  cohort.map((t) => ({ ticker: t, timeline: flatFuture })),
+  params1x,
+);
 
 const byId = Object.fromEntries(comparison.map((r) => [r.scenarioId, r]));
 ok(byId.momentum.eligibleCount === 4, "momentum: all 4 eligible (all have a sign)");
@@ -292,6 +295,18 @@ near(byId.four_day_rally_fade.totalPnlUsd, -10, 0.01, "rally fade total pnl = -$
 // Extreme: UP6 only → SHORT -$5
 ok(byId.extreme_streak_reversal.eligibleCount === 1, "extreme streak: 1 eligible");
 near(byId.extreme_streak_reversal.totalPnlUsd, -5, 0.01, "extreme streak pnl = -$5");
+
+// Regression guard: same symbol across multiple cohort dates must be counted
+// independently (the comparison block passes pairs, not a symbol lookup).
+section("compareAllScenarios — duplicate symbols not collapsed");
+const dupeCohort = [
+  { ticker: { symbol: "DUP", entryPrice: 100, dayChangePct: -2, consecutiveDays: 1 }, timeline: [{ key: "d1_close", price: 110 }] }, // LONG +$10
+  { ticker: { symbol: "DUP", entryPrice: 100, dayChangePct: -2, consecutiveDays: 1 }, timeline: [{ key: "d1_close", price: 120 }] }, // LONG +$20
+];
+const dupeCmp = compareAllScenarios(dupeCohort, params1x);
+const dupeReversal = dupeCmp.find((r) => r.scenarioId === "reversal");
+ok(dupeReversal.eligibleCount === 2, "same symbol counted twice when it appears twice");
+near(dupeReversal.totalPnlUsd, 30, 0.01, "duplicate symbols each use their own timeline (+$10 + +$20 = +$30)");
 
 // ---------------------------------------------------------------------------
 // 11. Zero entry price / bad input safety

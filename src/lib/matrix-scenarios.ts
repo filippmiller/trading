@@ -436,14 +436,21 @@ export function summarizeScenario(
   };
 }
 
-/** Evaluate all 5 scenarios over the same cohort and return aggregate P&L per scenario. */
+/**
+ * Evaluate all 5 scenarios over the same cohort and return aggregate P&L
+ * per scenario.
+ *
+ * Input is an array of (ticker, timeline) PAIRS — not a symbol-keyed lookup —
+ * because the same symbol can legitimately appear multiple times (once per
+ * cohort date), and each occurrence must be evaluated against its own
+ * timeline. A name-based lookup would collapse them and double-count.
+ */
 export function compareAllScenarios(
-  tickers: ScenarioTickerInput[],
-  timelineFor: (ticker: ScenarioTickerInput) => ScenarioSnapshotInput[],
+  pairs: Array<{ ticker: ScenarioTickerInput; timeline: ScenarioSnapshotInput[] }>,
   params: ScenarioParams,
 ): { scenarioId: ScenarioId; label: string; eligibleCount: number; totalCohort: number; totalPnlUsd: number }[] {
   return SCENARIOS.map((scn) => {
-    const perTicker = tickers.map((t) => evaluateScenario(scn.id, t, timelineFor(t), params));
+    const perTicker = pairs.map((p) => evaluateScenario(scn.id, p.ticker, p.timeline, params));
     const report = summarizeScenario(scn.id, perTicker, params);
     return {
       scenarioId: scn.id,

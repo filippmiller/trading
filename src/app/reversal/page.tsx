@@ -453,14 +453,17 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
 
   const comparison = useMemo(() => {
     if (!applied) return null;
-    return compareAllScenarios(
-      visibleEntries.map(entryToScenarioInput),
-      (t) => {
-        const entry = visibleEntries.find((e) => e.symbol === t.symbol);
-        return entry ? buildTimeline(entry) : [];
-      },
-      { investment: applied.investment, leverage: applied.leverage },
-    );
+    // Note: same symbol can appear across multiple cohort dates (one
+    // enrollment per day). compareAllScenarios takes (ticker, timeline) pairs
+    // directly so each occurrence is evaluated against its own timeline.
+    const pairs = visibleEntries.map((e) => ({
+      ticker: entryToScenarioInput(e),
+      timeline: buildTimeline(e),
+    }));
+    return compareAllScenarios(pairs, {
+      investment: applied.investment,
+      leverage: applied.leverage,
+    });
   }, [applied, visibleEntries]);
 
   const applyScenario = () => {
