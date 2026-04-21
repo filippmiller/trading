@@ -9,6 +9,57 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-21 09:18] — Railway data restore from VPS (matrix recovery)
+
+**Area:** Trading/Ops, Trading/Data, Trading/Docs
+**Type:** data recovery + docs
+**Branch:** `ops/railway-data-restore`
+**Commit:** `f9f343a`
+**PR:** [#10](https://github.com/filippmiller/trading/pull/10)
+**Session notes:** [2026-04-21-091800-railway-data-restore.md](sessions/2026-04-21-091800-railway-data-restore.md)
+
+### Files Changed
+- `scripts/railway-restore-prelude.sql` — new, FK-safe TRUNCATE prelude for 8 VPS-owned tables before mysqldump load
+- `.claude/deploy-instructions.md` — full restore playbook, two-DB topology, verification queries
+- `CLAUDE.md` — session-start report updated to reflect Railway production deploy target
+- `.claude/agent-log.md` — this entry
+- `.claude/sessions/2026-04-21-091800-railway-data-restore.md` — detailed session notes
+
+### Functions/Symbols Modified
+- N/A — no application code touched. Ops-only change (SQL + docs).
+
+### Database Tables Affected (Railway production MySQL)
+Restored from VPS (TRUNCATE + INSERT preserving PKs for FK integrity):
+- `reversal_entries` 134 → **891**
+- `paper_signals` 63 → **3,023**
+- `paper_position_prices` 0 → **18,283**
+- `paper_trades` 0 → **3**
+- `paper_orders` 0 → **7**
+- `surveillance_logs` 9 → **69**
+- `surveillance_failures` 0 → **192**
+- `paper_strategies` 32 → **32** (synced `enabled` flags from VPS)
+
+Preserved on Railway (not touched):
+- `prices_daily` (9,374 rows, 1989-2026 seed history)
+- `strategy_runs` / `trades` / `run_metrics` (5 / 65 / 5 research runs)
+- `app_users` (admin), `app_settings`, `paper_accounts`
+
+### Summary
+Root cause: the 2026-04-20/21 Railway deploy bootstrapped the production DB empty and did not migrate the VPS-side accumulating dataset. User reported the "matrix of tickers with prices" had disappeared. Verified both DBs were reachable (VPS via SSH + local tunnel on 3319, Railway via public TCP proxy), row-counted every table on both sides, confirmed `paper_strategies` IDs matched 1:1 (no FK remap needed), confirmed VPS's 2026-04-20 symbol set was identical to Railway's (zero today-only Railway enrollments would be lost by overwrite). Executed a surgical restore: 8 VPS-owned tables TRUNCATEd + reloaded from `mysqldump --no-create-info`, 4 Railway-owned tables left alone. Post-restore row counts match plan exactly; FK integrity clean.
+
+### Verification
+- Row counts on Railway match VPS dump exactly for all 8 restored tables
+- FK integrity clean: `paper_position_prices` → `paper_signals` (0 orphans), `surveillance_failures` → `reversal_entries` (0 orphans), `paper_signals.strategy_id` → `paper_strategies.id` (0 orphans)
+- The 69 `paper_signals.reversal_entry_id` orphans on Railway post-restore are pre-existing on VPS (verified same count on source); that column has no actual FK constraint defined, only an index
+- Matrix date range on Railway now spans 2026-03-10 → 2026-04-20 (29 trading days, 486 unique symbols, D1-D10 captures intact)
+
+### Gotchas
+- Docker Desktop for Windows has broken internal DNS for Railway proxy hostnames. Workaround in playbook: resolve host on laptop via `nslookup switchback.proxy.rlwy.net 8.8.8.8`, pass the IP to `docker run ... mysql -h <ip>`.
+- Railway DB is called `railway` not `trading`. Use `mysqldump --no-create-info --tables <list>` (not `--databases`) to produce a DB-neutral dump.
+- Worker service is stateless over DB content, so no worker restart was required after the restore.
+
+---
+
 ## [2026-04-20 11:15] — Recovery, docs refresh, PR #8 merge, merged-state verification
 
 **Area:** Trading/Ops, Trading/Docs, Trading/Git, Trading/Verification

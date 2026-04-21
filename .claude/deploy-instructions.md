@@ -2,14 +2,19 @@
 
 ## Current State
 
-This repository is still operated primarily as a local-development stack against the VPS MySQL database exposed through an SSH tunnel.
+Production runs on Railway. Local development still uses the VPS MySQL via SSH tunnel (historical accumulating dataset).
 
 | Field | Value |
 |---|---|
-| App host | Local Next.js dev/prod process |
-| Database | VPS MySQL via local tunnel |
+| Production app | Railway project `TRADING` — services: `web`, `worker`, `MySQL` |
+| Production URL | `trading-production-06fe.up.railway.app` |
+| Production DB | Railway MySQL (private: `mysql.railway.internal:3306`, public proxy: `switchback.proxy.rlwy.net:48486`) |
+| Local dev DB | VPS MySQL via SSH tunnel (`localhost:3319` → `89.167.42.128:3320` inside `docker-mysql-1`) |
 | Canonical branch | `master` |
-| Public deployment | Not configured |
+
+### Why two databases?
+
+The VPS MySQL has been accumulating enrollment + signal data since March 2026 and is the historical source of truth for the matrix (`reversal_entries`) and paper-trading tables. The Railway MySQL is the live production DB that the Railway worker writes to going forward. On 2026-04-21 the historical VPS data was one-shot restored into Railway; see the "Data recovery / restore" section below.
 
 ## Local Development
 
@@ -107,10 +112,83 @@ Expected:
 - **Multiple lockfile warning is cosmetic.** It does not block local dev.
 - **Public deployment is still blocked by auth and DB exposure choices.** Cloudflare/Vercel were discussed, but no production deployment path is currently configured.
 
+## Data recovery / restore
+
+### Background
+
+When Railway was bootstrapped on 2026-04-20/21, the production DB was created **empty** (aside from a seeded `prices_daily` history and paper_strategies rows). It did NOT inherit the accumulating VPS dataset. On 2026-04-21 the VPS historical data was one-shot restored into Railway using the playbook below.
+
+### Source of truth for historical data
+
+VPS MySQL on `89.167.42.128`, container `docker-mysql-1` (`mysql:8.0`), database `trading`, credentials `root / trading123` (only reachable via SSH).
+
+### Railway target
+
+- Database name: `railway` (not `trading`)
+- Public proxy host: `switchback.proxy.rlwy.net` (IP `66.33.22.230`) port `48486`
+- Credentials: see `railway variables --service MySQL --kv`
+
+### Playbook (one-shot restore from VPS to Railway)
+
+Tables VPS owns (restore overwrites Railway): `reversal_entries`, `paper_signals`, `paper_position_prices`, `paper_trades`, `paper_orders`, `surveillance_logs`, `surveillance_failures`, `paper_strategies`.
+
+Tables Railway owns (do NOT overwrite): `prices_daily` (9k+ seeded history back to 1989), `strategy_runs`, `trades`, `run_metrics`, `app_users` (bootstrap admin), `app_settings`.
+
+```bash
+# 1. Dump VPS (data-only, scoped tables)
+ssh root@89.167.42.128 "docker exec docker-mysql-1 mysqldump -uroot -ptrading123 \
+  --single-transaction --skip-lock-tables --no-tablespaces --skip-triggers \
+  --complete-insert --hex-blob --no-create-info --skip-add-drop-table --set-gtid-purged=OFF \
+  --databases trading \
+  --tables reversal_entries paper_signals paper_position_prices paper_trades \
+           paper_orders surveillance_logs surveillance_failures paper_strategies" \
+  > /tmp/vps-restore.sql
+
+# 2. Build restore file (TRUNCATEs + dump)
+cat scripts/railway-restore-prelude.sql /tmp/vps-restore.sql > /tmp/railway-restore-final.sql
+
+# 3. Resolve Railway public proxy IP (Docker Desktop DNS can fail on hostname)
+nslookup switchback.proxy.rlwy.net 8.8.8.8   # => 66.33.22.230 (IP may change; re-resolve on use)
+
+# 4. Apply against Railway
+docker run --rm -i mysql:8.0 mysql \
+  -h <railway-proxy-ip> -P 48486 \
+  -u root -p<MYSQL_ROOT_PASSWORD> \
+  railway < /tmp/railway-restore-final.sql
+```
+
+### Verification queries
+
+```sql
+-- Row-count parity (run against Railway, compare to VPS dump)
+SELECT 'reversal_entries' t, COUNT(*) n FROM reversal_entries
+UNION ALL SELECT 'paper_signals', COUNT(*) FROM paper_signals
+UNION ALL SELECT 'paper_position_prices', COUNT(*) FROM paper_position_prices
+UNION ALL SELECT 'paper_trades', COUNT(*) FROM paper_trades
+UNION ALL SELECT 'paper_orders', COUNT(*) FROM paper_orders
+UNION ALL SELECT 'surveillance_logs', COUNT(*) FROM surveillance_logs
+UNION ALL SELECT 'surveillance_failures', COUNT(*) FROM surveillance_failures
+UNION ALL SELECT 'paper_strategies', COUNT(*) FROM paper_strategies;
+
+-- FK integrity (all should return 0 except orphaned_signal_reversal_refs,
+-- which is a pre-existing data quality issue with no FK constraint defined)
+SELECT 'orphaned_position_prices',
+  (SELECT COUNT(*) FROM paper_position_prices pp
+   LEFT JOIN paper_signals s ON pp.signal_id = s.id WHERE s.id IS NULL);
+SELECT 'orphaned_surveillance_failures',
+  (SELECT COUNT(*) FROM surveillance_failures sf
+   LEFT JOIN reversal_entries re ON sf.entry_id = re.id WHERE re.id IS NULL);
+```
+
+### Last restore verified
+
+- **Date:** 2026-04-21
+- **VPS → Railway row transfer:** 891 reversal_entries, 3,023 paper_signals, 18,283 paper_position_prices, 3 paper_trades, 7 paper_orders, 69 surveillance_logs, 192 surveillance_failures, 32 paper_strategies
+- **FK integrity:** orphaned_position_prices=0, orphaned_surveillance_failures=0, orphaned_signal_strategy_refs=0 (paper_signals.reversal_entry_id has 69 orphans, pre-existing on VPS — not caused by restore)
+
 ## Last Verified
 
-- **Date:** 2026-04-20
+- **Date:** 2026-04-21
 - **Branch:** `master`
-- **Merged state:** includes Grid Sweep (`PR #9`) and tab-audit cleanup (`PR #8`)
-- **Runtime smoke:** `/research` and `/api/research/grid` verified with tunnel restored
+- **Merged state:** includes Grid Sweep (`PR #9`), tab-audit cleanup (`PR #8`), Railway deploy + auth (commit `fe6bccc`), VPS→Railway data restore
 - **Build:** passed on merged Grid Sweep master before PR #8 merge; post-merge build path may fail if Google Fonts are unreachable
