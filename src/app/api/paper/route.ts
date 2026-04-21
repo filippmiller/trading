@@ -3,7 +3,7 @@ import { getPool, mysql } from "@/lib/db";
 import { ensureSchema } from "@/lib/migrations";
 import {
   fetchLivePrices,
-  getDefaultAccount,
+  resolveAccount,
   computeAccountEquity,
   fillPendingOrders,
 } from "@/lib/paper";
@@ -14,14 +14,18 @@ import {
  * pending orders. Also runs the order-matching engine to fill any triggered
  * pending orders.
  *
+ * W5 — accepts optional `?account_id=<n>`; falls back to Default account if
+ * absent or invalid (backward compat).
+ *
  * Each open position carries `asOf` and `is_live` so the UI can show the
  * user which marks are stale (e.g. outside RTH, or when Yahoo returned null).
  */
-export async function GET() {
+export async function GET(req: Request) {
   try {
     await ensureSchema();
     const pool = await getPool();
-    const account = await getDefaultAccount();
+    const accountIdParam = new URL(req.url).searchParams.get("account_id");
+    const account = await resolveAccount(accountIdParam);
 
     const filled = await fillPendingOrders();
 

@@ -108,32 +108,7 @@ export type PaperAccount = {
   created_at: string;
 };
 
-/** Fetch the default paper account, creating it if missing. */
-export async function getDefaultAccount(): Promise<PaperAccount> {
-  const pool = await getPool();
-  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT * FROM paper_accounts WHERE name = 'Default' LIMIT 1"
-  );
-  if (rows.length > 0) {
-    const r = rows[0];
-    return {
-      id: r.id,
-      name: r.name,
-      initial_cash: Number(r.initial_cash),
-      cash: Number(r.cash),
-      reserved_cash: Number(r.reserved_cash ?? 0),
-      reserved_short_margin: Number(r.reserved_short_margin ?? 0),
-      created_at: r.created_at,
-    };
-  }
-  await pool.execute(
-    "INSERT INTO paper_accounts (name, initial_cash, cash) VALUES ('Default', 100000, 100000)"
-  );
-  const [created] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT * FROM paper_accounts WHERE name = 'Default' LIMIT 1"
-  );
-  if (created.length === 0) throw new Error("Failed to create default paper account");
-  const r = created[0];
+function rowToAccount(r: mysql.RowDataPacket): PaperAccount {
   return {
     id: r.id,
     name: r.name,
@@ -143,6 +118,66 @@ export async function getDefaultAccount(): Promise<PaperAccount> {
     reserved_short_margin: Number(r.reserved_short_margin ?? 0),
     created_at: r.created_at,
   };
+}
+
+/** Fetch the default paper account, creating it if missing. */
+export async function getDefaultAccount(): Promise<PaperAccount> {
+  const pool = await getPool();
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_accounts WHERE name = 'Default' LIMIT 1"
+  );
+  if (rows.length > 0) return rowToAccount(rows[0]);
+  await pool.execute(
+    "INSERT INTO paper_accounts (name, initial_cash, cash) VALUES ('Default', 100000, 100000)"
+  );
+  const [created] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_accounts WHERE name = 'Default' LIMIT 1"
+  );
+  if (created.length === 0) throw new Error("Failed to create default paper account");
+  return rowToAccount(created[0]);
+}
+
+/**
+ * W5 — multi-account. Fetch an account by id. Returns null if not found.
+ * Used by `resolveAccount` to honor the `?account_id=<n>` query param.
+ */
+export async function getAccountById(id: number): Promise<PaperAccount | null> {
+  const pool = await getPool();
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_accounts WHERE id = ? LIMIT 1",
+    [id]
+  );
+  return rows.length > 0 ? rowToAccount(rows[0]) : null;
+}
+
+/**
+ * W5 — list every paper account with basic info. Used by the account-switcher
+ * dropdown. Order: id ASC (so 'Default' — the first-created — tends to appear
+ * first in the UI).
+ */
+export async function listPaperAccounts(): Promise<PaperAccount[]> {
+  const pool = await getPool();
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_accounts ORDER BY id ASC"
+  );
+  return rows.map(rowToAccount);
+}
+
+/**
+ * W5 — resolve the account to operate on. Honors an optional `account_id`
+ * query param (from `?account_id=<n>`); falls back to the Default account
+ * when the param is absent or points at a non-existent row. Backward-compat:
+ * any caller that doesn't thread account_id through keeps getting Default,
+ * so existing cron + background paths don't break.
+ */
+export async function resolveAccount(
+  accountIdParam: string | null
+): Promise<PaperAccount> {
+  if (accountIdParam && /^\d+$/.test(accountIdParam)) {
+    const acct = await getAccountById(Number(accountIdParam));
+    if (acct) return acct;
+  }
+  return getDefaultAccount();
 }
 
 export type PositionMark = {
