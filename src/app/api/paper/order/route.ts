@@ -8,11 +8,10 @@ import {
 } from "@/lib/paper";
 import {
   fillOrder,
-  releaseReservationForOrder,
   reserveCashForOrder,
   reserveShortMarginForOrder,
-  adjustReservation,
-  patchPendingOrderPrices,
+  cancelOrderWithRefund,
+  modifyPendingOrder,
 } from "@/lib/paper-fill";
 
 type OrderBody = {
@@ -283,24 +282,20 @@ export async function PATCH(req: Request) {
     };
     const pool = await getPool();
 
-    // If investment_usd is supplied, re-size the reservation first. This
-    // runs in its own atomic transaction so failure to cover the delta
-    // rejects cleanly without touching the price fields.
-    if (body.investment_usd != null) {
-      const adj = await adjustReservation(pool, orderId, body.investment_usd);
-      if (!adj.ok) {
-        return NextResponse.json({ error: adj.reason }, { status: 400 });
-      }
-    }
-
-    // Then apply price patches (separate UPDATE — no reservation math).
-    if (body.limit_price != null || body.stop_price != null) {
-      const priceResult = await patchPendingOrderPrices(pool, orderId, {
+    // W3 hotfix #3: single atomic transaction for both reservation resize
+    // AND price field changes. The old split (adjustReservation then
+    // patchPendingOrderPrices) committed the money move before validating
+    // the prices, so a bad limit_price left the user with a resized
+    // reservation but stale prices.
+    if (body.investment_usd != null || body.limit_price != null || body.stop_price != null) {
+      const result = await modifyPendingOrder(pool, orderId, {
         limit_price: body.limit_price,
         stop_price: body.stop_price,
+        investment_usd: body.investment_usd,
       });
-      if (!priceResult.ok) {
-        return NextResponse.json({ error: priceResult.reason }, { status: 400 });
+      if (!result.ok) {
+        const status = result.reason === "ORDER_NOT_FOUND" ? 404 : 400;
+        return NextResponse.json({ error: result.reason }, { status });
       }
     }
 
@@ -333,13 +328,13 @@ export async function DELETE(req: Request) {
 
     const pool = await getPool();
     const orderId = Number(id);
-    await releaseReservationForOrder(pool, orderId);
-    const [result] = await pool.execute<mysql.ResultSetHeader>(
-      "UPDATE paper_orders SET status = 'CANCELLED' WHERE id = ? AND status = 'PENDING'",
-      [orderId]
-    );
-    if (result.affectedRows === 0) {
-      return NextResponse.json({ error: "Order not found or not pending" }, { status: 404 });
+    // W3 hotfix #2: single atomic transaction combines refund + status flip.
+    // The old split (releaseReservationForOrder then UPDATE) let concurrent
+    // DELETEs double-refund and let fillPendingOrders observe PENDING with
+    // reserved_amount=0 between the two commits.
+    const result = await cancelOrderWithRefund(pool, orderId);
+    if (!result.cancelled) {
+      return NextResponse.json({ error: result.reason ?? "Order not found or not pending" }, { status: 404 });
     }
     return NextResponse.json({ success: true });
   } catch (err) {

@@ -438,6 +438,144 @@ async function test8_orderModify(accountId) {
   assert(adjAfter.ok === false, `adjustReservation on non-PENDING rejected (got ${JSON.stringify(adjAfter)})`);
 }
 
+// ── Test H1 (hotfix #1): partial close then auto-exit — pnl_pct consistent ─
+async function testH1_partialThenAutoExit(accountId) {
+  console.log("\nTest H1 (hotfix #1): partial-close then auto-exit keeps pnl_pct consistent");
+  await pool.execute("DELETE FROM paper_trades WHERE account_id = ?", [accountId]);
+  await pool.execute("DELETE FROM paper_orders WHERE account_id = ?", [accountId]);
+  await pool.execute("UPDATE paper_accounts SET cash = ?, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?", [TEST_INITIAL_CASH, accountId]);
+
+  // Open LONG with $1000 investment at $100 → qty 10.
+  const buyOrder = await insertOrder(accountId, "WTST", "BUY", "LONG", "MARKET", {
+    investment_usd: 1000, bracket_stop_loss_pct: 5, // stop at $95
+  });
+  const buyFill = await paperFill.fillOrder(pool, buyOrder, 100);
+  assert(buyFill.filled === true, `H1 open`);
+  assert(Math.abs(buyFill.quantity - 10) < PRECISION_EPS, `H1 qty = 10`);
+
+  // Partial close 4 at $110 → slice pnl = 4*10 = +$40, closed_quantity=4, remaining=6.
+  const partial = await insertOrder(accountId, "WTST", "SELL", "LONG", "MARKET", {
+    trade_id: buyFill.tradeId, close_quantity: 4,
+  });
+  const partialFill = await paperFill.fillOrder(pool, partial, 110);
+  assert(partialFill.filled === true, `H1 partial fill`);
+  assert(Math.abs(partialFill.pnlUsd - 40) < PRECISION_EPS, `H1 partial pnl = +$40 (got ${partialFill.pnlUsd})`);
+  assert(partialFill.remainingQuantity === 6, `H1 remaining = 6 (got ${partialFill.remainingQuantity})`);
+
+  // Trigger auto-exit (stop) at $105 (above the stop but we force via
+  // applyExitDecisionToTrade to model the auto-exit path regardless of
+  // evaluateExits logic). This remaining 6 at $105 vs entry $100 → slice pnl
+  // = 6*5 = +$30. Total pnl across both legs = $40 + $30 = +$70.
+  // pnl_pct must be 70/1000*100 = 7.0, NOT the buggy slice value 30/600*100 = 5.0.
+  const [rows] = await pool.execute("SELECT * FROM paper_trades WHERE id = ?", [buyFill.tradeId]);
+  const trade = rows[0];
+  const input = paperExits.inputsFromTradeRow(trade, null, null);
+  // Force a HARD_STOP decision synthetically — we just need the apply path.
+  const decision = {
+    reason: "HARD_STOP",
+    closePrice: 105,
+    watermarks: {
+      maxPnlPct: Number(trade.max_pnl_pct ?? 0),
+      minPnlPct: Number(trade.min_pnl_pct ?? 0),
+      trailingActive: Boolean(trade.trailing_active),
+      trailingStopPrice: trade.trailing_stop_price != null ? Number(trade.trailing_stop_price) : null,
+    },
+  };
+  const applied = await paperExits.applyExitDecisionToTrade(pool, buyFill.tradeId, 105, decision);
+  assert(applied.closed === true, `H1 auto-exit closed`);
+
+  // Read final pnl_usd and pnl_pct.
+  const [finalRows] = await pool.execute("SELECT status, pnl_usd, pnl_pct, investment_usd FROM paper_trades WHERE id = ?", [buyFill.tradeId]);
+  const f = finalRows[0];
+  assert(f.status === "CLOSED", `H1 status = CLOSED (got ${f.status})`);
+  assert(Math.abs(Number(f.pnl_usd) - 70) < PRECISION_EPS, `H1 pnl_usd = $70 (got ${f.pnl_usd})`);
+  // The WHOLE point of the hotfix: pnl_pct must be relative to the ORIGINAL
+  // full investment ($1000), giving 7.0%. The bug would write 5.0% (derived
+  // from the remaining slice's investmentShare = $600).
+  assert(Math.abs(Number(f.pnl_pct) - 7.0) < 1e-3, `H1 pnl_pct = 7.0 (got ${f.pnl_pct}) — must be total/investment, not slice-based`);
+}
+
+// ── Test H2 (hotfix #2): DELETE is atomic — no intermediate state ─────────
+async function testH2_cancelAtomic(accountId) {
+  console.log("\nTest H2 (hotfix #2): cancelOrderWithRefund atomic — concurrent cancels, single winner");
+  await pool.execute("DELETE FROM paper_trades WHERE account_id = ?", [accountId]);
+  await pool.execute("DELETE FROM paper_orders WHERE account_id = ?", [accountId]);
+  await pool.execute("UPDATE paper_accounts SET cash = ?, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?", [TEST_INITIAL_CASH, accountId]);
+
+  // Open LIMIT BUY for $1000 at limit $50 on GOOGL — reserves $1000 in cash.
+  const orderId = await insertOrder(accountId, "GOOGL", "BUY", "LONG", "LIMIT", {
+    investment_usd: 1000, limit_price: 50,
+  });
+  const reserved = await paperFill.reserveCashForOrder(pool, orderId, accountId, 1000);
+  assert(reserved === true, `H2 reservation succeeded`);
+  let acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.cash) - (TEST_INITIAL_CASH - 1000)) < PRECISION_EPS, `H2 cash post-reserve = ${TEST_INITIAL_CASH - 1000}`);
+  assert(Math.abs(Number(acct.reserved_cash) - 1000) < PRECISION_EPS, `H2 reserved_cash = 1000`);
+
+  // Launch N=20 concurrent cancels on the same orderId.
+  const N = 20;
+  const promises = [];
+  for (let i = 0; i < N; i++) {
+    promises.push(paperFill.cancelOrderWithRefund(pool, orderId));
+  }
+  const results = await Promise.all(promises);
+  const winners = results.filter((r) => r.cancelled === true);
+  const losers = results.filter((r) => r.cancelled === false);
+  assert(winners.length === 1, `H2 exactly 1 cancel winner (got ${winners.length})`);
+  assert(losers.length === N - 1, `H2 exactly ${N - 1} losers (got ${losers.length})`);
+
+  // Cash must be restored to exactly initial — not +N*1000 (that would be the
+  // bug where every cancel re-refunded).
+  acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.cash) - TEST_INITIAL_CASH) < PRECISION_EPS, `H2 cash restored to exactly $${TEST_INITIAL_CASH} (got ${acct.cash})`);
+  assert(Math.abs(Number(acct.reserved_cash)) < PRECISION_EPS, `H2 reserved_cash = 0 (got ${acct.reserved_cash})`);
+
+  const [[orderRow]] = await pool.execute("SELECT status, reserved_amount FROM paper_orders WHERE id = ?", [orderId]);
+  assert(orderRow.status === "CANCELLED", `H2 order status = CANCELLED (got ${orderRow.status})`);
+  assert(Math.abs(Number(orderRow.reserved_amount)) < PRECISION_EPS, `H2 order reserved_amount = 0 (got ${orderRow.reserved_amount})`);
+}
+
+// ── Test H3 (hotfix #3): PATCH is atomic — failure reverts ────────────────
+async function testH3_modifyAtomic(accountId) {
+  console.log("\nTest H3 (hotfix #3): modifyPendingOrder atomic — invalid input leaves order untouched");
+  await pool.execute("DELETE FROM paper_trades WHERE account_id = ?", [accountId]);
+  await pool.execute("DELETE FROM paper_orders WHERE account_id = ?", [accountId]);
+  await pool.execute("UPDATE paper_accounts SET cash = ?, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?", [TEST_INITIAL_CASH, accountId]);
+
+  // Open LIMIT BUY $1000 at limit $50 on AAPL.
+  const orderId = await insertOrder(accountId, "AAPL", "BUY", "LONG", "LIMIT", {
+    investment_usd: 1000, limit_price: 50,
+  });
+  const reserved = await paperFill.reserveCashForOrder(pool, orderId, accountId, 1000);
+  assert(reserved === true, `H3 reservation succeeded`);
+
+  // PATCH with invalid limit_price (-5) — must fail and leave EVERYTHING
+  // untouched (including reservation + investment).
+  const bad = await paperFill.modifyPendingOrder(pool, orderId, { limit_price: -5, investment_usd: 500 });
+  assert(bad.ok === false, `H3 invalid PATCH rejected (got ${JSON.stringify(bad)})`);
+  assert(bad.reason === "INVALID_LIMIT_PRICE", `H3 rejection reason = INVALID_LIMIT_PRICE (got ${bad.reason})`);
+
+  // Assert order still has original values — no partial success.
+  const [[o1]] = await pool.execute("SELECT limit_price, investment_usd, reserved_amount FROM paper_orders WHERE id = ?", [orderId]);
+  assert(Math.abs(Number(o1.limit_price) - 50) < PRECISION_EPS, `H3 limit_price unchanged = 50 (got ${o1.limit_price})`);
+  assert(Math.abs(Number(o1.investment_usd) - 1000) < PRECISION_EPS, `H3 investment_usd unchanged = 1000 (got ${o1.investment_usd})`);
+  assert(Math.abs(Number(o1.reserved_amount) - 1000) < PRECISION_EPS, `H3 reserved_amount unchanged = 1000 (got ${o1.reserved_amount})`);
+  let acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.reserved_cash) - 1000) < PRECISION_EPS, `H3 account reserved_cash unchanged = 1000 (got ${acct.reserved_cash})`);
+
+  // Now a VALID PATCH: limit_price 45, investment_usd 500 — must succeed
+  // and update all fields atomically.
+  const good = await paperFill.modifyPendingOrder(pool, orderId, { limit_price: 45, investment_usd: 500 });
+  assert(good.ok === true, `H3 valid PATCH succeeded (got ${JSON.stringify(good)})`);
+  const [[o2]] = await pool.execute("SELECT limit_price, investment_usd, reserved_amount FROM paper_orders WHERE id = ?", [orderId]);
+  assert(Math.abs(Number(o2.limit_price) - 45) < PRECISION_EPS, `H3 limit_price = 45 (got ${o2.limit_price})`);
+  assert(Math.abs(Number(o2.investment_usd) - 500) < PRECISION_EPS, `H3 investment_usd = 500 (got ${o2.investment_usd})`);
+  assert(Math.abs(Number(o2.reserved_amount) - 500) < PRECISION_EPS, `H3 reserved_amount = 500 (got ${o2.reserved_amount})`);
+  acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.reserved_cash) - 500) < PRECISION_EPS, `H3 account reserved_cash = 500 (got ${acct.reserved_cash})`);
+  assert(Math.abs(Number(acct.cash) - (TEST_INITIAL_CASH - 500)) < PRECISION_EPS, `H3 account cash = ${TEST_INITIAL_CASH - 500} (got ${acct.cash})`);
+}
+
 // ── Test 9b: PF2 — duplicate SHORT position rejection ────────────────────
 async function test9b_duplicateShort(accountId) {
   console.log("\nTest 9b: PF2 — second SHORT on same (account, symbol) rejected as DUPLICATE_SHORT_POSITION");
@@ -529,6 +667,9 @@ async function test9_invariant(accountId) {
     await test6_timeExit(accountId);
     await test7_partialClose(accountId);
     await test8_orderModify(accountId);
+    await testH1_partialThenAutoExit(accountId);
+    await testH2_cancelAtomic(accountId);
+    await testH3_modifyAtomic(accountId);
     await test9b_duplicateShort(accountId);
     await test9_invariant(accountId);
 

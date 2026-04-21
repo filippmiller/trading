@@ -1240,3 +1240,266 @@ export async function patchPendingOrderPrices(
   }
   return { ok: true };
 }
+
+/**
+ * W3 hotfix #2 — atomic cancel-with-refund for a PENDING order.
+ *
+ * The old DELETE /api/paper/order path did (a) releaseReservationForOrder
+ * which committed its own transaction, then (b) a separate UPDATE to flip
+ * status to CANCELLED. Between those two commits the order is PENDING with
+ * reserved_amount = 0 — a concurrent `fillPendingOrders` run could see this
+ * half-state and attempt to fill from cash that has already been refunded.
+ * Two concurrent DELETEs could also double-refund.
+ *
+ * Collapsing both steps into ONE transaction under the canonical account →
+ * order lock order makes the cancellation observable atomically: either the
+ * caller sees PENDING-with-reservation, or CANCELLED-with-zero. No gap.
+ *
+ * Returns `{cancelled: true}` for the first caller that flips PENDING →
+ * CANCELLED. Every later caller returns `{cancelled: false}` — either the
+ * order no longer existed, was already cancelled/filled/rejected, or was
+ * raced out from under us.
+ */
+export async function cancelOrderWithRefund(
+  pool: mysqlTypes.Pool,
+  orderId: number
+): Promise<{ cancelled: boolean; reason?: string }> {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Pre-read — learn account_id without holding a lock so we can acquire
+    // locks in canonical order (accounts → orders). If the order is gone we
+    // report {cancelled:false} and commit the empty transaction.
+    const [preRows] = await conn.execute(
+      "SELECT account_id FROM paper_orders WHERE id = ?",
+      [orderId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (preRows.length === 0) {
+      await conn.rollback();
+      return { cancelled: false, reason: "ORDER_NOT_FOUND" };
+    }
+    const accountId = Number(preRows[0].account_id);
+
+    // LOCK STEP 1 — account (canonical order).
+    const [acctRows] = await conn.execute(
+      "SELECT id FROM paper_accounts WHERE id = ? FOR UPDATE",
+      [accountId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (acctRows.length === 0) {
+      await conn.rollback();
+      return { cancelled: false, reason: "ACCOUNT_NOT_FOUND" };
+    }
+
+    // LOCK STEP 2 — order. Authoritative status under lock.
+    const [orderRows] = await conn.execute(
+      "SELECT status, reserved_amount, reserved_short_margin FROM paper_orders WHERE id = ? FOR UPDATE",
+      [orderId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (orderRows.length === 0) {
+      await conn.rollback();
+      return { cancelled: false, reason: "ORDER_NOT_FOUND" };
+    }
+    const order = orderRows[0];
+    if (order.status !== "PENDING") {
+      // Already cancelled / filled / rejected — another caller won.
+      await conn.rollback();
+      return { cancelled: false, reason: `ORDER_NOT_PENDING_${order.status}` };
+    }
+    const reservedCash = Number(order.reserved_amount ?? 0);
+    const reservedShort = Number(order.reserved_short_margin ?? 0);
+
+    // Refund both reservation buckets atomically. Each UPDATE is guarded by a
+    // >= check on the destination column so an account with a bad invariant
+    // can't silently decrement past zero.
+    if (reservedCash > 0) {
+      const [refund] = await conn.execute(
+        "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
+        [reservedCash, reservedCash, accountId, reservedCash]
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (refund.affectedRows !== 1) {
+        await conn.rollback();
+        return { cancelled: false, reason: "RESERVED_CASH_UNDERFLOW" };
+      }
+    }
+    if (reservedShort > 0) {
+      const [refundShort] = await conn.execute(
+        "UPDATE paper_accounts SET cash = cash + ?, reserved_short_margin = reserved_short_margin - ? WHERE id = ? AND reserved_short_margin >= ?",
+        [reservedShort, reservedShort, accountId, reservedShort]
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (refundShort.affectedRows !== 1) {
+        await conn.rollback();
+        return { cancelled: false, reason: "RESERVED_SHORT_UNDERFLOW" };
+      }
+    }
+
+    // Flip the order in the same transaction. Status guard means the first
+    // caller to reach here wins; concurrent cancels see affectedRows === 0
+    // and roll back (leaving their refund-undo implicit via the rollback).
+    const [flip] = await conn.execute(
+      "UPDATE paper_orders SET status = 'CANCELLED', reserved_amount = 0, reserved_short_margin = 0 WHERE id = ? AND status = 'PENDING'",
+      [orderId]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (flip.affectedRows !== 1) {
+      await conn.rollback();
+      return { cancelled: false, reason: "ORDER_RACE_LOST" };
+    }
+
+    await conn.commit();
+    return { cancelled: true };
+  } catch (err) {
+    try { await conn.rollback(); } catch { /* ignore */ }
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * W3 hotfix #3 — atomic modify for a PENDING order.
+ *
+ * Replaces the old PATCH path that called `adjustReservation` (commits) then
+ * `patchPendingOrderPrices` (commits). If the second step failed (invalid
+ * price, race with a fill) the reservation resize had already been written,
+ * leaving the user with a reservation that didn't match the prices they'd
+ * see. One transaction means all-or-nothing: either every field changes
+ * together, or nothing changes.
+ *
+ * Lock order: accounts → orders (canonical). Price validation happens before
+ * any mutation so an invalid input bails before touching money.
+ */
+export async function modifyPendingOrder(
+  pool: mysqlTypes.Pool,
+  orderId: number,
+  patch: { limit_price?: number; stop_price?: number; investment_usd?: number }
+): Promise<{ ok: true; oldAmount: number; newAmount: number } | { ok: false; reason: string }> {
+  // Validate UP FRONT — no DB work if the input is garbage.
+  if (patch.limit_price != null) {
+    if (!Number.isFinite(patch.limit_price) || patch.limit_price <= 0) {
+      return { ok: false, reason: "INVALID_LIMIT_PRICE" };
+    }
+  }
+  if (patch.stop_price != null) {
+    if (!Number.isFinite(patch.stop_price) || patch.stop_price <= 0) {
+      return { ok: false, reason: "INVALID_STOP_PRICE" };
+    }
+  }
+  if (patch.investment_usd != null) {
+    if (!Number.isFinite(patch.investment_usd) || patch.investment_usd <= 0) {
+      return { ok: false, reason: "INVALID_INVESTMENT" };
+    }
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Pre-read to learn account_id for canonical lock ordering.
+    const [preRows] = await conn.execute(
+      "SELECT account_id FROM paper_orders WHERE id = ?",
+      [orderId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (preRows.length === 0) {
+      await conn.rollback();
+      return { ok: false, reason: "ORDER_NOT_FOUND" };
+    }
+    const accountId = Number(preRows[0].account_id);
+
+    // LOCK STEP 1 — accounts.
+    await conn.execute(
+      "SELECT id FROM paper_accounts WHERE id = ? FOR UPDATE",
+      [accountId]
+    );
+
+    // LOCK STEP 2 — order. Authoritative state + status guard.
+    const [orderRows] = await conn.execute(
+      "SELECT * FROM paper_orders WHERE id = ? FOR UPDATE",
+      [orderId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (orderRows.length === 0) {
+      await conn.rollback();
+      return { ok: false, reason: "ORDER_NOT_FOUND" };
+    }
+    const order = orderRows[0];
+    if (order.status !== "PENDING") {
+      await conn.rollback();
+      return { ok: false, reason: `ORDER_NOT_PENDING_${order.status}` };
+    }
+
+    const side = String(order.side) as "BUY" | "SELL";
+    const positionSide: "LONG" | "SHORT" = order.position_side === "SHORT" ? "SHORT" : "LONG";
+    const usesCashReservation = side === "BUY" && positionSide === "LONG";
+    const usesShortMargin = side === "SELL" && positionSide === "SHORT";
+
+    // Reservation delta — only relevant when investment_usd changed AND the
+    // order actually reserves something (open-side orders).
+    let oldAmount = 0;
+    let newAmount = 0;
+    if (patch.investment_usd != null && (usesCashReservation || usesShortMargin)) {
+      oldAmount = usesCashReservation
+        ? Number(order.reserved_amount ?? 0)
+        : Number(order.reserved_short_margin ?? 0);
+      newAmount = patch.investment_usd;
+      const delta = newAmount - oldAmount;
+      const col = usesCashReservation ? "reserved_cash" : "reserved_short_margin";
+
+      if (delta > 0) {
+        const [move] = await conn.execute(
+          `UPDATE paper_accounts SET cash = cash - ?, ${col} = ${col} + ? WHERE id = ? AND cash >= ?`,
+          [delta, delta, accountId, delta]
+        ) as [mysqlTypes.ResultSetHeader, unknown];
+        if (move.affectedRows !== 1) {
+          await conn.rollback();
+          return { ok: false, reason: "INSUFFICIENT_CASH" };
+        }
+      } else if (delta < 0) {
+        const diff = -delta;
+        const [move] = await conn.execute(
+          `UPDATE paper_accounts SET cash = cash + ?, ${col} = ${col} - ? WHERE id = ? AND ${col} >= ?`,
+          [diff, diff, accountId, diff]
+        ) as [mysqlTypes.ResultSetHeader, unknown];
+        if (move.affectedRows !== 1) {
+          await conn.rollback();
+          return { ok: false, reason: "RESERVATION_MISSING" };
+        }
+      }
+    }
+
+    // Build the single UPDATE for the order row. Only SET columns the caller
+    // supplied; unspecified fields keep their existing values.
+    const sets: string[] = [];
+    const params: (number | null)[] = [];
+    if (patch.limit_price != null) { sets.push("limit_price = ?"); params.push(patch.limit_price); }
+    if (patch.stop_price != null)  { sets.push("stop_price = ?");  params.push(patch.stop_price);  }
+    if (patch.investment_usd != null) {
+      sets.push("investment_usd = ?");
+      params.push(patch.investment_usd);
+      if (usesCashReservation) {
+        sets.push("reserved_amount = ?");
+        params.push(patch.investment_usd);
+      } else if (usesShortMargin) {
+        sets.push("reserved_short_margin = ?");
+        params.push(patch.investment_usd);
+      }
+    }
+    if (sets.length > 0) {
+      params.push(orderId);
+      const [upd] = await conn.execute(
+        `UPDATE paper_orders SET ${sets.join(", ")} WHERE id = ? AND status = 'PENDING'`,
+        params
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (upd.affectedRows !== 1) {
+        await conn.rollback();
+        return { ok: false, reason: "ORDER_RACE_LOST" };
+      }
+    }
+
+    await conn.commit();
+    return { ok: true, oldAmount, newAmount };
+  } catch (err) {
+    try { await conn.rollback(); } catch { /* ignore */ }
+    throw err;
+  } finally {
+    conn.release();
+  }
+}

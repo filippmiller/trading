@@ -237,6 +237,25 @@ function dayIndexFromKey(key: string): number {
 }
 
 /**
+ * W3 hotfix #4 — order snapshots by an intraday ordinal so "As-of" reports
+ * pick the latest snapshot within a day, not just the newest day. Matches
+ * the reversal_entries schema (`d{N}_morning` < `d{N}_midday` < `d{N}_close`).
+ *
+ * Returns a numeric ordinal that is monotonic across (day, intraday-slot).
+ * Unknown suffixes sort after the three known slots so we still pick them
+ * over an older day.
+ */
+function snapshotOrdinal(key: string): number {
+  const m = /^d(\d+)_([a-z_]+)$/i.exec(key);
+  if (!m) return 0;
+  const day = parseInt(m[1], 10);
+  const slot = m[2].toLowerCase();
+  const slotOrder: Record<string, number> = { morning: 0, midday: 1, close: 2 };
+  const offset = slot in slotOrder ? slotOrder[slot] : 3;
+  return day * 10 + offset;
+}
+
+/**
  * Evaluate a scenario for a single ticker across its timeline.
  * Returns a full per-ticker result even if the ticker doesn't match the
  * scenario filter — in that case, pnl values are null and direction=0,
@@ -397,7 +416,7 @@ export function summarizeScenario(
       shortPctSum += pnlPct;
     }
 
-    if (r.latestSnapshotKey && (!asOfKey || dayIndexFromKey(r.latestSnapshotKey) > dayIndexFromKey(asOfKey))) {
+    if (r.latestSnapshotKey && (!asOfKey || snapshotOrdinal(r.latestSnapshotKey) > snapshotOrdinal(asOfKey))) {
       asOfKey = r.latestSnapshotKey;
     }
 
