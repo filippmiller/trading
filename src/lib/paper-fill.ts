@@ -6,6 +6,22 @@
  * (`scripts/surveillance-cron.ts` every 15 min) call into `fillOrder` here so
  * the atomic guarantees are identical across both entry points.
  *
+ * CRON STRATEGY ATTRIBUTION (W2): The cron's `fillOrder` call site processes
+ * user-placed `paper_orders` rows (LIMIT/STOP queued from the UI) — NOT
+ * strategy-engine signals, which are owned by `paper_signals` and bypass
+ * `fillOrder` entirely (they mutate `paper_accounts.cash` directly from the
+ * cron's signal-close branch). Because `paper_orders` carries no `strategy_id`
+ * column today, cron-path fills store `strategy_id = NULL`. That is the
+ * SAME behaviour as manual UI fills — both end up as "user-initiated orders
+ * with no strategy FK". When W3+ introduces a strategy-emits-an-order path,
+ * add `paper_orders.strategy_id` and thread it through `opts.strategyId`.
+ *
+ * SNAPSHOT ERROR MODES (W2, codex F1): `recordEquitySnapshot` is split into
+ * two variants with opposite error semantics — `recordEquitySnapshotInTx`
+ * throws (so a snapshot INSERT failure rolls the fill back), while
+ * `recordEquitySnapshotSafe` catches + logs + returns false (so the hourly
+ * cron never aborts on one bad account). Never swap them.
+ *
  * Invariants maintained:
  *   1. `paper_accounts.cash` can never go negative — atomic
  *      `UPDATE ... WHERE cash >= ?` enforces this at the DB layer.
@@ -92,10 +108,20 @@ const SOFT_REJECT = new Set([
 ]);
 
 /**
- * Write an equity snapshot row for the account. Uses the supplied connection
- * so the snapshot can participate in an in-flight transaction (price-accurate
- * state at the instant of commit), or a fresh pool connection when called
- * from an idle hourly cron.
+ * Core snapshot routine — reads current cash + open-position book value and
+ * inserts into `paper_equity_snapshots`. Split into two exported wrappers
+ * (`recordEquitySnapshotInTx` / `recordEquitySnapshotSafe`) because the
+ * semantic around errors differs between callers:
+ *
+ *   - In-transaction: a snapshot INSERT failure MUST roll the fill back.
+ *     Committing a fill without the matching snapshot violates the
+ *     "snapshot-atomic-with-fill" claim, leaves the equity curve with a
+ *     missing data point whose absence looks like an empty hour rather than
+ *     a known anomaly. Throw → caller's `conn.rollback()` runs.
+ *
+ *   - Hourly cron: a snapshot failure for one account MUST NOT crash the
+ *     batch — other accounts still need their hourly data point. Catch →
+ *     log → return false. Caller continues with the next account.
  *
  * Positions are marked at `buy_price` here — not live price. That's
  * intentional: this helper runs inside a DB transaction without an outbound
@@ -108,50 +134,76 @@ const SOFT_REJECT = new Set([
  * `paper_equity_snapshots` sits at the END of the lock order chain
  * (paper_accounts → paper_orders → paper_trades → paper_equity_snapshots),
  * so inserting into it never precedes a write against the earlier three.
- *
- * Returns true if a row was written; false on any error (swallowed — a
- * snapshot write must NEVER fail the parent fill transaction).
  */
-export async function recordEquitySnapshot(
+async function recordEquitySnapshotCore(
   accountId: number,
   connOrPool: mysqlTypes.PoolConnection | mysqlTypes.Pool
 ): Promise<boolean> {
+  const [acctRows] = await connOrPool.execute(
+    "SELECT cash, reserved_cash FROM paper_accounts WHERE id = ?",
+    [accountId]
+  ) as [mysqlTypes.RowDataPacket[], unknown];
+  if (acctRows.length === 0) return false;
+  const cash = Number(acctRows[0].cash);
+  const reservedCash = Number(acctRows[0].reserved_cash ?? 0);
+
+  // Mark open positions at buy_price — conservative book value, avoids a
+  // network call inside the transaction. See helper header.
+  const [openRows] = await connOrPool.execute(
+    "SELECT COALESCE(SUM(quantity * buy_price), 0) AS open_value FROM paper_trades WHERE account_id = ? AND status = 'OPEN'",
+    [accountId]
+  ) as [mysqlTypes.RowDataPacket[], unknown];
+  const positionsValue = Number(openRows[0]?.open_value ?? 0);
+
+  const [closedRows] = await connOrPool.execute(
+    "SELECT COALESCE(SUM(pnl_usd), 0) AS realized FROM paper_trades WHERE account_id = ? AND status = 'CLOSED'",
+    [accountId]
+  ) as [mysqlTypes.RowDataPacket[], unknown];
+  const realizedPnl = Number(closedRows[0]?.realized ?? 0);
+
+  const equity = cash + reservedCash + positionsValue;
+
+  await connOrPool.execute(
+    `INSERT INTO paper_equity_snapshots
+       (account_id, cash, reserved_cash, positions_value, equity, realized_pnl)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [accountId, cash, reservedCash, positionsValue, equity, realizedPnl]
+  );
+  return true;
+}
+
+/**
+ * Transactional snapshot — call from inside `fillOrder` (or any other
+ * money-moving transaction). Throws on any DB error so the caller's
+ * `conn.rollback()` runs. NEVER swallows errors: a missing snapshot row
+ * after a successful fill is a correctness bug, not advisory.
+ *
+ * Caller MUST pass a `PoolConnection` that already owns an open transaction.
+ */
+export async function recordEquitySnapshotInTx(
+  conn: mysqlTypes.PoolConnection,
+  accountId: number
+): Promise<boolean> {
+  return recordEquitySnapshotCore(accountId, conn);
+}
+
+/**
+ * Cron-safe snapshot — call from the hourly cron path that iterates over
+ * many accounts. Catches + logs errors + returns `false` so a single failing
+ * account doesn't poison the batch for the rest. Accepts either a Pool or
+ * a Connection; no transaction is required.
+ */
+export async function recordEquitySnapshotSafe(
+  pool: mysqlTypes.Pool | mysqlTypes.PoolConnection,
+  accountId: number
+): Promise<boolean> {
   try {
-    const [acctRows] = await connOrPool.execute(
-      "SELECT cash, reserved_cash FROM paper_accounts WHERE id = ?",
-      [accountId]
-    ) as [mysqlTypes.RowDataPacket[], unknown];
-    if (acctRows.length === 0) return false;
-    const cash = Number(acctRows[0].cash);
-    const reservedCash = Number(acctRows[0].reserved_cash ?? 0);
-
-    // Mark open positions at buy_price — conservative book value, avoids a
-    // network call inside the transaction. See helper header.
-    const [openRows] = await connOrPool.execute(
-      "SELECT COALESCE(SUM(quantity * buy_price), 0) AS open_value FROM paper_trades WHERE account_id = ? AND status = 'OPEN'",
-      [accountId]
-    ) as [mysqlTypes.RowDataPacket[], unknown];
-    const positionsValue = Number(openRows[0]?.open_value ?? 0);
-
-    const [closedRows] = await connOrPool.execute(
-      "SELECT COALESCE(SUM(pnl_usd), 0) AS realized FROM paper_trades WHERE account_id = ? AND status = 'CLOSED'",
-      [accountId]
-    ) as [mysqlTypes.RowDataPacket[], unknown];
-    const realizedPnl = Number(closedRows[0]?.realized ?? 0);
-
-    const equity = cash + reservedCash + positionsValue;
-
-    await connOrPool.execute(
-      `INSERT INTO paper_equity_snapshots
-         (account_id, cash, reserved_cash, positions_value, equity, realized_pnl)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [accountId, cash, reservedCash, positionsValue, equity, realizedPnl]
-    );
-    return true;
-  } catch {
-    // Snapshot writes are advisory — never let a failure here cascade into
-    // rolling back a money-moving transaction. Caller should not check the
-    // return value for correctness decisions, only for telemetry.
+    return await recordEquitySnapshotCore(accountId, pool);
+  } catch (err) {
+    // Logged so the cron can surface repeated failures; swallowed so the
+    // per-account loop carries on to the next account.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`recordEquitySnapshotSafe: account=${accountId} failed: ${msg}`);
     return false;
   }
 }
@@ -525,11 +577,12 @@ export async function fillOrder(
     // order chain so this insert never precedes an earlier-chain write.
     //
     // Only write on `filled` (positive cash move) — soft rejects that
-    // don't change cash don't need a new snapshot row. Failures inside
-    // recordEquitySnapshot are swallowed so a snapshot write never fails
-    // the fill.
+    // don't change cash don't need a new snapshot row. `recordEquitySnapshotInTx`
+    // THROWS on any DB error so we roll back the fill rather than commit a
+    // fill without its matching snapshot (codex F1 — the old advisory-swallow
+    // behaviour let the fill commit silently with no snapshot row).
     if (result.filled && accountIdForSnapshot != null) {
-      await recordEquitySnapshot(accountIdForSnapshot, conn);
+      await recordEquitySnapshotInTx(conn, accountIdForSnapshot);
     }
 
     if (result.filled) {

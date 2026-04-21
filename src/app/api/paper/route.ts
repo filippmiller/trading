@@ -107,10 +107,14 @@ export async function GET() {
       ? ((equity.equity - account.initial_cash) / account.initial_cash) * 100
       : 0;
 
-    // Win-rate math (W2, finding #14):
-    //   - SCRATCHED (pnl_usd === 0) are excluded from BOTH numerator and
-    //     denominator. A break-even trade is neither a win nor a loss — it's
-    //     noise that shouldn't inflate or deflate the stat.
+    // Win-rate math (W2, finding #14 + codex F3):
+    //
+    //   - `win_rate_pct` keeps its ORIGINAL denominator (`wins / closed_trades`)
+    //     for backward-compat. Any external consumer that joined the KPI to
+    //     `closed_trades` stays correct.
+    //   - `win_rate_excl_scratched_pct` is the new SCRATCHED-excluded variant
+    //     — the KPI we actually want to show in the UI, where a break-even
+    //     trade is treated as noise rather than a 0%-win dilution.
     //   - profit_factor = gross_wins / |gross_losses|. If there were any
     //     winning trades but no losers, returns `null` (JSON-safe sentinel
     //     for infinity) — UI renders as "∞".
@@ -121,7 +125,10 @@ export async function GET() {
     const nonScratched = closedTrades.filter(r => Number(r.pnl_usd) !== 0);
     const wins = nonScratched.filter(r => Number(r.pnl_usd) > 0).length;
     const losses = nonScratched.length - wins;
-    const winRate = nonScratched.length > 0 ? (wins / nonScratched.length) * 100 : 0;
+    // Original (backward-compat) win rate: wins ÷ ALL closed trades.
+    const winRate = closedTrades.length > 0 ? (wins / closedTrades.length) * 100 : 0;
+    // New (scratched-excluded) win rate: wins ÷ non-scratched closed trades.
+    const winRateExclScratched = nonScratched.length > 0 ? (wins / nonScratched.length) * 100 : 0;
     const realizedPnl = closedTrades.reduce((s, r) => s + Number(r.pnl_usd || 0), 0);
 
     const grossWins = nonScratched
@@ -152,7 +159,10 @@ export async function GET() {
         stale_positions: equity.stale_positions,
         total_return_pct: totalReturn,
         realized_pnl_usd: realizedPnl,
+        // Original (backward-compat) denominator = `closed_trades`.
         win_rate_pct: winRate,
+        // Scratched-excluded variant — prefer this in UI displays.
+        win_rate_excl_scratched_pct: winRateExclScratched,
         closed_trades: closedTrades.length,
         wins_count: wins,
         losses_count: losses,

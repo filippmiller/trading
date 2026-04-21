@@ -16,7 +16,7 @@
 import cron from "node-cron";
 import mysql from "mysql2/promise";
 import { ensureAppBootstrapReady } from "../src/lib/bootstrap";
-import { fillOrder as sharedFillOrder, recordEquitySnapshot } from "../src/lib/paper-fill";
+import { fillOrder as sharedFillOrder, recordEquitySnapshotSafe } from "../src/lib/paper-fill";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -1233,11 +1233,16 @@ async function jobMonitorPositionsImpl() {
 
     if (!shouldFill) continue;
 
-    // Cron-path fill. strategyId is NOT passed here because paper_orders
-    // doesn't currently carry a strategy FK — these are LIMIT/STOP orders
-    // queued by the user from the UI, not by the strategy engine (which
-    // writes to paper_signals, a separate table). When W3+ wires strategy
-    // context through paper_orders, include { strategyId: order.strategy_id }.
+    // Cron-path fill. strategyId is DELIBERATELY NOT passed here — codex F2.
+    // These `pendingOrders` rows come from `paper_orders`, which is the user's
+    // UI-queued LIMIT/STOP book. The strategy engine writes to `paper_signals`
+    // (different table, different cash flow, handled above this block). So
+    // cron-generated trades from this call will store `paper_trades.strategy_id
+    // = NULL` — same as manual MARKET BUYs from the UI. That's CORRECT, not
+    // a bug: these orders have no strategy attribution by construction.
+    // When W3+ introduces strategy-emits-an-order (e.g. to route a signal
+    // through the same limit-fill machinery), add `paper_orders.strategy_id`
+    // and pass `{ strategyId: order.strategy_id }` here.
     const result = await sharedFillOrder(db, Number(order.id), price, {
       fillRationale: "SPOT",
     });
@@ -1685,7 +1690,9 @@ async function jobHourlyEquitySnapshots() {
   );
   let written = 0;
   for (const acct of accounts) {
-    const ok = await recordEquitySnapshot(Number(acct.id), db);
+    // Safe variant: catches + logs per-account errors so one bad account
+    // (missing row, schema skew) can't poison the whole hourly batch.
+    const ok = await recordEquitySnapshotSafe(db, Number(acct.id));
     if (ok) written++;
   }
   log(`  Hourly snapshots: wrote ${written} rows across ${accounts.length} non-dormant accounts`);

@@ -49,7 +49,10 @@ type AccountState = {
   stale_positions: number;
   total_return_pct: number;
   realized_pnl_usd: number;
+  /** Original (backward-compat) denominator = closed_trades. */
   win_rate_pct: number;
+  /** W2 / codex F3 — scratched-excluded denominator. Prefer in UI. */
+  win_rate_excl_scratched_pct: number;
   closed_trades: number;
   wins_count: number;
   losses_count: number;
@@ -318,15 +321,16 @@ export default function PaperTradingPage() {
             <p className={`text-2xl font-bold ${account.realized_pnl_usd >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
               {account.realized_pnl_usd >= 0 ? "+" : ""}${account.realized_pnl_usd.toFixed(2)}
             </p>
-            {/* W2: surface wins / losses / scratched separately. Scratched
-                trades are excluded from win_rate_pct and profit_factor so
-                "50% win" with half the trades being break-evens no longer
-                lies. profit_factor === null is the JSON-safe sentinel for
-                "infinity" — all winners and no losers — rendered as "∞". */}
+            {/* W2 / codex F3: surface wins / losses / scratched separately.
+                UI uses `win_rate_excl_scratched_pct` (SCRATCHED-excluded) as
+                the honest KPI; the legacy `win_rate_pct` field stays on the
+                API response for backward-compat with any external consumer.
+                profit_factor === null is the JSON-safe sentinel for "infinity"
+                — all winners and no losers — rendered as "∞". */}
             <p className="text-xs text-zinc-400 mt-1">
               {account.wins_count}W · {account.losses_count}L
               {account.scratched_count > 0 ? ` · ${account.scratched_count} scratched` : ""}
-              {(account.wins_count + account.losses_count) > 0 ? ` · ${account.win_rate_pct.toFixed(0)}% win` : ""}
+              {(account.wins_count + account.losses_count) > 0 ? ` · ${account.win_rate_excl_scratched_pct.toFixed(0)}% win` : ""}
             </p>
             <p className="text-[10px] text-zinc-400 mt-0.5">
               PF{" "}

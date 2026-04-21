@@ -208,12 +208,17 @@ async function test2_winRateMath(accountId) {
   const nonScratched = closedRows.filter(r => Number(r.pnl_usd) !== 0);
   const wins = nonScratched.filter(r => Number(r.pnl_usd) > 0).length;
   const scratched = closedRows.length - nonScratched.length;
-  const winRate = nonScratched.length > 0 ? (wins / nonScratched.length) * 100 : 0;
+  // codex F3 — two denominators: legacy (closed_trades) + scratched-excluded.
+  const winRateLegacy = closedRows.length > 0 ? (wins / closedRows.length) * 100 : 0;
+  const winRateExcl = nonScratched.length > 0 ? (wins / nonScratched.length) * 100 : 0;
   const grossWins = nonScratched.filter(r => Number(r.pnl_usd) > 0).reduce((s, r) => s + Number(r.pnl_usd), 0);
   const grossLosses = nonScratched.filter(r => Number(r.pnl_usd) < 0).reduce((s, r) => s + Math.abs(Number(r.pnl_usd)), 0);
   const profitFactor = grossLosses > 0 ? grossWins / grossLosses : (grossWins > 0 ? null : 0);
 
-  assert(winRate === 75, `win_rate_pct = 75 (3/4, scratched excluded; got ${winRate})`);
+  // 3 wins / 5 closed = 60% (legacy)
+  assert(winRateLegacy === 60, `win_rate_pct (legacy, 3/5) = 60 (got ${winRateLegacy})`);
+  // 3 wins / 4 non-scratched = 75% (excl)
+  assert(winRateExcl === 75, `win_rate_excl_scratched_pct (3/4) = 75 (got ${winRateExcl})`);
   assert(scratched === 1, `scratched_count = 1 (got ${scratched})`);
   assert(profitFactor !== null && Math.abs(profitFactor - 3.5) < 0.01, `profit_factor ≈ 3.5 (got ${profitFactor})`);
 
@@ -226,6 +231,8 @@ async function test2_winRateMath(accountId) {
       const body = await res.json();
       assert(typeof body?.account?.profit_factor !== "undefined", `API route returns profit_factor field`);
       assert(typeof body?.account?.scratched_count === "number", `API route returns scratched_count field`);
+      assert(typeof body?.account?.win_rate_pct === "number", `API route returns win_rate_pct (legacy) field`);
+      assert(typeof body?.account?.win_rate_excl_scratched_pct === "number", `API route returns win_rate_excl_scratched_pct (new) field`);
     }
   } catch { /* dev server not running — fine, local math already asserted */ }
 }
@@ -331,6 +338,62 @@ async function test5_stopFill(accountId) {
   assert(Number(orderRows[0].reserved_amount) === 0, `reserved_amount cleared (got ${orderRows[0].reserved_amount})`);
 }
 
+// ── Test 6b: OHLC double-fill protection (codex round-2 OHLC-A) ────────────
+async function test6b_ohlcDoubleFillProtection(accountId) {
+  console.log("\nTest 6b: OHLC/SPOT paths cannot double-fill a single LIMIT order");
+  // Insert a single pending LIMIT BUY order, then call fillOrder twice at
+  // the same fillPrice. The first fillOrder must succeed; the second MUST
+  // return { filled: false, rejection: ORDER_NOT_PENDING_FILLED } — it's
+  // the status-guarded UPDATE inside fillOrder that makes the OHLC vs SPOT
+  // paths safe against racing each other within a single pending-orders
+  // scan. If this ever fails we've lost the invariant that a FILLED order
+  // cannot transition again.
+  const orderId = await insertOrder(accountId, "TSLA", "BUY", "LIMIT", {
+    investment_usd: 1000,
+    limit_price: 200,
+  });
+  const reserved = await paperFill.reserveCashForOrder(pool, orderId, accountId, 1000);
+  assert(reserved === true, `reserveCashForOrder(LIMIT BUY) succeeded`);
+
+  const first = await paperFill.fillOrder(pool, orderId, 195, {
+    strategyLabel: "LIMIT BUY",
+    fillRationale: "OHLC_TOUCH",
+  });
+  assert(first.filled === true, `first fillOrder succeeded (got ${JSON.stringify(first)})`);
+
+  // Second call — simulating the SPOT path trying to fill the same order
+  // that OHLC already filled in the same batch.
+  const second = await paperFill.fillOrder(pool, orderId, 195, {
+    strategyLabel: "LIMIT BUY",
+    fillRationale: "SPOT",
+  });
+  assert(second.filled === false, `second fillOrder rejected (got ${JSON.stringify(second)})`);
+  assert(
+    second.rejection === "ORDER_NOT_PENDING_FILLED",
+    `second rejection = ORDER_NOT_PENDING_FILLED (got ${second.rejection})`
+  );
+
+  // Only one trade row created for that order.
+  const [tradeRows] = await pool.execute(
+    "SELECT COUNT(*) AS cnt FROM paper_trades WHERE account_id = ? AND symbol = 'TSLA'",
+    [accountId]
+  );
+  assert(
+    Number(tradeRows[0].cnt) === 1,
+    `exactly one paper_trades row for TSLA (got ${tradeRows[0].cnt})`
+  );
+
+  // reserved_amount cleared exactly once (not double-refunded).
+  const [acctRows] = await pool.execute(
+    "SELECT cash, reserved_cash FROM paper_accounts WHERE id = ?",
+    [accountId]
+  );
+  assert(
+    Math.abs(Number(acctRows[0].reserved_cash)) < PRECISION_EPS,
+    `reserved_cash cleared (got ${acctRows[0].reserved_cash})`
+  );
+}
+
 // ── Test 6: LIMIT OHLC touch fill ─────────────────────────────────────────
 async function test6_limitOhlcFill() {
   console.log("\nTest 6: evaluateLimitFill recognizes an OHLC_TOUCH even when spot > limit");
@@ -387,6 +450,7 @@ async function test6_limitOhlcFill() {
     await test3_strategyPersistence(accountId);
     await test4_reconciliationInvariant(accountId);
     await test5_stopFill(accountId);
+    await test6b_ohlcDoubleFillProtection(accountId);
     await test6_limitOhlcFill();
 
     console.log(`\n== SUMMARY: ${passed} passed, ${failed} failed ==`);

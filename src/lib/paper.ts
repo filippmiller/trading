@@ -1,5 +1,5 @@
 import { getPool, mysql } from "@/lib/db";
-import { fillOrder, recordEquitySnapshot, type FillRationale } from "@/lib/paper-fill";
+import { fillOrder, recordEquitySnapshotSafe, type FillRationale } from "@/lib/paper-fill";
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 const SYMBOL_RE = /^[A-Z0-9.\-]{1,16}$/;
@@ -294,6 +294,40 @@ export function _resetIntradayBarsFetcher(): void {
  * limit order is "you get the limit or better") + rationale, or null if no
  * touch happened and the spot check also did not trigger.
  *
+ * OHLC self-audit notes (W2 round-2):
+ *
+ * OHLC-A — Double-fill safety: `fillPendingOrders` produces exactly ONE
+ *   fillOrder call per pending order per batch (spot & OHLC checks are
+ *   mutually-exclusive branches of the same decision). If two batches race
+ *   (UI + cron concurrent), the status-guarded UPDATE in fillOrder
+ *   (`WHERE status='PENDING'`) rejects the second attempt with
+ *   `ORDER_NOT_PENDING_FILLED`. No double-fill possible.
+ *
+ * OHLC-B — Time basis: `bar.t` is Unix seconds (from Yahoo's `timestamp`
+ *   field). `createdAt` is a JS Date built from MySQL DATETIME(6) with the
+ *   mysql2 pool configured `timezone: "Z"` (see src/lib/db.ts), so the Date
+ *   reflects true UTC epoch. `Math.floor(createdAt.getTime() / 1000)` is
+ *   Unix seconds — SAME basis as `bar.t`. Comparison is valid across any
+ *   host timezone. Do NOT pass a string in; the mysql2 driver already
+ *   returns Date objects for DATETIME columns.
+ *
+ * OHLC-C — Bar validity: non-finite high/low values are skipped defensively
+ *   inside this loop even though `fetchIntradayBarsFromYahoo` already
+ *   filters them — a monkey-patched test fetcher could return malformed
+ *   bars, and we'd rather emit a SPOT (or null) decision than crash.
+ *
+ * OHLC-D — Market-hours: this function is DELIBERATELY NOT gated on
+ *   `live.isLive`. LIMIT orders are allowed to trigger on historical
+ *   intraday bars even when called outside RTH — a limit price pierced at
+ *   10:17 ET should fill regardless of whether the next poll runs at
+ *   10:20 or 17:30. The MARKET-order RTH gate lives in `fillPendingOrders`,
+ *   not here.
+ *
+ * OHLC-E — Wall-clock drift: bars are filtered only on `bar.t >= createdAtSec`
+ *   (the lower bound). There is NO upper bound — a bar whose timestamp is
+ *   30 minutes old is still a valid touch detector. This is intentional
+ *   for closed-market and low-activity symbols where the last bar may lag.
+ *
  * @param side       BUY or SELL
  * @param limit      Order's limit price
  * @param spot       Current live price
@@ -307,13 +341,21 @@ export function evaluateLimitFill(
   bars: IntradayBar[],
   createdAt: Date
 ): { fillPrice: number; rationale: FillRationale } | null {
-  // Spot check first — cheaper, matches legacy behavior.
-  if (side === "BUY" && spot <= limit) return { fillPrice: spot, rationale: "SPOT" };
-  if (side === "SELL" && spot >= limit) return { fillPrice: spot, rationale: "SPOT" };
+  // Spot check first — cheaper, matches legacy behavior. Guard against NaN
+  // spot (defensive: callers passing through `price` already guard earlier).
+  if (Number.isFinite(spot)) {
+    if (side === "BUY" && spot <= limit) return { fillPrice: spot, rationale: "SPOT" };
+    if (side === "SELL" && spot >= limit) return { fillPrice: spot, rationale: "SPOT" };
+  }
 
   // OHLC check — find any bar whose low..high range pierced the limit.
   const createdAtSec = Math.floor(createdAt.getTime() / 1000);
   for (const bar of bars) {
+    // OHLC-C defensive filter — skip bars with non-finite high/low. The
+    // Yahoo fetcher filters these already; this second check catches fixture
+    // bars from tests / future fetcher implementations.
+    if (!Number.isFinite(bar.high) || !Number.isFinite(bar.low)) continue;
+    if (!Number.isFinite(bar.t)) continue;
     if (bar.t < createdAtSec) continue;
     if (side === "BUY" && bar.low <= limit) {
       return { fillPrice: limit, rationale: "OHLC_TOUCH" };
@@ -413,9 +455,11 @@ export async function fillPendingOrders(): Promise<number> {
 }
 
 /**
- * Re-export so API + cron callers don't need a second import to take
- * snapshots. See `src/lib/paper-fill.ts:recordEquitySnapshot` for semantics.
+ * Re-export the Safe (cron / idle) snapshot variant. In-transaction callers
+ * must import `recordEquitySnapshotInTx` directly from `@/lib/paper-fill`;
+ * we don't re-export it here to keep the distinction explicit and prevent
+ * accidental use from non-transactional call sites.
  */
-export { recordEquitySnapshot };
+export { recordEquitySnapshotSafe };
 
 export { SYMBOL_RE };

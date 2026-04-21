@@ -353,6 +353,12 @@ async function runSchemaMigrations() {
   } catch (err: unknown) {
     if ((err as { errno?: number }).errno !== 1061) throw err;
   }
+  // ON DELETE SET NULL (codex F5): preserves the trade row + denormalized
+  // `strategy` VARCHAR label when a strategy is deleted, BUT the exact FK
+  // is lost. That's the accepted trade-off to allow strategies to be
+  // garbage-collected without rewriting historical trade rows. If stricter
+  // audit attribution is needed, switch to RESTRICT and retire strategies
+  // via `enabled=0` rather than DELETE.
   try {
     await pool.execute(
       "ALTER TABLE paper_trades ADD CONSTRAINT FK_paper_trades_strategy FOREIGN KEY (strategy_id) REFERENCES paper_strategies(id) ON DELETE SET NULL"
