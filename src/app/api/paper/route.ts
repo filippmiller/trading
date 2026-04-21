@@ -25,8 +25,15 @@ export async function GET() {
 
     const filled = await fillPendingOrders();
 
+    // Left join paper_strategies so the UI can render the strategy NAME
+    // (not just the denormalized VARCHAR label) for cron-generated trades.
+    // Manual trades have strategy_id=NULL so strategy_name stays NULL too.
     const [tradeRows] = await pool.execute<mysql.RowDataPacket[]>(
-      "SELECT * FROM paper_trades WHERE account_id = ? ORDER BY status ASC, created_at DESC",
+      `SELECT t.*, s.name AS strategy_name
+         FROM paper_trades t
+         LEFT JOIN paper_strategies s ON s.id = t.strategy_id
+        WHERE t.account_id = ?
+        ORDER BY t.status ASC, t.created_at DESC`,
       [account.id]
     );
 
@@ -70,6 +77,8 @@ export async function GET() {
         as_of: isOpen ? (live?.asOf?.toISOString() ?? null) : null,
         is_live: isOpen ? (live?.isLive ?? false) : true,
         strategy: r.strategy,
+        strategy_id: r.strategy_id != null ? Number(r.strategy_id) : null,
+        strategy_name: r.strategy_name ?? null,
         status: r.status,
         notes: r.notes,
         created_at: r.created_at,
@@ -98,10 +107,37 @@ export async function GET() {
       ? ((equity.equity - account.initial_cash) / account.initial_cash) * 100
       : 0;
 
+    // Win-rate math (W2, finding #14):
+    //   - SCRATCHED (pnl_usd === 0) are excluded from BOTH numerator and
+    //     denominator. A break-even trade is neither a win nor a loss — it's
+    //     noise that shouldn't inflate or deflate the stat.
+    //   - profit_factor = gross_wins / |gross_losses|. If there were any
+    //     winning trades but no losers, returns `null` (JSON-safe sentinel
+    //     for infinity) — UI renders as "∞".
+    //   - scratched_count exposes the excluded count so UI can show
+    //     "X wins · Y losses · Z scratched" honestly.
     const closedTrades = tradeRows.filter(r => r.status === "CLOSED");
-    const wins = closedTrades.filter(r => Number(r.pnl_usd) > 0).length;
-    const winRate = closedTrades.length > 0 ? (wins / closedTrades.length) * 100 : 0;
+    const scratchedCount = closedTrades.filter(r => Number(r.pnl_usd) === 0).length;
+    const nonScratched = closedTrades.filter(r => Number(r.pnl_usd) !== 0);
+    const wins = nonScratched.filter(r => Number(r.pnl_usd) > 0).length;
+    const losses = nonScratched.length - wins;
+    const winRate = nonScratched.length > 0 ? (wins / nonScratched.length) * 100 : 0;
     const realizedPnl = closedTrades.reduce((s, r) => s + Number(r.pnl_usd || 0), 0);
+
+    const grossWins = nonScratched
+      .filter(r => Number(r.pnl_usd) > 0)
+      .reduce((s, r) => s + Number(r.pnl_usd), 0);
+    const grossLosses = nonScratched
+      .filter(r => Number(r.pnl_usd) < 0)
+      .reduce((s, r) => s + Math.abs(Number(r.pnl_usd)), 0);
+    let profitFactor: number | null;
+    if (grossLosses > 0) {
+      profitFactor = grossWins / grossLosses;
+    } else if (grossWins > 0) {
+      profitFactor = null; // ∞ — all-winners case; UI renders "∞"
+    } else {
+      profitFactor = 0;    // no wins AND no losses (all scratched / empty)
+    }
 
     return NextResponse.json({
       account: {
@@ -118,6 +154,10 @@ export async function GET() {
         realized_pnl_usd: realizedPnl,
         win_rate_pct: winRate,
         closed_trades: closedTrades.length,
+        wins_count: wins,
+        losses_count: losses,
+        scratched_count: scratchedCount,
+        profit_factor: profitFactor,
       },
       trades,
       pendingOrders,

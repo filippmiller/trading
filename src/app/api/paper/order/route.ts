@@ -147,8 +147,16 @@ export async function POST(req: Request) {
     }
 
     // For MARKET: immediately attempt fill at the live price captured above.
+    // Manual UI trades get a `MANUAL BUY`/`MANUAL SELL` strategy label —
+    // this is the denormalized free-form column; strategy_id stays NULL so
+    // the trade history's "(manual)" badge is driven by FK absence, not
+    // string matching.
     if (order_type === "MARKET" && marketLivePrice != null) {
-      const fill = await fillOrder(pool, orderId, marketLivePrice);
+      const fill = await fillOrder(pool, orderId, marketLivePrice, {
+        strategyId: null,
+        strategyLabel: `MANUAL ${side}`,
+        fillRationale: "MANUAL",
+      });
       const [orderRows] = await pool.execute<mysql.RowDataPacket[]>(
         "SELECT status, filled_price, rejection_reason, trade_id FROM paper_orders WHERE id = ?",
         [orderId]
