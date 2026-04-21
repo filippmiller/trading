@@ -104,6 +104,7 @@ export type PaperAccount = {
   initial_cash: number;
   cash: number;
   reserved_cash: number;
+  reserved_short_margin: number;
   created_at: string;
 };
 
@@ -121,6 +122,7 @@ export async function getDefaultAccount(): Promise<PaperAccount> {
       initial_cash: Number(r.initial_cash),
       cash: Number(r.cash),
       reserved_cash: Number(r.reserved_cash ?? 0),
+      reserved_short_margin: Number(r.reserved_short_margin ?? 0),
       created_at: r.created_at,
     };
   }
@@ -138,6 +140,7 @@ export async function getDefaultAccount(): Promise<PaperAccount> {
     initial_cash: Number(r.initial_cash),
     cash: Number(r.cash),
     reserved_cash: Number(r.reserved_cash ?? 0),
+    reserved_short_margin: Number(r.reserved_short_margin ?? 0),
     created_at: r.created_at,
   };
 }
@@ -158,6 +161,7 @@ export type PositionMark = {
 export async function computeAccountEquity(accountId: number): Promise<{
   cash: number;
   reserved_cash: number;
+  reserved_short_margin: number;
   positions_value: number;
   equity: number;
   open_positions: number;
@@ -166,14 +170,21 @@ export async function computeAccountEquity(accountId: number): Promise<{
 }> {
   const pool = await getPool();
   const [accounts] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT cash, reserved_cash FROM paper_accounts WHERE id = ?",
+    "SELECT cash, reserved_cash, reserved_short_margin FROM paper_accounts WHERE id = ?",
     [accountId]
   );
   const cash = accounts.length > 0 ? Number(accounts[0].cash) : 0;
   const reservedCash = accounts.length > 0 ? Number(accounts[0].reserved_cash ?? 0) : 0;
+  const reservedShortMargin = accounts.length > 0 ? Number(accounts[0].reserved_short_margin ?? 0) : 0;
 
+  // W3: select side + closed_quantity so LONG vs SHORT mark-to-market
+  // contributions net correctly. LONG open value contributes remaining_qty *
+  // mark_price; SHORT unrealized-pnl contribution is (buy_price - mark_price)
+  // * remaining_qty (direction-aware), stacking ON TOP of the held margin.
   const [positions] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT symbol, quantity, buy_price, investment_usd FROM paper_trades WHERE account_id = ? AND status = 'OPEN'",
+    `SELECT symbol, side, quantity, closed_quantity, buy_price, investment_usd
+       FROM paper_trades
+      WHERE account_id = ? AND status = 'OPEN'`,
     [accountId]
   );
 
@@ -181,8 +192,9 @@ export async function computeAccountEquity(accountId: number): Promise<{
     return {
       cash,
       reserved_cash: reservedCash,
+      reserved_short_margin: reservedShortMargin,
       positions_value: 0,
-      equity: cash + reservedCash,
+      equity: cash + reservedCash + reservedShortMargin,
       open_positions: 0,
       stale_positions: 0,
       marks: {},
@@ -196,12 +208,20 @@ export async function computeAccountEquity(accountId: number): Promise<{
   for (const p of positions) {
     const live = prices[p.symbol];
     const buyPrice = Number(p.buy_price);
-    const qty = Number(p.quantity) || Number(p.investment_usd) / buyPrice;
+    const totalQty = Number(p.quantity) || Number(p.investment_usd) / buyPrice;
+    const closedQty = Number(p.closed_quantity ?? 0);
+    const remaining = Math.max(0, totalQty - closedQty);
     const markPrice = live?.price ?? buyPrice;
-    positions_value += qty * markPrice;
+    if (p.side === "SHORT") {
+      // SHORT: margin is already counted in reserved_short_margin. Contribution
+      // to positions_value is the UNREALIZED P&L on the short (price movement
+      // in our favour = positive). (buy_price - mark_price) * remaining.
+      positions_value += (buyPrice - markPrice) * remaining;
+    } else {
+      // LONG: contribute mark-to-market value of remaining shares.
+      positions_value += remaining * markPrice;
+    }
     if (!live) stale++;
-    // Per-symbol mark record; last-write-wins if a position has duplicate
-    // symbols, which is intentional — they share the same quote.
     marks[p.symbol] = {
       symbol: p.symbol,
       markPrice,
@@ -210,14 +230,15 @@ export async function computeAccountEquity(accountId: number): Promise<{
     };
   }
 
-  // Equity includes reserved cash because it's still the account's money —
-  // it's just locked against a PENDING order. Not including it would show
-  // a misleadingly low "equity" the instant a user places a LIMIT BUY.
+  // Equity includes reserved cash AND short margin — both are still the
+  // account's money, just locked against open exposure. positions_value
+  // already reflects direction-aware mark contributions.
   return {
     cash,
     reserved_cash: reservedCash,
+    reserved_short_margin: reservedShortMargin,
     positions_value,
-    equity: cash + reservedCash + positions_value,
+    equity: cash + reservedCash + reservedShortMargin + positions_value,
     open_positions: positions.length,
     stale_positions: stale,
     marks,
@@ -379,16 +400,18 @@ export function evaluateLimitFill(
  */
 export async function fillPendingOrders(): Promise<number> {
   const pool = await getPool();
+  // W3: select position_side too so LIMIT/STOP evaluation knows which
+  // direction the order is opening/closing. SHORT orders trigger at
+  // direction-aware thresholds — a SELL-SHORT LIMIT "sell at 105 or higher"
+  // mirrors BUY LIMIT "buy at 95 or lower."
   const [pending] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT id, account_id, symbol, side, order_type, limit_price, stop_price, created_at FROM paper_orders WHERE status = 'PENDING'"
+    "SELECT id, account_id, symbol, side, position_side, order_type, limit_price, stop_price, created_at FROM paper_orders WHERE status = 'PENDING'"
   );
   if (pending.length === 0) return 0;
 
   const symbols = Array.from(new Set(pending.map(o => o.symbol)));
   const prices = await fetchLivePrices(symbols);
 
-  // Only fetch OHLC bars for symbols that actually have a pending LIMIT order —
-  // no point paying the Yahoo round-trip for MARKET/STOP.
   const limitSymbols = Array.from(new Set(
     pending.filter(o => o.order_type === "LIMIT").map(o => o.symbol)
   ));
@@ -399,8 +422,6 @@ export async function fillPendingOrders(): Promise<number> {
       try {
         barsBySymbol[s] = await fetchIntradayBars(s);
       } catch {
-        // Fall back silently to spot-only for this symbol. Do NOT fail the
-        // batch on one bad upstream.
         barsBySymbol[s] = [];
       }
     }));
@@ -421,13 +442,18 @@ export async function fillPendingOrders(): Promise<number> {
     let rationale: FillRationale | undefined;
 
     if (type === "MARKET") {
-      // Only fill a PENDING MARKET order when the quote is live — outside
-      // RTH the last-close price is not an honest execution.
       if (live.isLive) {
         fillPrice = price;
         rationale = "SPOT";
       }
     } else if (type === "LIMIT" && limit != null) {
+      // LIMIT semantics in terms of order `side`:
+      //   BUY limit  → fill when price ≤ limit (buy cheap)
+      //   SELL limit → fill when price ≥ limit (sell high)
+      // This holds for both open-long (BUY+LONG), close-long (SELL+LONG),
+      // open-short (SELL+SHORT — sell at limit or higher), and cover-short
+      // (BUY+SHORT — buy at limit or lower). The existing evaluateLimitFill
+      // already encodes this via `side`.
       const bars = barsBySymbol[order.symbol] ?? [];
       const createdAt = order.created_at instanceof Date
         ? order.created_at
@@ -438,7 +464,9 @@ export async function fillPendingOrders(): Promise<number> {
         rationale = decision.rationale;
       }
     } else if (type === "STOP" && stop != null) {
-      // BUY stop fills when price >= stop; SELL stop fills when price <= stop.
+      // STOP semantics in terms of order `side`:
+      //   BUY stop  → fill when price ≥ stop (breakout BUY or cover SHORT stop)
+      //   SELL stop → fill when price ≤ stop (stop-loss SELL or short entry)
       const triggered = side === "BUY" ? price >= stop : price <= stop;
       if (triggered) {
         fillPrice = price;

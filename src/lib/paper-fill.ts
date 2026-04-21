@@ -56,7 +56,23 @@
 import type mysqlTypes from "mysql2/promise";
 
 export type FillOrderResult =
-  | { filled: true; tradeId: number; quantity: number; fillPrice: number; side: "BUY" | "SELL"; pnlUsd?: number; fillRationale?: FillRationale }
+  | {
+      filled: true;
+      tradeId: number;
+      quantity: number;
+      fillPrice: number;
+      /** Legacy BUY/SELL indicator. Paired with `positionSide` to disambiguate. */
+      side: "BUY" | "SELL";
+      /**
+       * Target position side — LONG for buy-to-open / sell-to-close-long,
+       * SHORT for sell-to-open / buy-to-cover. W3 addition.
+       */
+      positionSide: "LONG" | "SHORT";
+      pnlUsd?: number;
+      fillRationale?: FillRationale;
+      /** Quantity still open after this fill (for partials). */
+      remainingQuantity?: number;
+    }
   | { filled: false; rejection: string };
 
 /**
@@ -105,6 +121,7 @@ const SOFT_REJECT = new Set([
   "INSUFFICIENT_CASH",
   "TRADE_MISMATCH",
   "NO_OPEN_POSITION",
+  "DUPLICATE_SHORT_POSITION",
 ]);
 
 /**
@@ -140,17 +157,23 @@ async function recordEquitySnapshotCore(
   connOrPool: mysqlTypes.PoolConnection | mysqlTypes.Pool
 ): Promise<boolean> {
   const [acctRows] = await connOrPool.execute(
-    "SELECT cash, reserved_cash FROM paper_accounts WHERE id = ?",
+    "SELECT cash, reserved_cash, reserved_short_margin FROM paper_accounts WHERE id = ?",
     [accountId]
   ) as [mysqlTypes.RowDataPacket[], unknown];
   if (acctRows.length === 0) return false;
   const cash = Number(acctRows[0].cash);
   const reservedCash = Number(acctRows[0].reserved_cash ?? 0);
+  const reservedShortMargin = Number(acctRows[0].reserved_short_margin ?? 0);
 
   // Mark open positions at buy_price — conservative book value, avoids a
-  // network call inside the transaction. See helper header.
+  // network call inside the transaction. LONG positions contribute
+  // quantity*buy_price (asset owned). SHORT positions' book value is the
+  // held margin (already counted in reserved_short_margin), so we only sum
+  // remaining-quantity for LONGs here. (closed_quantity tracks partials.)
   const [openRows] = await connOrPool.execute(
-    "SELECT COALESCE(SUM(quantity * buy_price), 0) AS open_value FROM paper_trades WHERE account_id = ? AND status = 'OPEN'",
+    `SELECT COALESCE(SUM((quantity - COALESCE(closed_quantity,0)) * buy_price), 0) AS open_value
+       FROM paper_trades
+      WHERE account_id = ? AND status = 'OPEN' AND side = 'LONG'`,
     [accountId]
   ) as [mysqlTypes.RowDataPacket[], unknown];
   const positionsValue = Number(openRows[0]?.open_value ?? 0);
@@ -161,13 +184,15 @@ async function recordEquitySnapshotCore(
   ) as [mysqlTypes.RowDataPacket[], unknown];
   const realizedPnl = Number(closedRows[0]?.realized ?? 0);
 
-  const equity = cash + reservedCash + positionsValue;
+  // Equity = cash + reserved_cash + reserved_short_margin + LONG book value.
+  // (SHORT book value is the held margin, already in reserved_short_margin.)
+  const equity = cash + reservedCash + reservedShortMargin + positionsValue;
 
   await connOrPool.execute(
     `INSERT INTO paper_equity_snapshots
-       (account_id, cash, reserved_cash, positions_value, equity, realized_pnl)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [accountId, cash, reservedCash, positionsValue, equity, realizedPnl]
+       (account_id, cash, reserved_cash, reserved_short_margin, positions_value, equity, realized_pnl)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [accountId, cash, reservedCash, reservedShortMargin, positionsValue, equity, realizedPnl]
   );
   return true;
 }
@@ -211,6 +236,12 @@ export async function recordEquitySnapshotSafe(
 /**
  * Internal helper — runs the fill against the supplied connection. Caller
  * is responsible for wrapping in `beginTransaction` / `commit` / `rollback`.
+ *
+ * W3 — four orthogonal (side, position_side) combinations are handled:
+ *   BUY  + LONG  → open LONG (existing behaviour; debits cash or releases reservation)
+ *   SELL + LONG  → close LONG in full or part (partial via order.close_quantity)
+ *   SELL + SHORT → open SHORT (debits cash into reserved_short_margin)
+ *   BUY  + SHORT → cover SHORT in full or part (releases margin, settles P&L)
  */
 async function fillOrderCore(
   conn: mysqlTypes.PoolConnection,
@@ -237,7 +268,7 @@ async function fillOrderCore(
   // LOCK STEP 1 — paper_accounts. For BUY we need it to move cash; for SELL
   // we need it to credit proceeds. Always lock first per global invariant.
   const [acctRows] = await conn.execute(
-    "SELECT id, cash, reserved_cash FROM paper_accounts WHERE id = ? FOR UPDATE",
+    "SELECT id, cash, reserved_cash, reserved_short_margin FROM paper_accounts WHERE id = ? FOR UPDATE",
     [accountId]
   ) as [mysqlTypes.RowDataPacket[], unknown];
   if (acctRows.length === 0) {
@@ -265,9 +296,11 @@ async function fillOrderCore(
     return { filled: false, rejection: "ORDER_SIDE_MISMATCH" };
   }
   const side = order.side as "BUY" | "SELL";
+  const positionSide: "LONG" | "SHORT" = (order.position_side === "SHORT") ? "SHORT" : "LONG";
   const symbol = String(order.symbol);
 
-  if (side === "BUY") {
+  // ── OPEN LONG (BUY + LONG) ───────────────────────────────────────────
+  if (side === "BUY" && positionSide === "LONG") {
     const investment = Number(order.investment_usd);
     if (!Number.isFinite(investment) || investment <= 0) {
       await rejectOrder(conn, orderId, "INVALID_INVESTMENT");
@@ -277,15 +310,12 @@ async function fillOrderCore(
     // P1 — Validate quantity BEFORE any cash movement. If fillPrice is
     // tiny (e.g. 1e-30) the resulting quantity is Infinity; if we let that
     // through we'd debit cash and THEN reject, leaving funds stranded.
-    // Reject early so the soft-commit path writes only the REJECTED row
-    // without ever touching cash or reserved_cash.
     const quantity = investment / fillPrice;
     if (!Number.isFinite(quantity) || quantity <= 0) {
       await rejectOrder(conn, orderId, "INVALID_QUANTITY");
       return { filled: false, rejection: "INVALID_QUANTITY" };
     }
 
-    // Was cash reserved at submit time (LIMIT/STOP) or not (MARKET)?
     const reservedAmount = Number(order.reserved_amount ?? 0);
 
     if (reservedAmount > 0) {
@@ -298,7 +328,6 @@ async function fillOrderCore(
         await rejectOrder(conn, orderId, "RESERVATION_MISSING");
         return { filled: false, rejection: "RESERVATION_MISSING" };
       }
-      // Reconcile delta between reserved amount and actual fill cost.
       const delta = reservedAmount - investment;
       if (delta !== 0) {
         if (delta > 0) {
@@ -312,14 +341,11 @@ async function fillOrderCore(
             [-delta, accountId, -delta]
           ) as [mysqlTypes.ResultSetHeader, unknown];
           if (topUp.affectedRows !== 1) {
-            // Can't cover the extra cost — force rollback by returning a
-            // non-soft rejection.
             return { filled: false, rejection: "INSUFFICIENT_CASH_ON_FILL" };
           }
         }
       }
     } else {
-      // No reservation (MARKET BUY) — atomic debit from cash with guard.
       const [cashResult] = await conn.execute(
         "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
         [investment, accountId, investment]
@@ -330,75 +356,114 @@ async function fillOrderCore(
       }
     }
 
-    // LOCK STEP 3 — paper_trades (via INSERT; no row pre-exists to FOR UPDATE).
-    // W2 fields:
-    //   strategy_id — FK attribution. Cron path passes it; UI passes null.
-    //   strategy    — denormalized VARCHAR label. Defaults to "{type} BUY".
-    //                 UI path passes "MANUAL BUY" via opts.strategyLabel.
-    //   notes       — plain-text rationale suffix lets smoke tests/audit
-    //                 surface OHLC_TOUCH vs SPOT without a new column.
-    const strategyLabel = opts?.strategyLabel ?? `${order.order_type} BUY`;
-    const strategyId = opts?.strategyId ?? null;
-    const noteParts: string[] = [];
-    if (order.notes) noteParts.push(String(order.notes));
-    if (opts?.fillRationale) noteParts.push(`fill_rationale=${opts.fillRationale}`);
-    const notes = noteParts.length > 0 ? noteParts.join(" | ") : null;
-
-    const [tradeResult] = await conn.execute(
-      `INSERT INTO paper_trades
-         (account_id, symbol, quantity, buy_price, buy_date, investment_usd, strategy, strategy_id, status, notes)
-       VALUES (?, ?, ?, ?, CURRENT_DATE, ?, ?, ?, 'OPEN', ?)`,
-      [
-        accountId,
-        symbol,
-        quantity,
-        fillPrice,
-        investment,
-        strategyLabel,
-        strategyId,
-        notes,
-      ]
-    ) as [mysqlTypes.ResultSetHeader, unknown];
-
-    // Status-guarded FILLED transition.
-    const [orderUpdate] = await conn.execute(
-      `UPDATE paper_orders
-          SET status='FILLED', filled_price=?, filled_at=CURRENT_TIMESTAMP(6), trade_id=?, reserved_amount=0
-        WHERE id=? AND status='PENDING'`,
-      [fillPrice, tradeResult.insertId, orderId]
-    ) as [mysqlTypes.ResultSetHeader, unknown];
-    if (orderUpdate.affectedRows !== 1) {
-      // Concurrent fill — our cash move and trade insert must be undone by
-      // the transaction rollback. Surface so caller rolls back.
-      return { filled: false, rejection: "ORDER_RACE_LOST" };
-    }
-
-    return {
-      filled: true,
-      tradeId: tradeResult.insertId,
-      quantity,
-      fillPrice,
-      side: "BUY",
-      fillRationale: opts?.fillRationale,
-    };
+    return await insertOpenTrade(conn, {
+      accountId, symbol, quantity, fillPrice, investment,
+      positionSide: "LONG", side: "BUY", order, orderId, opts,
+    });
   }
 
-  // SELL path.
-  // LOCK STEP 3 — paper_trades. Resolve trade_id with account/symbol binding
-  // to close the cross-account / cross-symbol gap.
+  // ── OPEN SHORT (SELL + SHORT) ────────────────────────────────────────
+  if (side === "SELL" && positionSide === "SHORT") {
+    const investment = Number(order.investment_usd);
+    if (!Number.isFinite(investment) || investment <= 0) {
+      await rejectOrder(conn, orderId, "INVALID_INVESTMENT");
+      return { filled: false, rejection: "INVALID_INVESTMENT" };
+    }
+    const quantity = investment / fillPrice;
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      await rejectOrder(conn, orderId, "INVALID_QUANTITY");
+      return { filled: false, rejection: "INVALID_QUANTITY" };
+    }
+
+    // PF2 — reject new SHORT if an OPEN SHORT already exists for this
+    // (account, symbol). The cover path resolves "which position to close"
+    // via `trade_id` OR `LIMIT 1` on OPEN SHORTs — allowing a second OPEN
+    // SHORT for the same symbol would make the LIMIT 1 cover ambiguous.
+    // Users that want multiple legs per symbol must pass `trade_id` on cover.
+    const [dupRows] = await conn.execute(
+      "SELECT id FROM paper_trades WHERE account_id=? AND symbol=? AND side='SHORT' AND status='OPEN' LIMIT 1 FOR UPDATE",
+      [accountId, symbol]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (dupRows.length > 0) {
+      await rejectOrder(conn, orderId, "DUPLICATE_SHORT_POSITION");
+      return { filled: false, rejection: "DUPLICATE_SHORT_POSITION" };
+    }
+
+    // Short margin: held in paper_accounts.reserved_short_margin. If the order
+    // pre-reserved via reserveShortMarginForOrder (LIMIT/STOP short), that
+    // column already reflects the hold — we only need to reconcile any delta
+    // between pre-reserved and actual short-value at fill. If not pre-reserved
+    // (MARKET short), debit cash into reserved_short_margin now.
+    const reservedShort = Number(order.reserved_short_margin ?? 0);
+    if (reservedShort > 0) {
+      // Already held — nothing to do on cash / margin ledger other than
+      // adjust for delta between reserved amount and actual fill-value.
+      const delta = reservedShort - investment;
+      if (delta !== 0) {
+        if (delta > 0) {
+          // Over-reserved — release the surplus back to cash.
+          const [rel] = await conn.execute(
+            "UPDATE paper_accounts SET reserved_short_margin = reserved_short_margin - ?, cash = cash + ? WHERE id = ? AND reserved_short_margin >= ?",
+            [delta, delta, accountId, delta]
+          ) as [mysqlTypes.ResultSetHeader, unknown];
+          if (rel.affectedRows !== 1) {
+            return { filled: false, rejection: "SHORT_MARGIN_MISSING" };
+          }
+        } else {
+          // Under-reserved — need to move more from cash to margin.
+          const extra = -delta;
+          const [top] = await conn.execute(
+            "UPDATE paper_accounts SET cash = cash - ?, reserved_short_margin = reserved_short_margin + ? WHERE id = ? AND cash >= ?",
+            [extra, extra, accountId, extra]
+          ) as [mysqlTypes.ResultSetHeader, unknown];
+          if (top.affectedRows !== 1) {
+            return { filled: false, rejection: "INSUFFICIENT_CASH_ON_FILL" };
+          }
+        }
+      }
+    } else {
+      // No pre-reservation — this is a MARKET short. Atomically debit cash
+      // into reserved_short_margin.
+      const [move] = await conn.execute(
+        "UPDATE paper_accounts SET cash = cash - ?, reserved_short_margin = reserved_short_margin + ? WHERE id = ? AND cash >= ?",
+        [investment, investment, accountId, investment]
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (move.affectedRows !== 1) {
+        await rejectOrder(conn, orderId, "INSUFFICIENT_CASH");
+        return { filled: false, rejection: "INSUFFICIENT_CASH" };
+      }
+    }
+
+    return await insertOpenTrade(conn, {
+      accountId, symbol, quantity, fillPrice, investment,
+      positionSide: "SHORT", side: "SELL", order, orderId, opts,
+    });
+  }
+
+  // ── CLOSE LONG (SELL + LONG) or COVER SHORT (BUY + SHORT) ────────────
+  // Shared path: both decrement an open position, compute direction-aware
+  // P&L on the closed slice, and move cash accordingly.
   let tradeId: number | null = order.trade_id != null ? Number(order.trade_id) : null;
+
+  // W3: order.close_quantity (optional) — partial-close support. NULL =
+  // close the full remaining quantity.
+  const requestedCloseQty = order.close_quantity != null ? Number(order.close_quantity) : null;
+
+  // Expected position-side on the target trade must match the order's
+  // position_side (closing LONG vs covering SHORT).
+  const expectedTradeSide: "LONG" | "SHORT" = positionSide;
 
   let tradeRows: mysqlTypes.RowDataPacket[];
   if (tradeId != null) {
     const [rows] = await conn.execute(
-      "SELECT * FROM paper_trades WHERE id=? AND account_id=? AND symbol=? AND status='OPEN' FOR UPDATE",
-      [tradeId, accountId, symbol]
+      "SELECT * FROM paper_trades WHERE id=? AND account_id=? AND symbol=? AND side=? AND status='OPEN' FOR UPDATE",
+      [tradeId, accountId, symbol, expectedTradeSide]
     ) as [mysqlTypes.RowDataPacket[], unknown];
     tradeRows = rows;
   } else {
     const [rows] = await conn.execute(
-      "SELECT * FROM paper_trades WHERE account_id=? AND symbol=? AND status='OPEN' ORDER BY id ASC LIMIT 1 FOR UPDATE",
-      [accountId, symbol]
+      "SELECT * FROM paper_trades WHERE account_id=? AND symbol=? AND side=? AND status='OPEN' ORDER BY id ASC LIMIT 1 FOR UPDATE",
+      [accountId, symbol, expectedTradeSide]
     ) as [mysqlTypes.RowDataPacket[], unknown];
     tradeRows = rows;
   }
@@ -412,38 +477,122 @@ async function fillOrderCore(
   tradeId = Number(trade.id);
   const buyPrice = Number(trade.buy_price);
   const investment = Number(trade.investment_usd);
-  const quantity = Number(trade.quantity) || (buyPrice > 0 ? investment / buyPrice : 0);
-  if (!Number.isFinite(quantity) || quantity <= 0) {
-    await rejectOrder(conn, orderId, "INVALID_QUANTITY");
-    return { filled: false, rejection: "INVALID_QUANTITY" };
-  }
-  const proceeds = quantity * fillPrice;
-  const pnlUsd = proceeds - investment;
-  const pnlPct = investment > 0 ? (pnlUsd / investment) * 100 : 0;
-
-  // Status-guarded trade close.
-  const [tradeUpdate] = await conn.execute(
-    `UPDATE paper_trades
-        SET status='CLOSED', sell_price=?, sell_date=CURRENT_DATE, pnl_usd=?, pnl_pct=?
-      WHERE id=? AND status='OPEN'`,
-    [fillPrice, pnlUsd, pnlPct, tradeId]
-  ) as [mysqlTypes.ResultSetHeader, unknown];
-  if (tradeUpdate.affectedRows !== 1) {
-    return { filled: false, rejection: "TRADE_RACE_LOST" };
+  const totalQty = Number(trade.quantity) || (buyPrice > 0 ? investment / buyPrice : 0);
+  const alreadyClosed = Number(trade.closed_quantity ?? 0);
+  const remainingBefore = Math.max(0, totalQty - alreadyClosed);
+  if (!Number.isFinite(remainingBefore) || remainingBefore <= 0) {
+    await rejectOrder(conn, orderId, "NO_OPEN_POSITION");
+    return { filled: false, rejection: "NO_OPEN_POSITION" };
   }
 
-  // Credit proceeds atomically. Account row is already locked (LOCK STEP 1).
-  // Assert affectedRows === 1 — the row existed at lock time, so losing it
-  // now means DB corruption; force rollback.
-  const [creditResult] = await conn.execute(
-    "UPDATE paper_accounts SET cash = cash + ? WHERE id = ?",
-    [proceeds, accountId]
-  ) as [mysqlTypes.ResultSetHeader, unknown];
-  if (creditResult.affectedRows !== 1) {
-    return { filled: false, rejection: "ACCOUNT_VANISHED" };
+  // Quantity actually to close on this fill — bounded by remaining.
+  let closeQty = remainingBefore;
+  if (requestedCloseQty != null) {
+    if (!Number.isFinite(requestedCloseQty) || requestedCloseQty <= 0) {
+      await rejectOrder(conn, orderId, "INVALID_QUANTITY");
+      return { filled: false, rejection: "INVALID_QUANTITY" };
+    }
+    closeQty = Math.min(requestedCloseQty, remainingBefore);
   }
 
-  // Status-guarded order fill.
+  const investmentShare = totalQty > 0 ? investment * (closeQty / totalQty) : 0;
+  // Proceeds for LONG close = qty * fillPrice.
+  // Proceeds semantic for SHORT cover = qty * fillPrice (cash we pay to buy
+  // back). Margin release happens separately.
+  const closeValue = closeQty * fillPrice;
+
+  // Direction-aware P&L on the closed slice. LONG profits when fill > entry;
+  // SHORT profits when entry > fill.
+  const pnlSlice = expectedTradeSide === "SHORT"
+    ? (buyPrice - fillPrice) * closeQty
+    : (fillPrice - buyPrice) * closeQty;
+  const pnlPctSlice = investmentShare > 0 ? (pnlSlice / investmentShare) * 100 : 0;
+
+  const newClosedQty = alreadyClosed + closeQty;
+  const willBeFullyClosed = newClosedQty >= totalQty - 1e-9; // float tolerance
+
+  // Partial-close race guard: UPDATE is status-guarded AND verifies
+  // closed_quantity has not raced past quantity. If two partial-close orders
+  // hit the same trade simultaneously the second one sees a higher
+  // closed_quantity and the `closed_quantity + ? <= quantity` guard (enforced
+  // by the subquery) rejects with TRADE_RACE_LOST.
+  if (willBeFullyClosed) {
+    // Full close — flip to CLOSED.
+    const existingPnl = Number(trade.pnl_usd ?? 0);
+    const finalPnl = existingPnl + pnlSlice;
+    const investmentShareTotal = investment; // full investment realized
+    const finalPnlPct = investmentShareTotal > 0 ? (finalPnl / investmentShareTotal) * 100 : 0;
+    const [tradeUpdate] = await conn.execute(
+      `UPDATE paper_trades
+          SET status='CLOSED', sell_price=?, sell_date=CURRENT_DATE,
+              pnl_usd=?, pnl_pct=?,
+              closed_quantity=quantity
+        WHERE id=? AND status='OPEN' AND closed_quantity = ?`,
+      [fillPrice, finalPnl, finalPnlPct, tradeId, alreadyClosed]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (tradeUpdate.affectedRows !== 1) {
+      return { filled: false, rejection: "TRADE_RACE_LOST" };
+    }
+  } else {
+    // Partial close — accumulate into pnl_usd, advance closed_quantity,
+    // leave status OPEN. Guarded so a concurrent partial cannot over-close.
+    const existingPnl = Number(trade.pnl_usd ?? 0);
+    const accumulatedPnl = existingPnl + pnlSlice;
+    const [tradeUpdate] = await conn.execute(
+      `UPDATE paper_trades
+          SET pnl_usd=?, closed_quantity=closed_quantity + ?
+        WHERE id=? AND status='OPEN' AND closed_quantity + ? <= quantity + 1e-9`,
+      [accumulatedPnl, closeQty, tradeId, closeQty]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (tradeUpdate.affectedRows !== 1) {
+      return { filled: false, rejection: "TRADE_RACE_LOST" };
+    }
+  }
+
+  // Cash + margin arithmetic — differs by side.
+  if (expectedTradeSide === "LONG") {
+    // Credit closeValue (proceeds) to cash. No margin involvement.
+    const [creditResult] = await conn.execute(
+      "UPDATE paper_accounts SET cash = cash + ? WHERE id = ?",
+      [closeValue, accountId]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (creditResult.affectedRows !== 1) {
+      return { filled: false, rejection: "ACCOUNT_VANISHED" };
+    }
+  } else {
+    // SHORT cover. Accounting model:
+    //   OPEN:  cash -= investment    (deposit collateral)
+    //          reserved_short_margin += investment
+    //          Conceptually margin holds BOTH collateral AND the short-sale
+    //          proceeds — a standard cash-account short requires 100% of
+    //          position value as margin, and the short-sale generates the
+    //          other 100% which is also held. So equity is unchanged at open:
+    //            equity = cash + margin = (C - I) + I = C.
+    //
+    //   COVER: release investmentShare of margin, pay closeValue to buy back.
+    //          Net cash delta = investmentShare_released_from_margin + pnl
+    //          where pnl = investmentShare - closeValue = (entry - close) * qty.
+    //          Equivalently: cash += (2 * investmentShare - closeValue)
+    //                                = investmentShare + pnlSlice.
+    //          reserved_short_margin -= investmentShare.
+    //
+    // Concrete example: open $1000 short at $100 (qty 10), cover at $90.
+    //   At open: cash 100k→99k, margin 0→1k, equity 100k.
+    //   At cover: closeValue = 10*90 = 900. investmentShare = 1000.
+    //   cash += (1000 + 1000 - 900) = 1100. margin -= 1000.
+    //   Final: cash 99k+1.1k = 100.1k, margin 0, equity 100.1k = initial + pnl(+100) ✓
+    const cashCredit = 2 * investmentShare - closeValue;
+    const [release] = await conn.execute(
+      "UPDATE paper_accounts SET reserved_short_margin = reserved_short_margin - ?, cash = cash + ? WHERE id = ? AND reserved_short_margin >= ?",
+      [investmentShare, cashCredit, accountId, investmentShare]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (release.affectedRows !== 1) {
+      return { filled: false, rejection: "SHORT_MARGIN_MISSING" };
+    }
+  }
+
+  // Status-guarded order fill — regardless of partial vs full, this order
+  // is now FILLED.
   const [orderUpdate] = await conn.execute(
     `UPDATE paper_orders
         SET status='FILLED', filled_price=?, filled_at=CURRENT_TIMESTAMP(6), trade_id=?
@@ -460,10 +609,117 @@ async function fillOrderCore(
   return {
     filled: true,
     tradeId,
+    quantity: closeQty,
+    fillPrice,
+    side,
+    positionSide: expectedTradeSide,
+    pnlUsd: pnlSlice,
+    fillRationale: opts?.fillRationale,
+    remainingQuantity: willBeFullyClosed ? 0 : (remainingBefore - closeQty),
+  };
+}
+
+/**
+ * Shared insert path for OPEN trades — LONG or SHORT. Writes the new
+ * paper_trades row, captures exit-bracket fields from the order, and flips
+ * the order to FILLED. Returns the FillOrderResult.
+ *
+ * Bracket capture: if the order supplied any `bracket_*_pct` / `bracket_time_exit_days`
+ * we compute the absolute bracket prices from the fill price and persist them.
+ * This is the "compute at fill time" option from the plan — a stop-loss % of
+ * 5% on a fill at $100 becomes `stop_loss_price = $95` (LONG) or `$105` (SHORT).
+ */
+async function insertOpenTrade(
+  conn: mysqlTypes.PoolConnection,
+  args: {
+    accountId: number;
+    symbol: string;
+    quantity: number;
+    fillPrice: number;
+    investment: number;
+    positionSide: "LONG" | "SHORT";
+    side: "BUY" | "SELL";
+    order: mysqlTypes.RowDataPacket;
+    orderId: number;
+    opts?: FillOrderOptions;
+  }
+): Promise<FillOrderResult> {
+  const { accountId, symbol, quantity, fillPrice, investment, positionSide, side, order, orderId, opts } = args;
+
+  const strategyLabel = opts?.strategyLabel ?? `${order.order_type} ${side}`;
+  const strategyId = opts?.strategyId ?? null;
+  const noteParts: string[] = [];
+  if (order.notes) noteParts.push(String(order.notes));
+  if (opts?.fillRationale) noteParts.push(`fill_rationale=${opts.fillRationale}`);
+  const notes = noteParts.length > 0 ? noteParts.join(" | ") : null;
+
+  // Bracket absolute-price computation. For LONG positions: stop below entry,
+  // take-profit above entry. For SHORT: stop above entry (loss = price rises),
+  // take-profit below entry (profit = price falls).
+  const stopLossPct = order.bracket_stop_loss_pct != null ? Number(order.bracket_stop_loss_pct) : null;
+  const takeProfitPct = order.bracket_take_profit_pct != null ? Number(order.bracket_take_profit_pct) : null;
+  const trailingPct = order.bracket_trailing_pct != null ? Number(order.bracket_trailing_pct) : null;
+  const trailingActivatesPct = order.bracket_trailing_activates_pct != null ? Number(order.bracket_trailing_activates_pct) : null;
+  const timeExitDays = order.bracket_time_exit_days != null ? Number(order.bracket_time_exit_days) : null;
+
+  const stopLossPrice = stopLossPct != null && stopLossPct > 0
+    ? (positionSide === "LONG" ? fillPrice * (1 - stopLossPct / 100) : fillPrice * (1 + stopLossPct / 100))
+    : null;
+  const takeProfitPrice = takeProfitPct != null && takeProfitPct > 0
+    ? (positionSide === "LONG" ? fillPrice * (1 + takeProfitPct / 100) : fillPrice * (1 - takeProfitPct / 100))
+    : null;
+  const timeExitDate = timeExitDays != null && timeExitDays >= 0
+    ? new Date(Date.now() + timeExitDays * 86_400_000).toISOString().slice(0, 10)
+    : null;
+
+  const [tradeResult] = await conn.execute(
+    `INSERT INTO paper_trades
+       (account_id, symbol, side, quantity, buy_price, buy_date, investment_usd,
+        strategy, strategy_id, status, notes,
+        stop_loss_price, take_profit_price,
+        trailing_stop_pct, trailing_activates_at_profit_pct,
+        time_exit_date,
+        closed_quantity)
+     VALUES (?, ?, ?, ?, ?, CURRENT_DATE, ?, ?, ?, 'OPEN', ?,
+             ?, ?, ?, ?, ?, 0)`,
+    [
+      accountId,
+      symbol,
+      positionSide,
+      quantity,
+      fillPrice,
+      investment,
+      strategyLabel,
+      strategyId,
+      notes,
+      stopLossPrice,
+      takeProfitPrice,
+      trailingPct,
+      trailingActivatesPct,
+      timeExitDate,
+    ]
+  ) as [mysqlTypes.ResultSetHeader, unknown];
+
+  // Status-guarded FILLED transition. reset reserved_amount AND
+  // reserved_short_margin columns on the order.
+  const [orderUpdate] = await conn.execute(
+    `UPDATE paper_orders
+        SET status='FILLED', filled_price=?, filled_at=CURRENT_TIMESTAMP(6),
+            trade_id=?, reserved_amount=0, reserved_short_margin=0
+      WHERE id=? AND status='PENDING'`,
+    [fillPrice, tradeResult.insertId, orderId]
+  ) as [mysqlTypes.ResultSetHeader, unknown];
+  if (orderUpdate.affectedRows !== 1) {
+    return { filled: false, rejection: "ORDER_RACE_LOST" };
+  }
+
+  return {
+    filled: true,
+    tradeId: tradeResult.insertId,
     quantity,
     fillPrice,
-    side: "SELL",
-    pnlUsd,
+    side,
+    positionSide,
     fillRationale: opts?.fillRationale,
   };
 }
@@ -497,35 +753,48 @@ async function rejectOrder(
   // without FOR UPDATE here because the caller holds the order lock already
   // (every call site is inside fillOrderCore after LOCK STEP 2).
   const [orderRows] = await conn.execute(
-    "SELECT account_id, reserved_amount FROM paper_orders WHERE id = ?",
+    "SELECT account_id, reserved_amount, reserved_short_margin FROM paper_orders WHERE id = ?",
     [orderId]
   ) as [mysqlTypes.RowDataPacket[], unknown];
   if (orderRows.length === 0) return;
   const reserved = Number(orderRows[0].reserved_amount ?? 0);
-  if (reserved <= 0) return;
+  const reservedShort = Number(orderRows[0].reserved_short_margin ?? 0);
+  const accountId = orderRows[0].account_id;
 
-  // P3 — assert both (a) the account exists and (b) reserved_cash >= reserved.
-  // The `WHERE reserved_cash >= ?` guard means the UPDATE only matches when
-  // the reservation is actually backed. If affectedRows !== 1, the refund
-  // cannot be honoured atomically — throw so the caller's transaction rolls
-  // back instead of wiping `reserved_amount` while cash stays put.
-  const [refund] = await conn.execute(
-    "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
-    [reserved, reserved, orderRows[0].account_id, reserved]
-  ) as [mysqlTypes.ResultSetHeader, unknown];
-  if (refund.affectedRows !== 1) {
-    throw new Error(
-      `rejectOrder: refund failed for order=${orderId} account=${orderRows[0].account_id} reserved=${reserved} — rolling back`
-    );
+  // Refund BUY-side reserved_cash if any.
+  if (reserved > 0) {
+    const [refund] = await conn.execute(
+      "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
+      [reserved, reserved, accountId, reserved]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (refund.affectedRows !== 1) {
+      throw new Error(
+        `rejectOrder: reserved_cash refund failed for order=${orderId} account=${accountId} reserved=${reserved} — rolling back`
+      );
+    }
   }
-  const [clear] = await conn.execute(
-    "UPDATE paper_orders SET reserved_amount = 0 WHERE id = ?",
-    [orderId]
-  ) as [mysqlTypes.ResultSetHeader, unknown];
-  if (clear.affectedRows !== 1) {
-    throw new Error(
-      `rejectOrder: clearing reserved_amount failed for order=${orderId} — rolling back`
-    );
+  // W3 — refund SHORT-side reserved_short_margin if any.
+  if (reservedShort > 0) {
+    const [refundShort] = await conn.execute(
+      "UPDATE paper_accounts SET cash = cash + ?, reserved_short_margin = reserved_short_margin - ? WHERE id = ? AND reserved_short_margin >= ?",
+      [reservedShort, reservedShort, accountId, reservedShort]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (refundShort.affectedRows !== 1) {
+      throw new Error(
+        `rejectOrder: reserved_short_margin refund failed for order=${orderId} account=${accountId} reservedShort=${reservedShort} — rolling back`
+      );
+    }
+  }
+  if (reserved > 0 || reservedShort > 0) {
+    const [clear] = await conn.execute(
+      "UPDATE paper_orders SET reserved_amount = 0, reserved_short_margin = 0 WHERE id = ?",
+      [orderId]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (clear.affectedRows !== 1) {
+      throw new Error(
+        `rejectOrder: clearing reservations failed for order=${orderId} — rolling back`
+      );
+    }
   }
 }
 
@@ -657,7 +926,8 @@ export async function reserveCashForOrder(
 
 /**
  * Release a reservation back to cash — used when an order is cancelled
- * before fill. Idempotent (checks reserved_amount on the order row).
+ * before fill. Idempotent (checks reserved_amount + reserved_short_margin on
+ * the order row and releases both).
  *
  * Lock order: accounts → orders. Both UPDATEs assert affectedRows === 1
  * and will throw if the refund cannot be honoured atomically; caller's
@@ -674,7 +944,7 @@ export async function releaseReservationForOrder(
     // Non-locking read to discover the account_id so we can lock in canonical
     // order. If the order is gone, nothing to release.
     const [preRows] = await conn.execute(
-      "SELECT account_id, reserved_amount FROM paper_orders WHERE id = ?",
+      "SELECT account_id, reserved_amount, reserved_short_margin FROM paper_orders WHERE id = ?",
       [orderId]
     ) as [mysqlTypes.RowDataPacket[], unknown];
     if (preRows.length === 0) {
@@ -683,7 +953,8 @@ export async function releaseReservationForOrder(
     }
     const accountId = Number(preRows[0].account_id);
     const preReserved = Number(preRows[0].reserved_amount ?? 0);
-    if (preReserved <= 0) {
+    const preReservedShort = Number(preRows[0].reserved_short_margin ?? 0);
+    if (preReserved <= 0 && preReservedShort <= 0) {
       await conn.commit();
       return;
     }
@@ -699,9 +970,9 @@ export async function releaseReservationForOrder(
       );
     }
 
-    // LOCK STEP 2 — order. Re-read authoritative reserved_amount under lock.
+    // LOCK STEP 2 — order. Re-read authoritative amounts under lock.
     const [orderRows] = await conn.execute(
-      "SELECT account_id, reserved_amount FROM paper_orders WHERE id = ? FOR UPDATE",
+      "SELECT account_id, reserved_amount, reserved_short_margin FROM paper_orders WHERE id = ? FOR UPDATE",
       [orderId]
     ) as [mysqlTypes.RowDataPacket[], unknown];
     if (orderRows.length === 0) {
@@ -709,28 +980,41 @@ export async function releaseReservationForOrder(
       return;
     }
     const reserved = Number(orderRows[0].reserved_amount ?? 0);
-    if (reserved <= 0) {
+    const reservedShort = Number(orderRows[0].reserved_short_margin ?? 0);
+    if (reserved <= 0 && reservedShort <= 0) {
       await conn.commit();
       return;
     }
 
-    // P3 — assert both refund arms succeed atomically.
-    const [refund] = await conn.execute(
-      "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
-      [reserved, reserved, accountId, reserved]
-    ) as [mysqlTypes.ResultSetHeader, unknown];
-    if (refund.affectedRows !== 1) {
-      throw new Error(
-        `releaseReservationForOrder: refund failed for order=${orderId} account=${accountId} reserved=${reserved}`
-      );
+    if (reserved > 0) {
+      const [refund] = await conn.execute(
+        "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
+        [reserved, reserved, accountId, reserved]
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (refund.affectedRows !== 1) {
+        throw new Error(
+          `releaseReservationForOrder: reserved_cash refund failed for order=${orderId} account=${accountId} reserved=${reserved}`
+        );
+      }
+    }
+    if (reservedShort > 0) {
+      const [refundShort] = await conn.execute(
+        "UPDATE paper_accounts SET cash = cash + ?, reserved_short_margin = reserved_short_margin - ? WHERE id = ? AND reserved_short_margin >= ?",
+        [reservedShort, reservedShort, accountId, reservedShort]
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (refundShort.affectedRows !== 1) {
+        throw new Error(
+          `releaseReservationForOrder: reserved_short_margin refund failed for order=${orderId} account=${accountId} reservedShort=${reservedShort}`
+        );
+      }
     }
     const [clear] = await conn.execute(
-      "UPDATE paper_orders SET reserved_amount = 0 WHERE id = ?",
+      "UPDATE paper_orders SET reserved_amount = 0, reserved_short_margin = 0 WHERE id = ?",
       [orderId]
     ) as [mysqlTypes.ResultSetHeader, unknown];
     if (clear.affectedRows !== 1) {
       throw new Error(
-        `releaseReservationForOrder: clear reserved_amount failed for order=${orderId}`
+        `releaseReservationForOrder: clear reservations failed for order=${orderId}`
       );
     }
 
@@ -741,4 +1025,218 @@ export async function releaseReservationForOrder(
   } finally {
     conn.release();
   }
+}
+
+/**
+ * W3 — reserve SHORT margin for a pending sell-to-open short order.
+ * Symmetric to `reserveCashForOrder` but writes to the dedicated
+ * `reserved_short_margin` column. Moves `amount` from `cash` into margin.
+ *
+ * Lock order: accounts → orders.
+ */
+export async function reserveShortMarginForOrder(
+  pool: mysqlTypes.Pool,
+  orderId: number,
+  accountId: number,
+  amount: number
+): Promise<boolean> {
+  if (!Number.isFinite(amount) || amount <= 0) return false;
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [cashResult] = await conn.execute(
+      "UPDATE paper_accounts SET cash = cash - ?, reserved_short_margin = reserved_short_margin + ? WHERE id = ? AND cash >= ?",
+      [amount, amount, accountId, amount]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (cashResult.affectedRows !== 1) {
+      await conn.rollback();
+      return false;
+    }
+
+    const [orderResult] = await conn.execute(
+      "UPDATE paper_orders SET reserved_short_margin = ? WHERE id = ? AND status = 'PENDING'",
+      [amount, orderId]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (orderResult.affectedRows !== 1) {
+      await conn.rollback();
+      return false;
+    }
+
+    await conn.commit();
+    return true;
+  } catch (err) {
+    try { await conn.rollback(); } catch { /* ignore */ }
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * W3 — atomically adjust the reservation on a PENDING order.
+ *
+ * Used by `PATCH /api/paper/order` when the user modifies a pending order's
+ * `investment_usd`. Moves the delta between old and new reservations from
+ * cash ↔ reservation bucket without ever writing the order or account to an
+ * invalid intermediate state. If the order is not PENDING, or the account
+ * lacks cash for the delta, returns false and makes no change.
+ *
+ * Which bucket (`reserved_cash` vs `reserved_short_margin`) is picked based
+ * on the order's `(side, position_side)`: only BUY+LONG uses `reserved_cash`
+ * and only SELL+SHORT uses `reserved_short_margin`. SELL+LONG (close long)
+ * and BUY+SHORT (cover short) never reserve so PATCH on those is a no-op
+ * (still returns true).
+ *
+ * Lock order: accounts → orders.
+ */
+export async function adjustReservation(
+  pool: mysqlTypes.Pool,
+  orderId: number,
+  newInvestment: number
+): Promise<{ ok: true; oldAmount: number; newAmount: number } | { ok: false; reason: string }> {
+  if (!Number.isFinite(newInvestment) || newInvestment <= 0) {
+    return { ok: false, reason: "INVALID_INVESTMENT" };
+  }
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [preRows] = await conn.execute(
+      "SELECT account_id, side, position_side, status FROM paper_orders WHERE id = ?",
+      [orderId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (preRows.length === 0) {
+      await conn.rollback();
+      return { ok: false, reason: "ORDER_NOT_FOUND" };
+    }
+    const accountId = Number(preRows[0].account_id);
+    const side = String(preRows[0].side) as "BUY" | "SELL";
+    const positionSide: "LONG" | "SHORT" = preRows[0].position_side === "SHORT" ? "SHORT" : "LONG";
+
+    // LOCK STEP 1 — accounts.
+    await conn.execute(
+      "SELECT id FROM paper_accounts WHERE id = ? FOR UPDATE",
+      [accountId]
+    );
+
+    // LOCK STEP 2 — order. Authoritative state + status guard.
+    const [orderRows] = await conn.execute(
+      "SELECT * FROM paper_orders WHERE id = ? FOR UPDATE",
+      [orderId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (orderRows.length === 0) {
+      await conn.rollback();
+      return { ok: false, reason: "ORDER_NOT_FOUND" };
+    }
+    const order = orderRows[0];
+    if (order.status !== "PENDING") {
+      await conn.rollback();
+      return { ok: false, reason: `ORDER_NOT_PENDING_${order.status}` };
+    }
+
+    // Determine which bucket this order uses.
+    const usesCashReservation = side === "BUY" && positionSide === "LONG";
+    const usesShortMargin = side === "SELL" && positionSide === "SHORT";
+    if (!usesCashReservation && !usesShortMargin) {
+      // Close orders — no reservation to adjust. Just update investment_usd
+      // if the column is nullable; but close orders are driven by close_quantity,
+      // not investment_usd, so we simply ack.
+      await conn.execute(
+        "UPDATE paper_orders SET investment_usd = ? WHERE id = ? AND status = 'PENDING'",
+        [newInvestment, orderId]
+      );
+      await conn.commit();
+      return { ok: true, oldAmount: 0, newAmount: 0 };
+    }
+
+    const oldAmount = usesCashReservation
+      ? Number(order.reserved_amount ?? 0)
+      : Number(order.reserved_short_margin ?? 0);
+    const newAmount = newInvestment;
+    const delta = newAmount - oldAmount;
+
+    if (delta > 0) {
+      // Need MORE reservation — move delta from cash.
+      const col = usesCashReservation ? "reserved_cash" : "reserved_short_margin";
+      const [move] = await conn.execute(
+        `UPDATE paper_accounts SET cash = cash - ?, ${col} = ${col} + ? WHERE id = ? AND cash >= ?`,
+        [delta, delta, accountId, delta]
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (move.affectedRows !== 1) {
+        await conn.rollback();
+        return { ok: false, reason: "INSUFFICIENT_CASH" };
+      }
+    } else if (delta < 0) {
+      // LESS reservation — release abs(delta) back to cash.
+      const col = usesCashReservation ? "reserved_cash" : "reserved_short_margin";
+      const diff = -delta;
+      const [move] = await conn.execute(
+        `UPDATE paper_accounts SET cash = cash + ?, ${col} = ${col} - ? WHERE id = ? AND ${col} >= ?`,
+        [diff, diff, accountId, diff]
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (move.affectedRows !== 1) {
+        await conn.rollback();
+        return { ok: false, reason: "RESERVATION_MISSING" };
+      }
+    }
+
+    // Update the order's investment + reservation field to match.
+    const orderCol = usesCashReservation ? "reserved_amount" : "reserved_short_margin";
+    const [upd] = await conn.execute(
+      `UPDATE paper_orders SET investment_usd = ?, ${orderCol} = ? WHERE id = ? AND status = 'PENDING'`,
+      [newAmount, newAmount, orderId]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (upd.affectedRows !== 1) {
+      await conn.rollback();
+      return { ok: false, reason: "ORDER_RACE_LOST" };
+    }
+
+    await conn.commit();
+    return { ok: true, oldAmount, newAmount };
+  } catch (err) {
+    try { await conn.rollback(); } catch { /* ignore */ }
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * W3 — lightweight price-field patch for a PENDING order. Allows the UI to
+ * change `limit_price` and/or `stop_price` without cancel-and-replace. No
+ * reservation math involved — reservation is pinned to `investment_usd` (use
+ * `adjustReservation` for that).
+ */
+export async function patchPendingOrderPrices(
+  pool: mysqlTypes.Pool,
+  orderId: number,
+  patch: { limit_price?: number; stop_price?: number }
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const sets: string[] = [];
+  const params: (number | null)[] = [];
+  if (patch.limit_price != null) {
+    if (!Number.isFinite(patch.limit_price) || patch.limit_price <= 0) {
+      return { ok: false, reason: "INVALID_LIMIT_PRICE" };
+    }
+    sets.push("limit_price = ?");
+    params.push(patch.limit_price);
+  }
+  if (patch.stop_price != null) {
+    if (!Number.isFinite(patch.stop_price) || patch.stop_price <= 0) {
+      return { ok: false, reason: "INVALID_STOP_PRICE" };
+    }
+    sets.push("stop_price = ?");
+    params.push(patch.stop_price);
+  }
+  if (sets.length === 0) return { ok: true };
+  params.push(orderId);
+  const [r] = await pool.execute(
+    `UPDATE paper_orders SET ${sets.join(", ")} WHERE id = ? AND status = 'PENDING'`,
+    params
+  ) as [mysqlTypes.ResultSetHeader, unknown];
+  if (r.affectedRows !== 1) {
+    return { ok: false, reason: "ORDER_NOT_PENDING" };
+  }
+  return { ok: true };
 }

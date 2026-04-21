@@ -45,18 +45,27 @@ export async function GET() {
     const trades = tradeRows.map(r => {
       const buyPrice = Number(r.buy_price);
       const investment = Number(r.investment_usd);
-      const quantity = Number(r.quantity) || (buyPrice > 0 ? investment / buyPrice : 0);
+      const totalQty = Number(r.quantity) || (buyPrice > 0 ? investment / buyPrice : 0);
+      const closedQty = Number(r.closed_quantity ?? 0);
+      const remainingQty = Math.max(0, totalQty - closedQty);
       const live = prices[r.symbol];
       const isOpen = r.status === "OPEN";
+      const side = r.side === "SHORT" ? "SHORT" : "LONG";
       const currentPrice = isOpen
         ? (live?.price ?? null)
         : (r.sell_price != null ? Number(r.sell_price) : null);
 
+      // Direction-aware live P&L. For CLOSED trades we trust the stored value.
       let pnlPct: number | null = null;
       let pnlUsd: number | null = null;
       if (isOpen && currentPrice != null && buyPrice > 0) {
-        pnlPct = ((currentPrice - buyPrice) / buyPrice) * 100;
-        pnlUsd = quantity * (currentPrice - buyPrice);
+        if (side === "SHORT") {
+          pnlPct = ((buyPrice - currentPrice) / buyPrice) * 100;
+          pnlUsd = remainingQty * (buyPrice - currentPrice);
+        } else {
+          pnlPct = ((currentPrice - buyPrice) / buyPrice) * 100;
+          pnlUsd = remainingQty * (currentPrice - buyPrice);
+        }
       } else if (!isOpen && r.pnl_usd != null) {
         pnlUsd = Number(r.pnl_usd);
         pnlPct = r.pnl_pct != null ? Number(r.pnl_pct) : null;
@@ -65,7 +74,10 @@ export async function GET() {
       return {
         id: r.id,
         symbol: r.symbol,
-        quantity,
+        side,
+        quantity: totalQty,
+        closed_quantity: closedQty,
+        remaining_quantity: remainingQty,
         buy_price: buyPrice,
         buy_date: r.buy_date,
         sell_date: r.sell_date,
@@ -81,6 +93,14 @@ export async function GET() {
         strategy_name: r.strategy_name ?? null,
         status: r.status,
         notes: r.notes,
+        // W3 bracket surfacing — UI renders chips for non-null values.
+        stop_loss_price: r.stop_loss_price != null ? Number(r.stop_loss_price) : null,
+        take_profit_price: r.take_profit_price != null ? Number(r.take_profit_price) : null,
+        trailing_stop_pct: r.trailing_stop_pct != null ? Number(r.trailing_stop_pct) : null,
+        trailing_stop_price: r.trailing_stop_price != null ? Number(r.trailing_stop_price) : null,
+        trailing_active: Number(r.trailing_active ?? 0) === 1,
+        time_exit_date: r.time_exit_date ?? null,
+        exit_reason: r.exit_reason ?? null,
         created_at: r.created_at,
       };
     });
@@ -93,11 +113,14 @@ export async function GET() {
       id: o.id,
       symbol: o.symbol,
       side: o.side,
+      position_side: o.position_side ?? "LONG",
       order_type: o.order_type,
       investment_usd: o.investment_usd != null ? Number(o.investment_usd) : null,
       limit_price: o.limit_price != null ? Number(o.limit_price) : null,
       stop_price: o.stop_price != null ? Number(o.stop_price) : null,
       reserved_amount: Number(o.reserved_amount ?? 0),
+      reserved_short_margin: Number(o.reserved_short_margin ?? 0),
+      close_quantity: o.close_quantity != null ? Number(o.close_quantity) : null,
       created_at: o.created_at,
       notes: o.notes,
     }));
@@ -153,6 +176,7 @@ export async function GET() {
         initial_cash: account.initial_cash,
         cash: equity.cash,
         reserved_cash: equity.reserved_cash,
+        reserved_short_margin: equity.reserved_short_margin,
         positions_value: equity.positions_value,
         equity: equity.equity,
         open_positions: equity.open_positions,
