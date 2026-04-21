@@ -15,21 +15,45 @@
 
 import cron from "node-cron";
 import mysql from "mysql2/promise";
+import { ensureAppBootstrapReady } from "../src/lib/bootstrap";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
-function requiredEnv(name: string): string {
-  const val = process.env[name];
-  if (!val) throw new Error(`Missing required env var: ${name}`);
+function env(...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function parseDatabaseUrl() {
+  const value = process.env.DATABASE_URL;
+  if (!value) return null;
+  const parsed = new URL(value);
+  return {
+    host: parsed.hostname,
+    port: parsed.port ? Number(parsed.port) : 3306,
+    user: decodeURIComponent(parsed.username),
+    password: decodeURIComponent(parsed.password),
+    database: parsed.pathname.replace("/", ""),
+  };
+}
+
+function requiredEnv(...names: string[]): string {
+  const val = env(...names);
+  if (!val) throw new Error(`Missing required env var: ${names.join(" or ")}`);
   return val;
 }
 
+const fromUrl = parseDatabaseUrl();
+
 const DB_CONFIG: mysql.PoolOptions = {
-  host: requiredEnv("MYSQL_HOST"),
-  port: Number(requiredEnv("MYSQL_PORT")),
-  user: requiredEnv("MYSQL_USER"),
-  password: requiredEnv("MYSQL_PASSWORD"),
-  database: requiredEnv("MYSQL_DB"),
+  host: fromUrl?.host ?? requiredEnv("MYSQL_HOST", "MYSQLHOST"),
+  port: fromUrl?.port ?? Number(requiredEnv("MYSQL_PORT", "MYSQLPORT")),
+  user: fromUrl?.user ?? requiredEnv("MYSQL_USER", "MYSQLUSER"),
+  password: fromUrl?.password ?? requiredEnv("MYSQL_PASSWORD", "MYSQLPASSWORD"),
+  database: fromUrl?.database ?? requiredEnv("MYSQL_DB", "MYSQLDATABASE"),
   waitForConnections: true,
   connectionLimit: 5,
   timezone: "Z",
@@ -1750,26 +1774,34 @@ cron.schedule("0 3 * * *", async () => {
 
 // ─── Startup ────────────────────────────────────────────────────────────────
 
-log("========================================");
-log("Surveillance Cron Scheduler started");
-log("Schedule (ET, Mon-Fri):");
-log("  09:45 — Morning price sync (d_morning) — no enrollment");
-log("  09:50 — Execute trading strategies (trades yesterday's close cohort)");
-log("  12:35 — Midday prices (d_midday)");
-log("  16:05 — Close prices (d_close) + ENROLL today's post-close movers");
-log("  16:15 — Trend scanner (detect 3+ day streaks)");
-log("  16:30 — Execute confirmation strategies");
-log("  18:00 — Evening catchup sync");
-log("  */15  — Position monitor (9:00-16:59)");
-log(`  03:00 — Retention prune (>${PRICE_RETENTION_DAYS}d paper_position_prices, daily)`);
-log("========================================");
+async function main() {
+  await ensureAppBootstrapReady();
 
-// Startup catchup: prior-cohort price sync only. Never enroll on startup —
-// enrollment only via the scheduled 16:05 ET tick (or will be picked up
-// the next trading day if container restarts after close).
-log("Running immediate catchup sync (no enrollment)...");
-runMorningSync().then(async () => {
-  log("Startup sync complete.");
+  log("========================================");
+  log("Surveillance Cron Scheduler started");
+  log("Schedule (ET, Mon-Fri):");
+  log("  09:45 — Morning price sync (d_morning) — no enrollment");
+  log("  09:50 — Execute trading strategies (trades yesterday's close cohort)");
+  log("  12:35 — Midday prices (d_midday)");
+  log("  16:05 — Close prices (d_close) + ENROLL today's post-close movers");
+  log("  16:15 — Trend scanner (detect 3+ day streaks)");
+  log("  16:30 — Execute confirmation strategies");
+  log("  18:00 — Evening catchup sync");
+  log("  */15  — Position monitor (9:00-16:59)");
+  log(`  03:00 — Retention prune (>${PRICE_RETENTION_DAYS}d paper_position_prices, daily)`);
+  log("========================================");
+
+  // Startup catchup: prior-cohort price sync only. Never enroll on startup —
+  // enrollment only via the scheduled 16:05 ET tick (or will be picked up
+  // the next trading day if container restarts after close).
+  log("Running immediate catchup sync (no enrollment)...");
+  try {
+    await runMorningSync();
+    log("Startup sync complete.");
+  } catch (err) {
+    log(`Startup sync error: ${err}`);
+  }
+
   try {
     await jobExecuteStrategies();
   } catch (err) {
@@ -1786,6 +1818,9 @@ runMorningSync().then(async () => {
     log(`Startup confirmation strategy error: ${err}`);
   }
   log("Waiting for scheduled jobs...");
-}).catch(err => {
-  log(`Startup sync error: ${err}`);
+}
+
+main().catch((err) => {
+  console.error(`FATAL: scheduler bootstrap failed: ${err instanceof Error ? err.stack ?? err.message : err}`);
+  process.exit(1);
 });

@@ -69,6 +69,18 @@ CREATE TABLE IF NOT EXISTS app_settings (
   updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB;
 
+CREATE TABLE IF NOT EXISTS app_users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  role VARCHAR(16) NOT NULL DEFAULT 'admin',
+  is_active TINYINT NOT NULL DEFAULT 1,
+  last_login_at DATETIME(6) NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  UNIQUE KEY UX_app_users_email (email)
+) ENGINE=InnoDB;
+
 -- ─── Surveillance Tables ───────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS reversal_entries (

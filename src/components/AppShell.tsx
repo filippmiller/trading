@@ -39,6 +39,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [quickNav, setQuickNav] = useState("");
   const [quickNavOpen, setQuickNavOpen] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  async function handleLogout() {
+    try {
+      setLoggingOut(true);
+      await fetch("/api/auth/logout", { method: "POST" });
+      window.location.href = "/login";
+    } finally {
+      setLoggingOut(false);
+    }
+  }
 
   const filteredNavigation = useMemo(() => {
     const query = quickNav.trim().toLowerCase();
@@ -88,6 +99,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     AFTER:  { dot: 'bg-amber-500',                 text: 'text-amber-700',   label: 'After-Hours' },
     CLOSED: { dot: 'bg-zinc-400',                  text: 'text-zinc-500',    label: 'Market Closed' },
   } as const;
+
+  if (pathname === "/login") {
+    return <>{children}</>;
+  }
 
   return (
     <div className="flex min-h-screen bg-zinc-50">
@@ -230,6 +245,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <span>Enroll: 16:05 ET</span>
             <div className="h-4 w-px bg-zinc-200" />
             <span suppressHydrationWarning>ET: {marketNow?.clock ?? '—:—'}</span>
+            <div className="h-4 w-px bg-zinc-200" />
+            <button
+              type="button"
+              onClick={() => void handleLogout()}
+              disabled={loggingOut}
+              className="rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-semibold text-zinc-600 transition hover:border-zinc-300 hover:text-zinc-900 disabled:opacity-60"
+            >
+              {loggingOut ? "Signing out..." : "Log out"}
+            </button>
           </div>
         </header>
 

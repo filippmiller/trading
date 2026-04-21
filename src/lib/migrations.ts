@@ -62,11 +62,23 @@ const schemaStatements = [
     \`value\` LONGTEXT NOT NULL,
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
   ) ENGINE=InnoDB;`,
+  `CREATE TABLE IF NOT EXISTS app_users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(16) NOT NULL DEFAULT 'admin',
+    is_active TINYINT NOT NULL DEFAULT 1,
+    last_login_at DATETIME(6) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    UNIQUE KEY UX_app_users_email (email)
+  ) ENGINE=InnoDB;`,
   `CREATE TABLE IF NOT EXISTS reversal_entries (
     id INT AUTO_INCREMENT PRIMARY KEY,
     cohort_date DATE NOT NULL,
     symbol VARCHAR(16) NOT NULL,
     direction VARCHAR(8) NOT NULL,
+    enrollment_source VARCHAR(16) NOT NULL DEFAULT 'MOVERS',
     day_change_pct DECIMAL(10,4) NOT NULL,
     entry_price DECIMAL(18,6) NOT NULL,
     d1_morning DECIMAL(18,6) NULL,
@@ -182,6 +194,7 @@ const schemaStatements = [
     strategy_id INT NOT NULL,
     reversal_entry_id INT NULL,
     symbol VARCHAR(16) NOT NULL,
+    direction VARCHAR(8) NOT NULL DEFAULT 'LONG',
     generated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
     entry_price DECIMAL(18,6) NULL,
@@ -204,7 +217,8 @@ const schemaStatements = [
     INDEX IX_signal_strategy (strategy_id),
     INDEX IX_signal_status (status),
     INDEX IX_signal_symbol (symbol),
-    INDEX IX_signal_reversal (reversal_entry_id)
+    INDEX IX_signal_reversal (reversal_entry_id),
+    UNIQUE KEY UX_signal_strat_entry (strategy_id, reversal_entry_id)
   ) ENGINE=InnoDB;`,
   `CREATE TABLE IF NOT EXISTS paper_position_prices (
     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -227,7 +241,13 @@ const schemaStatements = [
   ) ENGINE=InnoDB;`,
 ];
 
-const ALLOWED_TABLES = new Set(["strategy_runs", "run_metrics", "reversal_entries", "paper_trades"]);
+const ALLOWED_TABLES = new Set([
+  "strategy_runs",
+  "run_metrics",
+  "reversal_entries",
+  "paper_trades",
+  "paper_signals",
+]);
 const COLUMN_REGEX = /^[a-z_][a-z0-9_]{0,63}$/;
 
 async function ensureColumn(table: string, column: string, definition: string) {
@@ -269,8 +289,10 @@ async function runSchemaMigrations() {
     await pool.execute(statement);
   }
   await ensureColumn("strategy_runs", "preset_name", "VARCHAR(64) NULL");
+  await ensureColumn("reversal_entries", "enrollment_source", "VARCHAR(16) NOT NULL DEFAULT 'MOVERS'");
   await ensureColumn("reversal_entries", "consecutive_days", "INT NULL");
   await ensureColumn("reversal_entries", "cumulative_change_pct", "DECIMAL(10,4) NULL");
+  await ensureColumn("paper_signals", "direction", "VARCHAR(8) NOT NULL DEFAULT 'LONG'");
   // Old surveillance runs could write duplicate (entry_id, field_name) rows.
   // Deduplicate first so the unique key can be added safely on existing data.
   await pool.execute(`

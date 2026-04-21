@@ -6,8 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "start:web": "node .next/standalone/trading/server.js",
     "lint": "eslint",
-    "surveillance": "npx tsx scripts/surveillance-cron.ts"
+    "surveillance": "npx tsx scripts/surveillance-cron.ts",
+    "start:worker": "npx tsx scripts/surveillance-cron.ts"
   },
   "dependencies": {
     "@radix-ui/react-tabs": "^1.1.13",
