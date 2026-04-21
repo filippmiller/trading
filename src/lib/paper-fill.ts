@@ -40,8 +40,31 @@
 import type mysqlTypes from "mysql2/promise";
 
 export type FillOrderResult =
-  | { filled: true; tradeId: number; quantity: number; fillPrice: number; side: "BUY" | "SELL"; pnlUsd?: number }
+  | { filled: true; tradeId: number; quantity: number; fillPrice: number; side: "BUY" | "SELL"; pnlUsd?: number; fillRationale?: FillRationale }
   | { filled: false; rejection: string };
+
+/**
+ * How a BUY/SELL was matched. SPOT = current live quote touched the trigger.
+ * OHLC_TOUCH = historical 5-min bar showed the limit price was pierced between
+ * polls (W2 LIMIT OHLC best-effort fill). MANUAL = immediate MARKET at quote.
+ */
+export type FillRationale = "SPOT" | "OHLC_TOUCH" | "MANUAL";
+
+/**
+ * Options that modify how a fill is recorded. Both are optional — MARKET
+ * orders placed via the UI typically pass neither (strategy defaults to
+ * MANUAL label, rationale defaults to SPOT). The cron path passes
+ * strategyId to attribute the trade to the strategy that emitted the signal;
+ * the OHLC limit path passes rationale='OHLC_TOUCH'.
+ */
+export type FillOrderOptions = {
+  /** FK to paper_strategies.id. NULL = manual user trade. */
+  strategyId?: number | null;
+  /** Provenance tag recorded in the trade row's `notes` column. */
+  fillRationale?: FillRationale;
+  /** Override strategy VARCHAR label (defaults to "{order_type} {side}"). */
+  strategyLabel?: string;
+};
 
 const MAX_REJECTION_LEN = 255;
 
@@ -69,6 +92,71 @@ const SOFT_REJECT = new Set([
 ]);
 
 /**
+ * Write an equity snapshot row for the account. Uses the supplied connection
+ * so the snapshot can participate in an in-flight transaction (price-accurate
+ * state at the instant of commit), or a fresh pool connection when called
+ * from an idle hourly cron.
+ *
+ * Positions are marked at `buy_price` here — not live price. That's
+ * intentional: this helper runs inside a DB transaction without an outbound
+ * Yahoo call so it can stay fast and not fail the parent transaction on a
+ * network blip. Live marking happens in `computeAccountEquity` for display;
+ * `paper_equity_snapshots` is the conservative book-value record.
+ *
+ * Lock order: this takes NO `FOR UPDATE` locks. It reads current cash and
+ * open-position book value, then inserts into `paper_equity_snapshots`.
+ * `paper_equity_snapshots` sits at the END of the lock order chain
+ * (paper_accounts → paper_orders → paper_trades → paper_equity_snapshots),
+ * so inserting into it never precedes a write against the earlier three.
+ *
+ * Returns true if a row was written; false on any error (swallowed — a
+ * snapshot write must NEVER fail the parent fill transaction).
+ */
+export async function recordEquitySnapshot(
+  accountId: number,
+  connOrPool: mysqlTypes.PoolConnection | mysqlTypes.Pool
+): Promise<boolean> {
+  try {
+    const [acctRows] = await connOrPool.execute(
+      "SELECT cash, reserved_cash FROM paper_accounts WHERE id = ?",
+      [accountId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (acctRows.length === 0) return false;
+    const cash = Number(acctRows[0].cash);
+    const reservedCash = Number(acctRows[0].reserved_cash ?? 0);
+
+    // Mark open positions at buy_price — conservative book value, avoids a
+    // network call inside the transaction. See helper header.
+    const [openRows] = await connOrPool.execute(
+      "SELECT COALESCE(SUM(quantity * buy_price), 0) AS open_value FROM paper_trades WHERE account_id = ? AND status = 'OPEN'",
+      [accountId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    const positionsValue = Number(openRows[0]?.open_value ?? 0);
+
+    const [closedRows] = await connOrPool.execute(
+      "SELECT COALESCE(SUM(pnl_usd), 0) AS realized FROM paper_trades WHERE account_id = ? AND status = 'CLOSED'",
+      [accountId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    const realizedPnl = Number(closedRows[0]?.realized ?? 0);
+
+    const equity = cash + reservedCash + positionsValue;
+
+    await connOrPool.execute(
+      `INSERT INTO paper_equity_snapshots
+         (account_id, cash, reserved_cash, positions_value, equity, realized_pnl)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [accountId, cash, reservedCash, positionsValue, equity, realizedPnl]
+    );
+    return true;
+  } catch {
+    // Snapshot writes are advisory — never let a failure here cascade into
+    // rolling back a money-moving transaction. Caller should not check the
+    // return value for correctness decisions, only for telemetry.
+    return false;
+  }
+}
+
+/**
  * Internal helper — runs the fill against the supplied connection. Caller
  * is responsible for wrapping in `beginTransaction` / `commit` / `rollback`.
  */
@@ -76,7 +164,8 @@ async function fillOrderCore(
   conn: mysqlTypes.PoolConnection,
   orderId: number,
   fillPrice: number,
-  nowIso: () => string
+  nowIso: () => string,
+  opts?: FillOrderOptions
 ): Promise<FillOrderResult> {
   if (!Number.isFinite(fillPrice) || fillPrice <= 0) {
     return { filled: false, rejection: "INVALID_PRICE" };
@@ -190,18 +279,32 @@ async function fillOrderCore(
     }
 
     // LOCK STEP 3 — paper_trades (via INSERT; no row pre-exists to FOR UPDATE).
+    // W2 fields:
+    //   strategy_id — FK attribution. Cron path passes it; UI passes null.
+    //   strategy    — denormalized VARCHAR label. Defaults to "{type} BUY".
+    //                 UI path passes "MANUAL BUY" via opts.strategyLabel.
+    //   notes       — plain-text rationale suffix lets smoke tests/audit
+    //                 surface OHLC_TOUCH vs SPOT without a new column.
+    const strategyLabel = opts?.strategyLabel ?? `${order.order_type} BUY`;
+    const strategyId = opts?.strategyId ?? null;
+    const noteParts: string[] = [];
+    if (order.notes) noteParts.push(String(order.notes));
+    if (opts?.fillRationale) noteParts.push(`fill_rationale=${opts.fillRationale}`);
+    const notes = noteParts.length > 0 ? noteParts.join(" | ") : null;
+
     const [tradeResult] = await conn.execute(
       `INSERT INTO paper_trades
-         (account_id, symbol, quantity, buy_price, buy_date, investment_usd, strategy, status, notes)
-       VALUES (?, ?, ?, ?, CURRENT_DATE, ?, ?, 'OPEN', ?)`,
+         (account_id, symbol, quantity, buy_price, buy_date, investment_usd, strategy, strategy_id, status, notes)
+       VALUES (?, ?, ?, ?, CURRENT_DATE, ?, ?, ?, 'OPEN', ?)`,
       [
         accountId,
         symbol,
         quantity,
         fillPrice,
         investment,
-        `${order.order_type} BUY`,
-        order.notes || null,
+        strategyLabel,
+        strategyId,
+        notes,
       ]
     ) as [mysqlTypes.ResultSetHeader, unknown];
 
@@ -218,7 +321,14 @@ async function fillOrderCore(
       return { filled: false, rejection: "ORDER_RACE_LOST" };
     }
 
-    return { filled: true, tradeId: tradeResult.insertId, quantity, fillPrice, side: "BUY" };
+    return {
+      filled: true,
+      tradeId: tradeResult.insertId,
+      quantity,
+      fillPrice,
+      side: "BUY",
+      fillRationale: opts?.fillRationale,
+    };
   }
 
   // SELL path.
@@ -295,7 +405,15 @@ async function fillOrderCore(
   // Silence unused `nowIso` param — reserved for future slippage audit logs.
   void nowIso;
 
-  return { filled: true, tradeId, quantity, fillPrice, side: "SELL", pnlUsd };
+  return {
+    filled: true,
+    tradeId,
+    quantity,
+    fillPrice,
+    side: "SELL",
+    pnlUsd,
+    fillRationale: opts?.fillRationale,
+  };
 }
 
 /**
@@ -370,20 +488,48 @@ async function rejectOrder(
 export async function fillOrder(
   pool: mysqlTypes.Pool,
   orderId: number,
-  fillPrice: number
+  fillPrice: number,
+  opts?: FillOrderOptions
 ): Promise<FillOrderResult> {
   const conn = await pool.getConnection();
+  let accountIdForSnapshot: number | null = null;
   try {
     await conn.beginTransaction();
     let result: FillOrderResult;
     try {
-      result = await fillOrderCore(conn, orderId, fillPrice, () => new Date().toISOString());
+      result = await fillOrderCore(conn, orderId, fillPrice, () => new Date().toISOString(), opts);
     } catch (err) {
       // rejectOrder (or any core step) may throw to force rollback when
       // a refund / state update could not complete atomically. Treat as a
       // hard rejection; the outer finally-rollback runs below.
       await conn.rollback();
       throw err;
+    }
+
+    // Resolve the account_id for the eventual snapshot before we commit the
+    // fill. We need this for BOTH filled AND soft-reject branches when the
+    // reservation was refunded (cash-moving rejection). Do the lookup while
+    // the transaction is still open so it's a single consistent snapshot.
+    if (result.filled || SOFT_REJECT.has(result.rejection ?? "")) {
+      try {
+        const [rows] = await conn.execute(
+          "SELECT account_id FROM paper_orders WHERE id = ?",
+          [orderId]
+        ) as [mysqlTypes.RowDataPacket[], unknown];
+        if (rows.length > 0) accountIdForSnapshot = Number(rows[0].account_id);
+      } catch { /* ignore — snapshot is advisory */ }
+    }
+
+    // W2 — write the equity snapshot INSIDE the transaction so it reflects the
+    // fill atomically. paper_equity_snapshots sits at the END of the lock
+    // order chain so this insert never precedes an earlier-chain write.
+    //
+    // Only write on `filled` (positive cash move) — soft rejects that
+    // don't change cash don't need a new snapshot row. Failures inside
+    // recordEquitySnapshot are swallowed so a snapshot write never fails
+    // the fill.
+    if (result.filled && accountIdForSnapshot != null) {
+      await recordEquitySnapshot(accountIdForSnapshot, conn);
     }
 
     if (result.filled) {
