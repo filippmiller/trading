@@ -3,7 +3,7 @@ import { getPool, mysql } from "@/lib/db";
 import { ensureSchema } from "@/lib/migrations";
 import {
   fetchLivePrice,
-  getDefaultAccount,
+  resolveAccount,
   SYMBOL_RE,
 } from "@/lib/paper";
 import {
@@ -13,6 +13,15 @@ import {
   cancelOrderWithRefund,
   modifyPendingOrder,
 } from "@/lib/paper-fill";
+
+/**
+ * W5 idempotency key validation. Accepts UUID-like tokens, base32, or
+ * anything crypto-random the client generates. Bounded 8..64 chars and a
+ * conservative charset to avoid any accidental SQL / encoding edge cases
+ * (the column is already VARCHAR(64) with a UNIQUE index, but we validate
+ * at the boundary too so a malformed client can never pollute the index).
+ */
+const CLIENT_REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
 type OrderBody = {
   symbol: string;
@@ -39,7 +48,52 @@ type OrderBody = {
   trailing_stop_pct?: number;
   trailing_activates_at_profit_pct?: number;
   time_exit_days?: number;
+
+  /**
+   * W5 — client-generated idempotency key. If the same id is submitted twice
+   * (Buy button mashed twice, network retry, etc) the second POST returns
+   * the original order row instead of inserting a duplicate. See the
+   * UNIQUE INDEX `idx_paper_orders_client_request_id` — errno 1062 on the
+   * INSERT triggers the dedup-lookup branch.
+   */
+  client_request_id?: string;
 };
+
+/**
+ * W5 — alias for the mysql pool type so helper funcs can receive it without
+ * pulling `Pool` from the deep mysql2 typings. `Awaited<ReturnType<...>>` is
+ * the canonical way to pick the pool instance type out of an async getter.
+ */
+type PoolType = Awaited<ReturnType<typeof getPool>>;
+
+/**
+ * W5 — return the minimal "already-placed" response shape so the client sees
+ * the exact same `success: true, order_id: N` it got the first time. Reads
+ * enough of the row to mirror the normal POST response including `status`,
+ * `filled_price`, `trade_id`.
+ */
+async function buildIdempotentResponse(
+  pool: PoolType,
+  orderId: number
+) {
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT status, filled_price, rejection_reason, trade_id FROM paper_orders WHERE id = ?",
+    [orderId]
+  );
+  if (rows.length === 0) {
+    return NextResponse.json({ error: "order vanished mid-request" }, { status: 500 });
+  }
+  const r = rows[0];
+  return NextResponse.json({
+    success: r.status === "FILLED" || r.status === "PENDING",
+    order_id: orderId,
+    status: r.status,
+    filled_price: r.filled_price != null ? Number(r.filled_price) : null,
+    rejection_reason: r.rejection_reason,
+    trade_id: r.trade_id,
+    idempotent_replay: true,
+  });
+}
 
 /**
  * POST /api/paper/order
@@ -53,6 +107,7 @@ type OrderBody = {
 export async function POST(req: Request) {
   try {
     await ensureSchema();
+    const accountIdParam = new URL(req.url).searchParams.get("account_id");
     const body = (await req.json()) as OrderBody;
     const {
       symbol,
@@ -70,6 +125,7 @@ export async function POST(req: Request) {
       trailing_stop_pct,
       trailing_activates_at_profit_pct,
       time_exit_days,
+      client_request_id,
     } = body;
 
     if (!symbol || typeof symbol !== "string") {
@@ -87,6 +143,28 @@ export async function POST(req: Request) {
     }
     if (!["MARKET", "LIMIT", "STOP"].includes(order_type)) {
       return NextResponse.json({ error: "order_type must be MARKET, LIMIT, or STOP" }, { status: 400 });
+    }
+
+    // W5 idempotency — if the client provided an id, validate it and check
+    // up-front for a prior row. Early return avoids any side-effects (no
+    // price fetch, no reservation, no insert) on replays. The UNIQUE index
+    // at the DB layer is the final line of defense against races.
+    let clientRequestId: string | null = null;
+    if (client_request_id != null) {
+      if (typeof client_request_id !== "string" || !CLIENT_REQUEST_ID_RE.test(client_request_id)) {
+        return NextResponse.json({
+          error: "client_request_id must be 8-64 chars matching [A-Za-z0-9_-]+"
+        }, { status: 400 });
+      }
+      clientRequestId = client_request_id;
+      const pool = await getPool();
+      const [existing] = await pool.execute<mysql.RowDataPacket[]>(
+        "SELECT id FROM paper_orders WHERE client_request_id = ? LIMIT 1",
+        [clientRequestId]
+      );
+      if (existing.length > 0) {
+        return buildIdempotentResponse(pool, Number(existing[0].id));
+      }
     }
 
     // Classify the action via (side, position_side).
@@ -112,7 +190,7 @@ export async function POST(req: Request) {
     }
 
     const pool = await getPool();
-    const account = await getDefaultAccount();
+    const account = await resolveAccount(accountIdParam);
 
     // For MARKET close: verify an open position of the correct side exists
     // up-front so the user sees an immediate error. Account/side match is
@@ -154,34 +232,54 @@ export async function POST(req: Request) {
       marketLivePrice = quote.price;
     }
 
-    const [result] = await pool.execute<mysql.ResultSetHeader>(
-      `INSERT INTO paper_orders
-       (account_id, symbol, side, position_side, order_type, investment_usd, limit_price, stop_price,
-        trade_id, close_quantity, notes,
-        bracket_stop_loss_pct, bracket_take_profit_pct,
-        bracket_trailing_pct, bracket_trailing_activates_pct, bracket_time_exit_days,
-        status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
-      [
-        account.id,
-        sym,
-        side,
-        position_side,
-        order_type,
-        (isOpenLong || isOpenShort) ? investment_usd : null,
-        limit_price ?? null,
-        stop_price ?? null,
-        trade_id ?? null,
-        close_quantity ?? null,
-        notes ?? null,
-        (isOpenLong || isOpenShort) && stop_loss_pct != null && stop_loss_pct > 0 ? stop_loss_pct : null,
-        (isOpenLong || isOpenShort) && take_profit_pct != null && take_profit_pct > 0 ? take_profit_pct : null,
-        (isOpenLong || isOpenShort) && trailing_stop_pct != null && trailing_stop_pct > 0 ? trailing_stop_pct : null,
-        (isOpenLong || isOpenShort) && trailing_activates_at_profit_pct != null ? trailing_activates_at_profit_pct : null,
-        (isOpenLong || isOpenShort) && time_exit_days != null && time_exit_days >= 0 ? time_exit_days : null,
-      ]
-    );
-    const orderId = result.insertId;
+    // W5 — pass `client_request_id` through on INSERT. The UNIQUE index
+    // `idx_paper_orders_client_request_id` enforces dedup at the DB layer;
+    // if a concurrent caller raced past our pre-check and inserted the same
+    // id first, we catch errno 1062 and return the existing row. That
+    // closes the TOCTOU gap between the pre-check and the INSERT.
+    let orderId: number;
+    try {
+      const [result] = await pool.execute<mysql.ResultSetHeader>(
+        `INSERT INTO paper_orders
+         (account_id, symbol, side, position_side, order_type, investment_usd, limit_price, stop_price,
+          trade_id, close_quantity, notes,
+          bracket_stop_loss_pct, bracket_take_profit_pct,
+          bracket_trailing_pct, bracket_trailing_activates_pct, bracket_time_exit_days,
+          client_request_id, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+        [
+          account.id,
+          sym,
+          side,
+          position_side,
+          order_type,
+          (isOpenLong || isOpenShort) ? investment_usd : null,
+          limit_price ?? null,
+          stop_price ?? null,
+          trade_id ?? null,
+          close_quantity ?? null,
+          notes ?? null,
+          (isOpenLong || isOpenShort) && stop_loss_pct != null && stop_loss_pct > 0 ? stop_loss_pct : null,
+          (isOpenLong || isOpenShort) && take_profit_pct != null && take_profit_pct > 0 ? take_profit_pct : null,
+          (isOpenLong || isOpenShort) && trailing_stop_pct != null && trailing_stop_pct > 0 ? trailing_stop_pct : null,
+          (isOpenLong || isOpenShort) && trailing_activates_at_profit_pct != null ? trailing_activates_at_profit_pct : null,
+          (isOpenLong || isOpenShort) && time_exit_days != null && time_exit_days >= 0 ? time_exit_days : null,
+          clientRequestId,
+        ]
+      );
+      orderId = result.insertId;
+    } catch (err: unknown) {
+      // errno 1062 = UNIQUE constraint violation on client_request_id (race
+      // between our pre-check and the INSERT). Return the winning row.
+      if ((err as { errno?: number }).errno === 1062 && clientRequestId) {
+        const [existing] = await pool.execute<mysql.RowDataPacket[]>(
+          "SELECT id FROM paper_orders WHERE client_request_id = ? LIMIT 1",
+          [clientRequestId]
+        );
+        if (existing.length > 0) return buildIdempotentResponse(pool, Number(existing[0].id));
+      }
+      throw err;
+    }
 
     // PENDING reservation logic per (side, position_side):
     //   - LIMIT/STOP BUY + LONG  → reserve from cash
