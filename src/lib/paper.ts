@@ -1,5 +1,5 @@
 import { getPool, mysql } from "@/lib/db";
-import { fillOrder } from "@/lib/paper-fill";
+import { fillOrder, recordEquitySnapshot, type FillRationale } from "@/lib/paper-fill";
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 const SYMBOL_RE = /^[A-Z0-9.\-]{1,16}$/;
@@ -225,19 +225,144 @@ export async function computeAccountEquity(accountId: number): Promise<{
 }
 
 /**
+ * 5-minute OHLC bar. `t` is the bar's Unix-seconds open time. W2 LIMIT-fill
+ * path uses these bars to detect a limit-price touch that happened BETWEEN
+ * polls (current spot may have snapped back before the poller looked).
+ */
+export type IntradayBar = {
+  t: number;   // Unix seconds
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+};
+
+/**
+ * Fetch 5-minute intraday bars for `symbol` from Yahoo. Returns the last
+ * `range=1d` window at `interval=5m`. Returns an empty array on any
+ * transport/parse error — callers fall back silently to the spot check.
+ *
+ * Exposed via a module-level reference so smoke tests can monkey-patch the
+ * fetcher without touching internals; normal code paths just call
+ * `fetchIntradayBars(symbol)`.
+ */
+export async function fetchIntradayBarsFromYahoo(symbol: string): Promise<IntradayBar[]> {
+  if (!SYMBOL_RE.test(symbol)) return [];
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=5m`;
+    const res = await fetch(url, { headers: { "User-Agent": UA } });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const result = data?.chart?.result?.[0];
+    const ts: number[] = result?.timestamp ?? [];
+    const q = result?.indicators?.quote?.[0];
+    const opens: (number | null)[] = q?.open ?? [];
+    const highs: (number | null)[] = q?.high ?? [];
+    const lows: (number | null)[] = q?.low ?? [];
+    const closes: (number | null)[] = q?.close ?? [];
+    const bars: IntradayBar[] = [];
+    for (let i = 0; i < ts.length; i++) {
+      const open = opens[i], high = highs[i], low = lows[i], close = closes[i];
+      if (!Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close)) continue;
+      bars.push({ t: Number(ts[i]), open: open as number, high: high as number, low: low as number, close: close as number });
+    }
+    return bars;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Monkey-patch slot for tests. Default implementation hits Yahoo; smoke
+ * tests replace it with a fixture-returning fn to prove the OHLC_TOUCH code
+ * path runs without network dependency.
+ */
+export let fetchIntradayBars: (symbol: string) => Promise<IntradayBar[]> = fetchIntradayBarsFromYahoo;
+
+/** Set a test override. Call `_resetIntradayBarsFetcher()` after the test. */
+export function _setIntradayBarsFetcher(fn: (symbol: string) => Promise<IntradayBar[]>): void {
+  fetchIntradayBars = fn;
+}
+export function _resetIntradayBarsFetcher(): void {
+  fetchIntradayBars = fetchIntradayBarsFromYahoo;
+}
+
+/**
+ * Decide whether a LIMIT order should fill against the intraday bars window.
+ *
+ * Returns the fill price (the limit price itself — the UX contract for a
+ * limit order is "you get the limit or better") + rationale, or null if no
+ * touch happened and the spot check also did not trigger.
+ *
+ * @param side       BUY or SELL
+ * @param limit      Order's limit price
+ * @param spot       Current live price
+ * @param bars       Intraday 5-min bars since the order's created_at
+ * @param createdAt  Order's created_at as a Date (filters bars)
+ */
+export function evaluateLimitFill(
+  side: "BUY" | "SELL",
+  limit: number,
+  spot: number,
+  bars: IntradayBar[],
+  createdAt: Date
+): { fillPrice: number; rationale: FillRationale } | null {
+  // Spot check first — cheaper, matches legacy behavior.
+  if (side === "BUY" && spot <= limit) return { fillPrice: spot, rationale: "SPOT" };
+  if (side === "SELL" && spot >= limit) return { fillPrice: spot, rationale: "SPOT" };
+
+  // OHLC check — find any bar whose low..high range pierced the limit.
+  const createdAtSec = Math.floor(createdAt.getTime() / 1000);
+  for (const bar of bars) {
+    if (bar.t < createdAtSec) continue;
+    if (side === "BUY" && bar.low <= limit) {
+      return { fillPrice: limit, rationale: "OHLC_TOUCH" };
+    }
+    if (side === "SELL" && bar.high >= limit) {
+      return { fillPrice: limit, rationale: "OHLC_TOUCH" };
+    }
+  }
+  return null;
+}
+
+/**
  * Check pending limit/stop orders and fill any that are triggered by current
  * prices. Called before every GET /api/paper to keep the order book fresh.
  * Delegates each fill to the shared `fillOrder` in `src/lib/paper-fill.ts`.
+ *
+ * W2: LIMIT orders additionally query 5-min OHLC bars for the window since
+ * `created_at` — if the limit price was pierced inside any bar the order
+ * fills at the limit with `fill_rationale=OHLC_TOUCH`. Yahoo failures fall
+ * back silently to the spot check so one bad symbol never poisons the batch.
  */
 export async function fillPendingOrders(): Promise<number> {
   const pool = await getPool();
   const [pending] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT id, account_id, symbol, side, order_type, limit_price, stop_price FROM paper_orders WHERE status = 'PENDING'"
+    "SELECT id, account_id, symbol, side, order_type, limit_price, stop_price, created_at FROM paper_orders WHERE status = 'PENDING'"
   );
   if (pending.length === 0) return 0;
 
   const symbols = Array.from(new Set(pending.map(o => o.symbol)));
   const prices = await fetchLivePrices(symbols);
+
+  // Only fetch OHLC bars for symbols that actually have a pending LIMIT order —
+  // no point paying the Yahoo round-trip for MARKET/STOP.
+  const limitSymbols = Array.from(new Set(
+    pending.filter(o => o.order_type === "LIMIT").map(o => o.symbol)
+  ));
+  const barsBySymbol: Record<string, IntradayBar[]> = {};
+  for (let i = 0; i < limitSymbols.length; i += 5) {
+    const batch = limitSymbols.slice(i, i + 5);
+    await Promise.all(batch.map(async (s) => {
+      try {
+        barsBySymbol[s] = await fetchIntradayBars(s);
+      } catch {
+        // Fall back silently to spot-only for this symbol. Do NOT fail the
+        // batch on one bad upstream.
+        barsBySymbol[s] = [];
+      }
+    }));
+  }
 
   let filled = 0;
   for (const order of pending) {
@@ -250,25 +375,47 @@ export async function fillPendingOrders(): Promise<number> {
     const side = order.side as "BUY" | "SELL";
     const type = order.order_type as "MARKET" | "LIMIT" | "STOP";
 
-    let shouldFill = false;
+    let fillPrice: number | null = null;
+    let rationale: FillRationale | undefined;
+
     if (type === "MARKET") {
       // Only fill a PENDING MARKET order when the quote is live — outside
       // RTH the last-close price is not an honest execution.
-      shouldFill = live.isLive;
+      if (live.isLive) {
+        fillPrice = price;
+        rationale = "SPOT";
+      }
     } else if (type === "LIMIT" && limit != null) {
-      // BUY limit fills when price <= limit; SELL limit fills when price >= limit.
-      shouldFill = side === "BUY" ? price <= limit : price >= limit;
+      const bars = barsBySymbol[order.symbol] ?? [];
+      const createdAt = order.created_at instanceof Date
+        ? order.created_at
+        : new Date(order.created_at);
+      const decision = evaluateLimitFill(side, limit, price, bars, createdAt);
+      if (decision) {
+        fillPrice = decision.fillPrice;
+        rationale = decision.rationale;
+      }
     } else if (type === "STOP" && stop != null) {
       // BUY stop fills when price >= stop; SELL stop fills when price <= stop.
-      shouldFill = side === "BUY" ? price >= stop : price <= stop;
+      const triggered = side === "BUY" ? price >= stop : price <= stop;
+      if (triggered) {
+        fillPrice = price;
+        rationale = "SPOT";
+      }
     }
 
-    if (!shouldFill) continue;
+    if (fillPrice == null) continue;
 
-    const result = await fillOrder(pool, Number(order.id), price);
+    const result = await fillOrder(pool, Number(order.id), fillPrice, { fillRationale: rationale });
     if (result.filled) filled++;
   }
   return filled;
 }
+
+/**
+ * Re-export so API + cron callers don't need a second import to take
+ * snapshots. See `src/lib/paper-fill.ts:recordEquitySnapshot` for semantics.
+ */
+export { recordEquitySnapshot };
 
 export { SYMBOL_RE };
