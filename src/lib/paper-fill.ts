@@ -1240,3 +1240,117 @@ export async function patchPendingOrderPrices(
   }
   return { ok: true };
 }
+
+/**
+ * W3 hotfix #2 — atomic cancel-with-refund for a PENDING order.
+ *
+ * The old DELETE /api/paper/order path did (a) releaseReservationForOrder
+ * which committed its own transaction, then (b) a separate UPDATE to flip
+ * status to CANCELLED. Between those two commits the order is PENDING with
+ * reserved_amount = 0 — a concurrent `fillPendingOrders` run could see this
+ * half-state and attempt to fill from cash that has already been refunded.
+ * Two concurrent DELETEs could also double-refund.
+ *
+ * Collapsing both steps into ONE transaction under the canonical account →
+ * order lock order makes the cancellation observable atomically: either the
+ * caller sees PENDING-with-reservation, or CANCELLED-with-zero. No gap.
+ *
+ * Returns `{cancelled: true}` for the first caller that flips PENDING →
+ * CANCELLED. Every later caller returns `{cancelled: false}` — either the
+ * order no longer existed, was already cancelled/filled/rejected, or was
+ * raced out from under us.
+ */
+export async function cancelOrderWithRefund(
+  pool: mysqlTypes.Pool,
+  orderId: number
+): Promise<{ cancelled: boolean; reason?: string }> {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Pre-read — learn account_id without holding a lock so we can acquire
+    // locks in canonical order (accounts → orders). If the order is gone we
+    // report {cancelled:false} and commit the empty transaction.
+    const [preRows] = await conn.execute(
+      "SELECT account_id FROM paper_orders WHERE id = ?",
+      [orderId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (preRows.length === 0) {
+      await conn.rollback();
+      return { cancelled: false, reason: "ORDER_NOT_FOUND" };
+    }
+    const accountId = Number(preRows[0].account_id);
+
+    // LOCK STEP 1 — account (canonical order).
+    const [acctRows] = await conn.execute(
+      "SELECT id FROM paper_accounts WHERE id = ? FOR UPDATE",
+      [accountId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (acctRows.length === 0) {
+      await conn.rollback();
+      return { cancelled: false, reason: "ACCOUNT_NOT_FOUND" };
+    }
+
+    // LOCK STEP 2 — order. Authoritative status under lock.
+    const [orderRows] = await conn.execute(
+      "SELECT status, reserved_amount, reserved_short_margin FROM paper_orders WHERE id = ? FOR UPDATE",
+      [orderId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (orderRows.length === 0) {
+      await conn.rollback();
+      return { cancelled: false, reason: "ORDER_NOT_FOUND" };
+    }
+    const order = orderRows[0];
+    if (order.status !== "PENDING") {
+      // Already cancelled / filled / rejected — another caller won.
+      await conn.rollback();
+      return { cancelled: false, reason: `ORDER_NOT_PENDING_${order.status}` };
+    }
+    const reservedCash = Number(order.reserved_amount ?? 0);
+    const reservedShort = Number(order.reserved_short_margin ?? 0);
+
+    // Refund both reservation buckets atomically. Each UPDATE is guarded by a
+    // >= check on the destination column so an account with a bad invariant
+    // can't silently decrement past zero.
+    if (reservedCash > 0) {
+      const [refund] = await conn.execute(
+        "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
+        [reservedCash, reservedCash, accountId, reservedCash]
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (refund.affectedRows !== 1) {
+        await conn.rollback();
+        return { cancelled: false, reason: "RESERVED_CASH_UNDERFLOW" };
+      }
+    }
+    if (reservedShort > 0) {
+      const [refundShort] = await conn.execute(
+        "UPDATE paper_accounts SET cash = cash + ?, reserved_short_margin = reserved_short_margin - ? WHERE id = ? AND reserved_short_margin >= ?",
+        [reservedShort, reservedShort, accountId, reservedShort]
+      ) as [mysqlTypes.ResultSetHeader, unknown];
+      if (refundShort.affectedRows !== 1) {
+        await conn.rollback();
+        return { cancelled: false, reason: "RESERVED_SHORT_UNDERFLOW" };
+      }
+    }
+
+    // Flip the order in the same transaction. Status guard means the first
+    // caller to reach here wins; concurrent cancels see affectedRows === 0
+    // and roll back (leaving their refund-undo implicit via the rollback).
+    const [flip] = await conn.execute(
+      "UPDATE paper_orders SET status = 'CANCELLED', reserved_amount = 0, reserved_short_margin = 0 WHERE id = ? AND status = 'PENDING'",
+      [orderId]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (flip.affectedRows !== 1) {
+      await conn.rollback();
+      return { cancelled: false, reason: "ORDER_RACE_LOST" };
+    }
+
+    await conn.commit();
+    return { cancelled: true };
+  } catch (err) {
+    try { await conn.rollback(); } catch { /* ignore */ }
+    throw err;
+  } finally {
+    conn.release();
+  }
+}

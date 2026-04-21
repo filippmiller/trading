@@ -8,11 +8,11 @@ import {
 } from "@/lib/paper";
 import {
   fillOrder,
-  releaseReservationForOrder,
   reserveCashForOrder,
   reserveShortMarginForOrder,
   adjustReservation,
   patchPendingOrderPrices,
+  cancelOrderWithRefund,
 } from "@/lib/paper-fill";
 
 type OrderBody = {
@@ -333,13 +333,13 @@ export async function DELETE(req: Request) {
 
     const pool = await getPool();
     const orderId = Number(id);
-    await releaseReservationForOrder(pool, orderId);
-    const [result] = await pool.execute<mysql.ResultSetHeader>(
-      "UPDATE paper_orders SET status = 'CANCELLED' WHERE id = ? AND status = 'PENDING'",
-      [orderId]
-    );
-    if (result.affectedRows === 0) {
-      return NextResponse.json({ error: "Order not found or not pending" }, { status: 404 });
+    // W3 hotfix #2: single atomic transaction combines refund + status flip.
+    // The old split (releaseReservationForOrder then UPDATE) let concurrent
+    // DELETEs double-refund and let fillPendingOrders observe PENDING with
+    // reserved_amount=0 between the two commits.
+    const result = await cancelOrderWithRefund(pool, orderId);
+    if (!result.cancelled) {
+      return NextResponse.json({ error: result.reason ?? "Order not found or not pending" }, { status: 404 });
     }
     return NextResponse.json({ success: true });
   } catch (err) {

@@ -495,6 +495,46 @@ async function testH1_partialThenAutoExit(accountId) {
   assert(Math.abs(Number(f.pnl_pct) - 7.0) < 1e-3, `H1 pnl_pct = 7.0 (got ${f.pnl_pct}) — must be total/investment, not slice-based`);
 }
 
+// ── Test H2 (hotfix #2): DELETE is atomic — no intermediate state ─────────
+async function testH2_cancelAtomic(accountId) {
+  console.log("\nTest H2 (hotfix #2): cancelOrderWithRefund atomic — concurrent cancels, single winner");
+  await pool.execute("DELETE FROM paper_trades WHERE account_id = ?", [accountId]);
+  await pool.execute("DELETE FROM paper_orders WHERE account_id = ?", [accountId]);
+  await pool.execute("UPDATE paper_accounts SET cash = ?, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?", [TEST_INITIAL_CASH, accountId]);
+
+  // Open LIMIT BUY for $1000 at limit $50 on GOOGL — reserves $1000 in cash.
+  const orderId = await insertOrder(accountId, "GOOGL", "BUY", "LONG", "LIMIT", {
+    investment_usd: 1000, limit_price: 50,
+  });
+  const reserved = await paperFill.reserveCashForOrder(pool, orderId, accountId, 1000);
+  assert(reserved === true, `H2 reservation succeeded`);
+  let acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.cash) - (TEST_INITIAL_CASH - 1000)) < PRECISION_EPS, `H2 cash post-reserve = ${TEST_INITIAL_CASH - 1000}`);
+  assert(Math.abs(Number(acct.reserved_cash) - 1000) < PRECISION_EPS, `H2 reserved_cash = 1000`);
+
+  // Launch N=20 concurrent cancels on the same orderId.
+  const N = 20;
+  const promises = [];
+  for (let i = 0; i < N; i++) {
+    promises.push(paperFill.cancelOrderWithRefund(pool, orderId));
+  }
+  const results = await Promise.all(promises);
+  const winners = results.filter((r) => r.cancelled === true);
+  const losers = results.filter((r) => r.cancelled === false);
+  assert(winners.length === 1, `H2 exactly 1 cancel winner (got ${winners.length})`);
+  assert(losers.length === N - 1, `H2 exactly ${N - 1} losers (got ${losers.length})`);
+
+  // Cash must be restored to exactly initial — not +N*1000 (that would be the
+  // bug where every cancel re-refunded).
+  acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.cash) - TEST_INITIAL_CASH) < PRECISION_EPS, `H2 cash restored to exactly $${TEST_INITIAL_CASH} (got ${acct.cash})`);
+  assert(Math.abs(Number(acct.reserved_cash)) < PRECISION_EPS, `H2 reserved_cash = 0 (got ${acct.reserved_cash})`);
+
+  const [[orderRow]] = await pool.execute("SELECT status, reserved_amount FROM paper_orders WHERE id = ?", [orderId]);
+  assert(orderRow.status === "CANCELLED", `H2 order status = CANCELLED (got ${orderRow.status})`);
+  assert(Math.abs(Number(orderRow.reserved_amount)) < PRECISION_EPS, `H2 order reserved_amount = 0 (got ${orderRow.reserved_amount})`);
+}
+
 // ── Test 9b: PF2 — duplicate SHORT position rejection ────────────────────
 async function test9b_duplicateShort(accountId) {
   console.log("\nTest 9b: PF2 — second SHORT on same (account, symbol) rejected as DUPLICATE_SHORT_POSITION");
@@ -587,6 +627,7 @@ async function test9_invariant(accountId) {
     await test7_partialClose(accountId);
     await test8_orderModify(accountId);
     await testH1_partialThenAutoExit(accountId);
+    await testH2_cancelAtomic(accountId);
     await test9b_duplicateShort(accountId);
     await test9_invariant(accountId);
 
