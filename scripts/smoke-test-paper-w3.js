@@ -535,6 +535,47 @@ async function testH2_cancelAtomic(accountId) {
   assert(Math.abs(Number(orderRow.reserved_amount)) < PRECISION_EPS, `H2 order reserved_amount = 0 (got ${orderRow.reserved_amount})`);
 }
 
+// ── Test H3 (hotfix #3): PATCH is atomic — failure reverts ────────────────
+async function testH3_modifyAtomic(accountId) {
+  console.log("\nTest H3 (hotfix #3): modifyPendingOrder atomic — invalid input leaves order untouched");
+  await pool.execute("DELETE FROM paper_trades WHERE account_id = ?", [accountId]);
+  await pool.execute("DELETE FROM paper_orders WHERE account_id = ?", [accountId]);
+  await pool.execute("UPDATE paper_accounts SET cash = ?, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?", [TEST_INITIAL_CASH, accountId]);
+
+  // Open LIMIT BUY $1000 at limit $50 on AAPL.
+  const orderId = await insertOrder(accountId, "AAPL", "BUY", "LONG", "LIMIT", {
+    investment_usd: 1000, limit_price: 50,
+  });
+  const reserved = await paperFill.reserveCashForOrder(pool, orderId, accountId, 1000);
+  assert(reserved === true, `H3 reservation succeeded`);
+
+  // PATCH with invalid limit_price (-5) — must fail and leave EVERYTHING
+  // untouched (including reservation + investment).
+  const bad = await paperFill.modifyPendingOrder(pool, orderId, { limit_price: -5, investment_usd: 500 });
+  assert(bad.ok === false, `H3 invalid PATCH rejected (got ${JSON.stringify(bad)})`);
+  assert(bad.reason === "INVALID_LIMIT_PRICE", `H3 rejection reason = INVALID_LIMIT_PRICE (got ${bad.reason})`);
+
+  // Assert order still has original values — no partial success.
+  const [[o1]] = await pool.execute("SELECT limit_price, investment_usd, reserved_amount FROM paper_orders WHERE id = ?", [orderId]);
+  assert(Math.abs(Number(o1.limit_price) - 50) < PRECISION_EPS, `H3 limit_price unchanged = 50 (got ${o1.limit_price})`);
+  assert(Math.abs(Number(o1.investment_usd) - 1000) < PRECISION_EPS, `H3 investment_usd unchanged = 1000 (got ${o1.investment_usd})`);
+  assert(Math.abs(Number(o1.reserved_amount) - 1000) < PRECISION_EPS, `H3 reserved_amount unchanged = 1000 (got ${o1.reserved_amount})`);
+  let acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.reserved_cash) - 1000) < PRECISION_EPS, `H3 account reserved_cash unchanged = 1000 (got ${acct.reserved_cash})`);
+
+  // Now a VALID PATCH: limit_price 45, investment_usd 500 — must succeed
+  // and update all fields atomically.
+  const good = await paperFill.modifyPendingOrder(pool, orderId, { limit_price: 45, investment_usd: 500 });
+  assert(good.ok === true, `H3 valid PATCH succeeded (got ${JSON.stringify(good)})`);
+  const [[o2]] = await pool.execute("SELECT limit_price, investment_usd, reserved_amount FROM paper_orders WHERE id = ?", [orderId]);
+  assert(Math.abs(Number(o2.limit_price) - 45) < PRECISION_EPS, `H3 limit_price = 45 (got ${o2.limit_price})`);
+  assert(Math.abs(Number(o2.investment_usd) - 500) < PRECISION_EPS, `H3 investment_usd = 500 (got ${o2.investment_usd})`);
+  assert(Math.abs(Number(o2.reserved_amount) - 500) < PRECISION_EPS, `H3 reserved_amount = 500 (got ${o2.reserved_amount})`);
+  acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.reserved_cash) - 500) < PRECISION_EPS, `H3 account reserved_cash = 500 (got ${acct.reserved_cash})`);
+  assert(Math.abs(Number(acct.cash) - (TEST_INITIAL_CASH - 500)) < PRECISION_EPS, `H3 account cash = ${TEST_INITIAL_CASH - 500} (got ${acct.cash})`);
+}
+
 // ── Test 9b: PF2 — duplicate SHORT position rejection ────────────────────
 async function test9b_duplicateShort(accountId) {
   console.log("\nTest 9b: PF2 — second SHORT on same (account, symbol) rejected as DUPLICATE_SHORT_POSITION");
@@ -628,6 +669,7 @@ async function test9_invariant(accountId) {
     await test8_orderModify(accountId);
     await testH1_partialThenAutoExit(accountId);
     await testH2_cancelAtomic(accountId);
+    await testH3_modifyAtomic(accountId);
     await test9b_duplicateShort(accountId);
     await test9_invariant(accountId);
 

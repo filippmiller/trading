@@ -10,9 +10,8 @@ import {
   fillOrder,
   reserveCashForOrder,
   reserveShortMarginForOrder,
-  adjustReservation,
-  patchPendingOrderPrices,
   cancelOrderWithRefund,
+  modifyPendingOrder,
 } from "@/lib/paper-fill";
 
 type OrderBody = {
@@ -283,24 +282,20 @@ export async function PATCH(req: Request) {
     };
     const pool = await getPool();
 
-    // If investment_usd is supplied, re-size the reservation first. This
-    // runs in its own atomic transaction so failure to cover the delta
-    // rejects cleanly without touching the price fields.
-    if (body.investment_usd != null) {
-      const adj = await adjustReservation(pool, orderId, body.investment_usd);
-      if (!adj.ok) {
-        return NextResponse.json({ error: adj.reason }, { status: 400 });
-      }
-    }
-
-    // Then apply price patches (separate UPDATE — no reservation math).
-    if (body.limit_price != null || body.stop_price != null) {
-      const priceResult = await patchPendingOrderPrices(pool, orderId, {
+    // W3 hotfix #3: single atomic transaction for both reservation resize
+    // AND price field changes. The old split (adjustReservation then
+    // patchPendingOrderPrices) committed the money move before validating
+    // the prices, so a bad limit_price left the user with a resized
+    // reservation but stale prices.
+    if (body.investment_usd != null || body.limit_price != null || body.stop_price != null) {
+      const result = await modifyPendingOrder(pool, orderId, {
         limit_price: body.limit_price,
         stop_price: body.stop_price,
+        investment_usd: body.investment_usd,
       });
-      if (!priceResult.ok) {
-        return NextResponse.json({ error: priceResult.reason }, { status: 400 });
+      if (!result.ok) {
+        const status = result.reason === "ORDER_NOT_FOUND" ? 404 : 400;
+        return NextResponse.json({ error: result.reason }, { status });
       }
     }
 
