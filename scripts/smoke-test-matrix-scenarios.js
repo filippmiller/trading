@@ -22,6 +22,7 @@ const {
   evaluateScenario,
   summarizeScenario,
   compareAllScenarios,
+  computeRecurrences,
 } = mod;
 
 let passed = 0;
@@ -316,6 +317,157 @@ section("Input safety");
 const zeroPriceTicker = { symbol: "ZERO", entryPrice: 0, dayChangePct: 1 };
 const zeroRes = evaluateScenario("momentum", zeroPriceTicker, [{ key: "d1_close", price: 50 }], params1x);
 ok(zeroRes.snapshots[0].pnlUsd === null, "zero entry price → null pnl (div-by-zero guard)");
+
+// ---------------------------------------------------------------------------
+// V2 — F1 cohort date filtering (intersection with scenario evaluator)
+// ---------------------------------------------------------------------------
+section("V2/F1 — cohort date filter narrows scenario sample");
+
+// Three cohort dates, 5 tickers each. All momentum LONG (gainers).
+function makeCohort(date, count) {
+  return Array.from({ length: count }, (_, i) => ({
+    entry: {
+      id: `${date}-${i}`,
+      symbol: `TKR${i}`,
+      cohort_date: date,
+      direction: "LONG",
+      entry_price: 100,
+      day_change_pct: 2, // up day → momentum LONG
+      consecutive_days: 1,
+    },
+    timeline: [{ key: "d1_close", price: 110 }], // +10% → +$10 LONG
+  }));
+}
+const d1cohort = makeCohort("2026-04-01", 5);
+const d2cohort = makeCohort("2026-04-02", 5);
+const d3cohort = makeCohort("2026-04-03", 5);
+const allCohort = [...d1cohort, ...d2cohort, ...d3cohort];
+
+// Simulate F1: user checks only "2026-04-02"
+const onlyD2 = allCohort.filter((p) => p.entry.cohort_date === "2026-04-02");
+const onlyD2Pairs = onlyD2.map((p) => ({
+  ticker: { symbol: p.entry.symbol, entryPrice: p.entry.entry_price, dayChangePct: p.entry.day_change_pct, consecutiveDays: p.entry.consecutive_days },
+  timeline: p.timeline,
+}));
+const f1Cmp = compareAllScenarios(onlyD2Pairs, params1x);
+const f1Mom = f1Cmp.find((r) => r.scenarioId === "momentum");
+ok(f1Mom.eligibleCount === 5, "F1: only 5 tickers (single cohort date) eligible after filter");
+near(f1Mom.totalPnlUsd, 50, 0.01, "F1: 5 × +$10 LONG = +$50 after filter");
+ok(onlyD2Pairs.length === 5, "F1: precomputed effective sample = 5");
+
+// Simulate F1: two dates checked (d1 + d3) → excludes d2
+const d1d3 = allCohort.filter((p) => p.entry.cohort_date !== "2026-04-02");
+const d1d3Pairs = d1d3.map((p) => ({
+  ticker: { symbol: p.entry.symbol, entryPrice: p.entry.entry_price, dayChangePct: p.entry.day_change_pct, consecutiveDays: p.entry.consecutive_days },
+  timeline: p.timeline,
+}));
+const f1Cmp2 = compareAllScenarios(d1d3Pairs, params1x);
+const f1Mom2 = f1Cmp2.find((r) => r.scenarioId === "momentum");
+ok(f1Mom2.eligibleCount === 10, "F1: two dates × 5 tickers = 10 eligible");
+near(f1Mom2.totalPnlUsd, 100, 0.01, "F1: 10 × +$10 LONG = +$100 after 2-date filter");
+
+// ---------------------------------------------------------------------------
+// V2 — F2 ticker selection (narrows sample)
+// ---------------------------------------------------------------------------
+section("V2/F2 — individual ticker selection");
+
+// 15 tickers single-date, user picks 3
+const fifteen = makeCohort("2026-04-10", 15);
+const picked3 = fifteen.slice(0, 3);
+const picked3Pairs = picked3.map((p) => ({
+  ticker: { symbol: p.entry.symbol, entryPrice: p.entry.entry_price, dayChangePct: p.entry.day_change_pct, consecutiveDays: p.entry.consecutive_days },
+  timeline: p.timeline,
+}));
+const f2Cmp = compareAllScenarios(picked3Pairs, params1x);
+const f2Mom = f2Cmp.find((r) => r.scenarioId === "momentum");
+ok(f2Mom.totalCohort === 3, "F2: only 3 tickers pass through as totalCohort");
+near(f2Mom.totalPnlUsd, 30, 0.01, "F2: 3 × +$10 = +$30 after ticker filter");
+
+// ---------------------------------------------------------------------------
+// V2 — F1 ∩ F2 intersection
+// ---------------------------------------------------------------------------
+section("V2/F1∩F2 — date checked AND ticker checked");
+
+// 3 dates × 5 tickers = 15 total. Select dates 1+2 (10 tickers) AND tickers TKR0,TKR2,TKR4 (global ticker names).
+const d1d2 = [...d1cohort, ...d2cohort];
+const pickedSymbols = new Set(["TKR0", "TKR2", "TKR4"]);
+const intersection = d1d2.filter((p) => pickedSymbols.has(p.entry.symbol));
+const interPairs = intersection.map((p) => ({
+  ticker: { symbol: p.entry.symbol, entryPrice: p.entry.entry_price, dayChangePct: p.entry.day_change_pct, consecutiveDays: p.entry.consecutive_days },
+  timeline: p.timeline,
+}));
+const f3Cmp = compareAllScenarios(interPairs, params1x);
+const f3Mom = f3Cmp.find((r) => r.scenarioId === "momentum");
+ok(intersection.length === 6, "F1∩F2: 2 dates × 3 tickers = 6 effective rows");
+ok(f3Mom.totalCohort === 6, "F1∩F2: totalCohort reflects intersection");
+near(f3Mom.totalPnlUsd, 60, 0.01, "F1∩F2: 6 × +$10 = +$60 aggregate");
+
+// Empty selection guard: scenario evaluator should handle 0 pairs gracefully
+const emptyCmp = compareAllScenarios([], params1x);
+ok(emptyCmp.every((r) => r.eligibleCount === 0 && r.totalCohort === 0), "empty selection → zero eligible across all scenarios");
+ok(emptyCmp.every((r) => r.totalPnlUsd === 0), "empty selection → zero pnl across all scenarios");
+
+// ---------------------------------------------------------------------------
+// V2 — F3 recurrence aggregation
+// ---------------------------------------------------------------------------
+section("V2/F3 — computeRecurrences()");
+
+const recInput = [
+  { symbol: "AAPL", cohort_date: "2026-04-01", direction: "LONG",  entry_price: 150, day_change_pct:  2.1 },
+  { symbol: "AAPL", cohort_date: "2026-04-05", direction: "SHORT", entry_price: 152, day_change_pct:  3.0 },
+  { symbol: "AAPL", cohort_date: "2026-04-10", direction: "LONG",  entry_price: 148, day_change_pct: -1.5 },
+  { symbol: "AAPL", cohort_date: "2026-04-15", direction: "LONG",  entry_price: 151, day_change_pct:  0.9 },
+  { symbol: "NVDA", cohort_date: "2026-04-02", direction: "LONG",  entry_price: 700, day_change_pct:  4.0 },
+  { symbol: "MSFT", cohort_date: "2026-04-03", direction: "SHORT", entry_price: 400, day_change_pct:  1.2 },
+  { symbol: "MSFT", cohort_date: "2026-04-09", direction: "SHORT", entry_price: 402, day_change_pct:  0.3 },
+];
+const recMap = computeRecurrences(recInput);
+ok(recMap instanceof Map, "computeRecurrences returns a Map");
+ok(recMap.get("AAPL").count === 4, "AAPL has 4 distinct cohort dates → count = 4");
+ok(recMap.get("AAPL").appearances.length === 4, "AAPL appearances array has 4 entries");
+ok(recMap.get("AAPL").appearances[0].cohortDate === "2026-04-15", "AAPL appearances sorted newest-first");
+ok(recMap.get("AAPL").appearances[3].cohortDate === "2026-04-01", "AAPL oldest appearance last");
+ok(recMap.get("NVDA").count === 1, "NVDA appears once → count = 1 (no badge)");
+ok(recMap.get("MSFT").count === 2, "MSFT appears twice → count = 2 (badge)");
+// Dedup: same (symbol, cohort_date) must not inflate count
+const dedupInput = [
+  { symbol: "TSLA", cohort_date: "2026-04-01", direction: "LONG",  entry_price: 200, day_change_pct: 1 },
+  { symbol: "TSLA", cohort_date: "2026-04-01", direction: "LONG",  entry_price: 200, day_change_pct: 1 },
+  { symbol: "TSLA", cohort_date: "2026-04-02", direction: "LONG",  entry_price: 201, day_change_pct: 1 },
+];
+const dedupMap = computeRecurrences(dedupInput);
+ok(dedupMap.get("TSLA").count === 2, "duplicate (symbol, cohort_date) de-duped to 1 appearance");
+// Date type tolerance (Date object and ISO string with time both slice to YYYY-MM-DD)
+const dateObjInput = [
+  { symbol: "AMD", cohort_date: "2026-04-01T12:00:00Z", direction: "LONG", entry_price: 100, day_change_pct: 1 },
+  { symbol: "AMD", cohort_date: new Date("2026-04-02T12:00:00Z"), direction: "LONG", entry_price: 100, day_change_pct: 1 },
+];
+const dateObjMap = computeRecurrences(dateObjInput);
+ok(dateObjMap.get("AMD").count === 2, "Date objects and ISO strings both normalized to YYYY-MM-DD");
+ok(dateObjMap.get("AMD").appearances[0].cohortDate.length === 10, "cohortDate stored as YYYY-MM-DD (10 chars)");
+
+// Empty input
+const emptyRec = computeRecurrences([]);
+ok(emptyRec.size === 0, "empty input → empty Map");
+
+// ---------------------------------------------------------------------------
+// V2 — F4 cell price: snapshot prices preserved through evaluateScenario
+// ---------------------------------------------------------------------------
+section("V2/F4 — snapshot price is carried through per-snapshot results");
+
+const priceTl = [
+  { key: "d1_morning", price: 667 },
+  { key: "d1_close",   price: 680 },
+];
+const priceRes = evaluateScenario(
+  "momentum",
+  { symbol: "ABC", entryPrice: 667, dayChangePct: 1 },
+  priceTl,
+  params1x,
+);
+ok(priceRes.snapshots[0].price === 667, "F4: snapshot.price = 667 preserved from input");
+ok(priceRes.snapshots[1].price === 680, "F4: later snapshot.price = 680 preserved");
+near(priceRes.snapshots[1].pnlPct, ((680 - 667) / 667) * 100, 0.01, "F4: pnlPct still computed alongside price");
 
 // ---------------------------------------------------------------------------
 // Summary

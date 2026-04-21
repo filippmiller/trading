@@ -436,6 +436,83 @@ export function summarizeScenario(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Recurrence aggregation (F3: "aggressive-swings" badges)
+// ---------------------------------------------------------------------------
+
+/**
+ * One appearance of a ticker in the matrix (i.e. one cohort enrollment).
+ * Stored compactly so the UI can render a tooltip table on hover.
+ */
+export type RecurrenceAppearance = {
+  cohortDate: string;
+  direction: "LONG" | "SHORT";
+  entryPrice: number;
+  dayChangePct: number;
+};
+
+export type RecurrenceInfo = {
+  count: number;
+  appearances: RecurrenceAppearance[];
+};
+
+/**
+ * Minimal entry shape needed to compute recurrences. A subset of
+ * ReversalEntry so /reversal can pass its loaded entries through directly.
+ */
+export type RecurrenceInput = {
+  symbol: string;
+  cohort_date: string | Date;
+  direction: "LONG" | "SHORT";
+  entry_price: number;
+  day_change_pct: number;
+};
+
+/**
+ * Group matrix entries by symbol and count how many distinct cohort dates
+ * each symbol has been enrolled on. Symbols with count >= 2 are "recurring"
+ * ("aggressive-swing") tickers worth flagging in the UI.
+ *
+ * WHY: When the same symbol re-enrolls across multiple cohort dates the
+ * underlying market moved enough to trigger a reversal pattern more than
+ * once in a short window — that's behavioural signal separate from any
+ * scenario. Aggregation is client-side from the already-loaded matrix data.
+ *
+ * The same symbol on the SAME cohort date is treated as one appearance
+ * (de-duped via a Set on cohort_date). Appearances are returned sorted
+ * newest-first so tooltips read top-to-bottom chronologically.
+ */
+export function computeRecurrences(
+  entries: RecurrenceInput[],
+): Map<string, RecurrenceInfo> {
+  const acc = new Map<string, Map<string, RecurrenceAppearance>>();
+  for (const e of entries) {
+    if (!e || !e.symbol) continue;
+    const dateStr =
+      typeof e.cohort_date === "string"
+        ? e.cohort_date.slice(0, 10)
+        : new Date(e.cohort_date).toISOString().slice(0, 10);
+    const perSymbol = acc.get(e.symbol) ?? new Map<string, RecurrenceAppearance>();
+    // Last write wins if the same (symbol, cohortDate) appears twice — but we
+    // only count it once. entry_price/direction from the latest occurrence is fine.
+    perSymbol.set(dateStr, {
+      cohortDate: dateStr,
+      direction: e.direction,
+      entryPrice: Number(e.entry_price),
+      dayChangePct: Number(e.day_change_pct),
+    });
+    acc.set(e.symbol, perSymbol);
+  }
+  const out = new Map<string, RecurrenceInfo>();
+  for (const [sym, dateMap] of acc) {
+    const appearances = Array.from(dateMap.values()).sort((a, b) =>
+      b.cohortDate.localeCompare(a.cohortDate),
+    );
+    out.set(sym, { count: appearances.length, appearances });
+  }
+  return out;
+}
+
 /**
  * Evaluate all 5 scenarios over the same cohort and return aggregate P&L
  * per scenario.
