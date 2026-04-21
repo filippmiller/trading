@@ -6,7 +6,10 @@ import { Activity, DollarSign, Clock, XCircle, Plus, RefreshCw, Wallet, Download
 type Trade = {
   id: number;
   symbol: string;
+  side: "LONG" | "SHORT";
   quantity: number;
+  closed_quantity: number;
+  remaining_quantity: number;
   buy_price: number;
   buy_date: string;
   sell_date: string | null;
@@ -22,17 +25,27 @@ type Trade = {
   strategy_name: string | null;
   status: string;
   notes: string;
+  stop_loss_price: number | null;
+  take_profit_price: number | null;
+  trailing_stop_pct: number | null;
+  trailing_stop_price: number | null;
+  trailing_active: boolean;
+  time_exit_date: string | null;
+  exit_reason: string | null;
 };
 
 type PendingOrder = {
   id: number;
   symbol: string;
   side: "BUY" | "SELL";
+  position_side: "LONG" | "SHORT";
   order_type: "MARKET" | "LIMIT" | "STOP";
   investment_usd: number | null;
   limit_price: number | null;
   stop_price: number | null;
   reserved_amount: number;
+  reserved_short_margin: number;
+  close_quantity: number | null;
   created_at: string;
   notes: string | null;
 };
@@ -43,6 +56,7 @@ type AccountState = {
   initial_cash: number;
   cash: number;
   reserved_cash: number;
+  reserved_short_margin: number;
   positions_value: number;
   equity: number;
   open_positions: number;
@@ -73,9 +87,25 @@ export default function PaperTradingPage() {
   const [buySymbol, setBuySymbol] = useState("");
   const [buyAmount, setBuyAmount] = useState("1000");
   const [orderType, setOrderType] = useState<"MARKET" | "LIMIT" | "STOP">("MARKET");
+  const [positionSide, setPositionSide] = useState<"LONG" | "SHORT">("LONG");
   const [limitPrice, setLimitPrice] = useState("");
   const [stopPrice, setStopPrice] = useState("");
   const [buyError, setBuyError] = useState("");
+
+  // W3: optional exit-bracket fields for opening orders.
+  const [bracketStopLossPct, setBracketStopLossPct] = useState("");
+  const [bracketTakeProfitPct, setBracketTakeProfitPct] = useState("");
+  const [bracketTrailingPct, setBracketTrailingPct] = useState("");
+  const [bracketTrailingActivatesPct, setBracketTrailingActivatesPct] = useState("");
+  const [bracketTimeExitDays, setBracketTimeExitDays] = useState("");
+  const [showBrackets, setShowBrackets] = useState(false);
+
+  // W3: modify-order inline form.
+  const [editingOrderId, setEditingOrderId] = useState<number | null>(null);
+  const [editLimitPrice, setEditLimitPrice] = useState("");
+  const [editStopPrice, setEditStopPrice] = useState("");
+  const [editInvestment, setEditInvestment] = useState("");
+  const [editError, setEditError] = useState("");
 
   // Trade history filters (local state — no API param, filtering is client-side)
   const [filterSymbol, setFilterSymbol] = useState("");
@@ -117,31 +147,49 @@ export default function PaperTradingPage() {
     if (orderType === "LIMIT" && !(parseFloat(limitPrice) > 0)) { setBuyError("Provide a valid limit price."); return; }
     if (orderType === "STOP" && !(parseFloat(stopPrice) > 0)) { setBuyError("Provide a valid stop price."); return; }
 
+    // W3 open semantics:
+    //   LONG  → side=BUY,  position_side=LONG
+    //   SHORT → side=SELL, position_side=SHORT
+    const apiSide: "BUY" | "SELL" = positionSide === "LONG" ? "BUY" : "SELL";
+
     setBusy(true);
     try {
+      const body: Record<string, unknown> = {
+        symbol,
+        side: apiSide,
+        position_side: positionSide,
+        order_type: orderType,
+        investment_usd: investment,
+        limit_price: orderType === "LIMIT" ? parseFloat(limitPrice) : undefined,
+        stop_price: orderType === "STOP" ? parseFloat(stopPrice) : undefined,
+      };
+      // Only attach bracket fields if the user entered something.
+      if (bracketStopLossPct && parseFloat(bracketStopLossPct) > 0) body.stop_loss_pct = parseFloat(bracketStopLossPct);
+      if (bracketTakeProfitPct && parseFloat(bracketTakeProfitPct) > 0) body.take_profit_pct = parseFloat(bracketTakeProfitPct);
+      if (bracketTrailingPct && parseFloat(bracketTrailingPct) > 0) body.trailing_stop_pct = parseFloat(bracketTrailingPct);
+      if (bracketTrailingActivatesPct) body.trailing_activates_at_profit_pct = parseFloat(bracketTrailingActivatesPct);
+      if (bracketTimeExitDays && parseInt(bracketTimeExitDays, 10) >= 0) body.time_exit_days = parseInt(bracketTimeExitDays, 10);
+
       const res = await fetch("/api/paper/order", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          symbol,
-          side: "BUY",
-          order_type: orderType,
-          investment_usd: investment,
-          limit_price: orderType === "LIMIT" ? parseFloat(limitPrice) : undefined,
-          stop_price: orderType === "STOP" ? parseFloat(stopPrice) : undefined,
-        }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       if (!res.ok) {
         setBuyError(data.error || "Order placement failed.");
       } else if (data.success === false) {
-        // MARKET order inserted but fill rejected (e.g. race).
         setBuyError(`Order rejected: ${data.rejection_reason || data.error || "unknown reason"}`);
         await loadData();
       } else {
         setBuySymbol("");
         setLimitPrice("");
         setStopPrice("");
+        setBracketStopLossPct("");
+        setBracketTakeProfitPct("");
+        setBracketTrailingPct("");
+        setBracketTrailingActivatesPct("");
+        setBracketTimeExitDays("");
         await loadData();
       }
     } catch (e) {
@@ -150,22 +198,75 @@ export default function PaperTradingPage() {
     setBusy(false);
   };
 
-  const handleSell = async (trade: Trade) => {
+  /**
+   * W3: partial-close a position. `fraction` ∈ (0, 1]. Fraction of 1 means
+   * close the entire remaining quantity. Sends close_quantity when fraction
+   * < 1; omits it (server defaults to full close) when fraction === 1.
+   *
+   * For LONG: close with side=SELL. For SHORT: cover with side=BUY.
+   */
+  const handleClose = async (trade: Trade, fraction: number) => {
     setSelling(trade.id);
+    const remaining = trade.remaining_quantity;
+    const closeQty = fraction >= 1 ? undefined : Math.max(1e-6, remaining * fraction);
+    const apiSide: "BUY" | "SELL" = trade.side === "SHORT" ? "BUY" : "SELL";
     try {
       await fetch("/api/paper/order", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           symbol: trade.symbol,
-          side: "SELL",
+          side: apiSide,
+          position_side: trade.side,
           order_type: "MARKET",
           trade_id: trade.id,
+          close_quantity: closeQty,
         }),
       });
       await loadData();
     } catch { /* ignore */ }
     setSelling(null);
+  };
+
+  const handleStartEdit = (o: PendingOrder) => {
+    setEditingOrderId(o.id);
+    setEditLimitPrice(o.limit_price != null ? String(o.limit_price) : "");
+    setEditStopPrice(o.stop_price != null ? String(o.stop_price) : "");
+    setEditInvestment(o.investment_usd != null ? String(o.investment_usd) : "");
+    setEditError("");
+  };
+
+  const handleCancelEdit = () => {
+    setEditingOrderId(null);
+    setEditError("");
+  };
+
+  const handleSaveEdit = async (id: number) => {
+    setEditError("");
+    const body: Record<string, number> = {};
+    if (editLimitPrice && parseFloat(editLimitPrice) > 0) body.limit_price = parseFloat(editLimitPrice);
+    if (editStopPrice && parseFloat(editStopPrice) > 0) body.stop_price = parseFloat(editStopPrice);
+    if (editInvestment && parseFloat(editInvestment) > 0) body.investment_usd = parseFloat(editInvestment);
+    if (Object.keys(body).length === 0) {
+      setEditError("Nothing to update.");
+      return;
+    }
+    try {
+      const res = await fetch(`/api/paper/order?id=${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok || data.success === false) {
+        setEditError(data.error || "Modification failed.");
+        return;
+      }
+      setEditingOrderId(null);
+      await loadData();
+    } catch (e) {
+      setEditError(String(e));
+    }
   };
 
   const handleCancelOrder = async (id: number) => {
@@ -237,7 +338,7 @@ export default function PaperTradingPage() {
       t.symbol,
       // CSV-safe: quote strategy label because it can contain commas.
       JSON.stringify(t.strategy_name || t.strategy || "(manual)"),
-      "LONG", // W3 will add SHORT — until then every trade is LONG
+      t.side,
       t.buy_date,
       t.buy_price.toFixed(4),
       t.quantity.toFixed(6),
@@ -298,9 +399,12 @@ export default function PaperTradingPage() {
           <div className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
             <p className="text-[10px] text-zinc-400 uppercase font-bold">Cash</p>
             <p className="text-2xl font-bold text-zinc-700">${account.cash.toFixed(2)}</p>
-            {account.reserved_cash > 0 ? (
+            {(account.reserved_cash > 0 || account.reserved_short_margin > 0) ? (
               <p className="text-xs text-amber-600 mt-1">
-                ${account.reserved_cash.toFixed(2)} reserved · of ${account.initial_cash.toFixed(0)}
+                {account.reserved_cash > 0 && <>${account.reserved_cash.toFixed(2)} reserved</>}
+                {account.reserved_cash > 0 && account.reserved_short_margin > 0 && <> · </>}
+                {account.reserved_short_margin > 0 && <>${account.reserved_short_margin.toFixed(2)} short-margin</>}
+                <span className="text-zinc-400"> · of ${account.initial_cash.toFixed(0)}</span>
               </p>
             ) : (
               <p className="text-xs text-zinc-400 mt-1">of ${account.initial_cash.toFixed(0)}</p>
@@ -344,12 +448,23 @@ export default function PaperTradingPage() {
         </div>
       )}
 
-      {/* Buy form */}
+      {/* Buy / Sell-short form */}
       <div className="bg-white rounded-xl p-5 ring-1 ring-zinc-200/50 shadow-sm">
         <h2 className="text-lg font-bold text-zinc-800 mb-3 flex items-center gap-2">
-          <Plus className="h-5 w-5 text-emerald-500" /> Buy
+          <Plus className="h-5 w-5 text-emerald-500" /> Open Position
         </h2>
-        <div className="grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-3 items-end">
+          <div>
+            <label className="text-xs text-zinc-400 font-bold uppercase">Direction</label>
+            <select
+              value={positionSide}
+              onChange={e => setPositionSide(e.target.value as "LONG" | "SHORT")}
+              className="w-full px-3 py-2 border rounded-lg text-sm"
+            >
+              <option value="LONG">Long</option>
+              <option value="SHORT">Short</option>
+            </select>
+          </div>
           <div>
             <label className="text-xs text-zinc-400 font-bold uppercase">Ticker</label>
             <input
@@ -382,8 +497,6 @@ export default function PaperTradingPage() {
               <option value="STOP">Stop</option>
             </select>
           </div>
-          {/* One conditional price input — LIMIT uses it for limit price,
-              STOP reuses the same slot for stop price. MARKET disables it. */}
           <div>
             <label className="text-xs text-zinc-400 font-bold uppercase">
               {orderType === "STOP" ? "Stop price" : "Limit price"}
@@ -403,12 +516,12 @@ export default function PaperTradingPage() {
           <button
             onClick={handleBuy}
             disabled={busy}
-            className="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg font-bold text-sm disabled:opacity-50"
+            className={`px-4 py-2 rounded-lg font-bold text-sm disabled:opacity-50 text-white ${positionSide === "SHORT" ? "bg-rose-500 hover:bg-rose-600" : "bg-emerald-500 hover:bg-emerald-600"}`}
           >
-            {busy ? "..." : "BUY"}
+            {busy ? "..." : (positionSide === "SHORT" ? "SELL SHORT" : "BUY")}
           </button>
         </div>
-        <div className="mt-3 flex flex-wrap gap-2">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           {[250, 500, 1000, 2500].map((amount) => (
             <button
               key={amount}
@@ -418,7 +531,37 @@ export default function PaperTradingPage() {
               ${amount}
             </button>
           ))}
+          <button
+            onClick={() => setShowBrackets(s => !s)}
+            className="rounded-full bg-indigo-50 text-indigo-700 px-3 py-1 text-xs font-semibold hover:bg-indigo-100 ml-auto"
+          >
+            {showBrackets ? "− Hide brackets" : "+ Exit brackets"}
+          </button>
         </div>
+        {showBrackets && (
+          <div className="mt-3 grid grid-cols-2 md:grid-cols-5 gap-2 rounded-lg bg-indigo-50/40 p-3">
+            <div>
+              <label className="block text-[10px] text-indigo-600 uppercase font-bold">Stop-loss %</label>
+              <input type="number" step="0.1" value={bracketStopLossPct} onChange={e => setBracketStopLossPct(e.target.value)} placeholder="5" className="w-full px-2 py-1 border rounded text-xs font-mono" />
+            </div>
+            <div>
+              <label className="block text-[10px] text-indigo-600 uppercase font-bold">Take-profit %</label>
+              <input type="number" step="0.1" value={bracketTakeProfitPct} onChange={e => setBracketTakeProfitPct(e.target.value)} placeholder="10" className="w-full px-2 py-1 border rounded text-xs font-mono" />
+            </div>
+            <div>
+              <label className="block text-[10px] text-indigo-600 uppercase font-bold">Trailing %</label>
+              <input type="number" step="0.1" value={bracketTrailingPct} onChange={e => setBracketTrailingPct(e.target.value)} placeholder="3" className="w-full px-2 py-1 border rounded text-xs font-mono" />
+            </div>
+            <div>
+              <label className="block text-[10px] text-indigo-600 uppercase font-bold">Trail-activates %</label>
+              <input type="number" step="0.1" value={bracketTrailingActivatesPct} onChange={e => setBracketTrailingActivatesPct(e.target.value)} placeholder="5" className="w-full px-2 py-1 border rounded text-xs font-mono" />
+            </div>
+            <div>
+              <label className="block text-[10px] text-indigo-600 uppercase font-bold">Time-exit days</label>
+              <input type="number" step="1" value={bracketTimeExitDays} onChange={e => setBracketTimeExitDays(e.target.value)} placeholder="5" className="w-full px-2 py-1 border rounded text-xs font-mono" />
+            </div>
+          </div>
+        )}
         {buyError && <p className="text-rose-500 text-xs mt-2">{buyError}</p>}
       </div>
 
@@ -430,22 +573,66 @@ export default function PaperTradingPage() {
           </h2>
           <div className="space-y-2">
             {orders.map(o => (
-              <div key={o.id} className="bg-amber-50 rounded-lg p-3 flex items-center justify-between text-sm">
-                <div className="flex items-center gap-3">
-                  <span className="font-bold">{o.symbol}</span>
-                  <span className={`px-2 py-0.5 rounded text-xs font-bold ${o.side === "BUY" ? "bg-emerald-100 text-emerald-700" : "bg-rose-100 text-rose-700"}`}>
-                    {o.side} {o.order_type}
-                  </span>
-                  {o.investment_usd != null && <span className="text-zinc-600">${o.investment_usd}</span>}
-                  {o.limit_price != null && <span className="text-zinc-600">limit ${o.limit_price.toFixed(2)}</span>}
-                  {o.stop_price != null && <span className="text-zinc-600">stop ${o.stop_price.toFixed(2)}</span>}
+              <div key={o.id} className="bg-amber-50 rounded-lg p-3 text-sm">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <span className="font-bold">{o.symbol}</span>
+                    <span className={`px-2 py-0.5 rounded text-xs font-bold ${o.position_side === "SHORT" ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>
+                      {o.position_side === "SHORT" ? "SHORT" : "LONG"} · {o.side} {o.order_type}
+                    </span>
+                    {o.investment_usd != null && <span className="text-zinc-600">${o.investment_usd}</span>}
+                    {o.limit_price != null && <span className="text-zinc-600">limit ${o.limit_price.toFixed(2)}</span>}
+                    {o.stop_price != null && <span className="text-zinc-600">stop ${o.stop_price.toFixed(2)}</span>}
+                    {o.close_quantity != null && <span className="text-zinc-600">close qty {o.close_quantity.toFixed(4)}</span>}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {editingOrderId !== o.id && (
+                      <button
+                        onClick={() => handleStartEdit(o)}
+                        className="text-xs text-indigo-600 hover:underline"
+                      >
+                        Edit
+                      </button>
+                    )}
+                    <button
+                      onClick={() => handleCancelOrder(o.id)}
+                      className="text-xs text-rose-600 hover:underline"
+                    >
+                      Cancel
+                    </button>
+                  </div>
                 </div>
-                <button
-                  onClick={() => handleCancelOrder(o.id)}
-                  className="text-xs text-rose-600 hover:underline"
-                >
-                  Cancel
-                </button>
+                {editingOrderId === o.id && (
+                  <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-2 items-end">
+                    <div>
+                      <label className="block text-[10px] text-indigo-600 uppercase font-bold">Limit price</label>
+                      <input type="number" step="0.01" value={editLimitPrice} onChange={e => setEditLimitPrice(e.target.value)} className="w-full px-2 py-1 border rounded text-xs font-mono" />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-indigo-600 uppercase font-bold">Stop price</label>
+                      <input type="number" step="0.01" value={editStopPrice} onChange={e => setEditStopPrice(e.target.value)} className="w-full px-2 py-1 border rounded text-xs font-mono" />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-indigo-600 uppercase font-bold">Investment $</label>
+                      <input type="number" step="1" value={editInvestment} onChange={e => setEditInvestment(e.target.value)} className="w-full px-2 py-1 border rounded text-xs font-mono" />
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleSaveEdit(o.id)}
+                        className="flex-1 px-3 py-1 bg-indigo-500 hover:bg-indigo-600 text-white rounded text-xs font-bold"
+                      >
+                        Save
+                      </button>
+                      <button
+                        onClick={handleCancelEdit}
+                        className="flex-1 px-3 py-1 bg-zinc-200 hover:bg-zinc-300 text-zinc-700 rounded text-xs"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                    {editError && <p className="text-rose-500 text-xs col-span-full">{editError}</p>}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -465,8 +652,11 @@ export default function PaperTradingPage() {
               <div key={trade.id} className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-3 flex-wrap">
                       <span className="text-xl font-bold">{trade.symbol}</span>
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${trade.side === "SHORT" ? "bg-rose-100 text-rose-700" : "bg-emerald-100 text-emerald-700"}`}>
+                        {trade.side}
+                      </span>
                       {trade.live_pnl_pct !== null && (
                         <span className={`text-lg font-bold ${trade.live_pnl_pct >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
                           {trade.live_pnl_pct >= 0 ? "+" : ""}{trade.live_pnl_pct.toFixed(2)}%
@@ -479,7 +669,7 @@ export default function PaperTradingPage() {
                       )}
                     </div>
                     <div className="flex flex-wrap gap-4 mt-1 text-sm text-zinc-500">
-                      <span>Qty: <b className="text-zinc-700">{trade.quantity.toFixed(4)}</b></span>
+                      <span>Qty: <b className="text-zinc-700">{trade.remaining_quantity.toFixed(4)}</b>{trade.closed_quantity > 0 && <span className="text-xs text-zinc-400"> / {trade.quantity.toFixed(4)}</span>}</span>
                       <span>Entry: <b className="text-zinc-700">${trade.buy_price.toFixed(2)}</b></span>
                       <span>
                         Live: <b className="text-zinc-700">{trade.current_price ? `$${trade.current_price.toFixed(2)}` : "..."}</b>
@@ -492,19 +682,54 @@ export default function PaperTradingPage() {
                       <span>Allocated: ${trade.investment_usd.toFixed(2)}</span>
                       <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {trade.buy_date}</span>
                     </div>
+                    {/* W3 bracket chips — show only when set. */}
+                    {(trade.stop_loss_price != null || trade.take_profit_price != null || trade.trailing_stop_pct != null || trade.time_exit_date != null) && (
+                      <div className="flex flex-wrap gap-1.5 mt-2">
+                        {trade.stop_loss_price != null && (
+                          <span className="px-2 py-0.5 text-[10px] rounded bg-rose-50 text-rose-700 font-semibold">SL ${trade.stop_loss_price.toFixed(2)}</span>
+                        )}
+                        {trade.take_profit_price != null && (
+                          <span className="px-2 py-0.5 text-[10px] rounded bg-emerald-50 text-emerald-700 font-semibold">TP ${trade.take_profit_price.toFixed(2)}</span>
+                        )}
+                        {trade.trailing_stop_pct != null && (
+                          <span className="px-2 py-0.5 text-[10px] rounded bg-indigo-50 text-indigo-700 font-semibold">
+                            Trail {trade.trailing_stop_pct}%{trade.trailing_active ? ` @ $${(trade.trailing_stop_price ?? 0).toFixed(2)}` : " (idle)"}
+                          </span>
+                        )}
+                        {trade.time_exit_date != null && (
+                          <span className="px-2 py-0.5 text-[10px] rounded bg-amber-50 text-amber-700 font-semibold">Exit by {String(trade.time_exit_date).slice(0, 10)}</span>
+                        )}
+                      </div>
+                    )}
                     {trade.notes && <p className="text-xs text-zinc-400 mt-1">{trade.notes}</p>}
                   </div>
-                  <button
-                    onClick={() => handleSell(trade)}
-                    disabled={selling === trade.id}
-                    className={`ml-4 px-5 py-2 rounded-lg font-bold text-sm transition-all ${
-                      trade.live_pnl_pct && trade.live_pnl_pct > 0
-                        ? "bg-emerald-500 hover:bg-emerald-600 text-white"
-                        : "bg-rose-100 hover:bg-rose-200 text-rose-700"
-                    } disabled:opacity-50`}
-                  >
-                    {selling === trade.id ? "..." : "SELL"}
-                  </button>
+                  <div className="ml-4 flex flex-col gap-1">
+                    {/* W3 partial-close controls — replace single SELL with a small
+                        button group. For SHORT positions the action is BUY-TO-COVER. */}
+                    <div className="flex gap-1">
+                      <button
+                        onClick={() => handleClose(trade, 0.25)}
+                        disabled={selling === trade.id}
+                        className="px-2 py-1 text-[10px] rounded bg-zinc-100 hover:bg-zinc-200 font-bold disabled:opacity-50"
+                      >25%</button>
+                      <button
+                        onClick={() => handleClose(trade, 0.5)}
+                        disabled={selling === trade.id}
+                        className="px-2 py-1 text-[10px] rounded bg-zinc-100 hover:bg-zinc-200 font-bold disabled:opacity-50"
+                      >50%</button>
+                      <button
+                        onClick={() => handleClose(trade, 1)}
+                        disabled={selling === trade.id}
+                        className={`px-3 py-1 text-xs rounded font-bold disabled:opacity-50 ${
+                          trade.live_pnl_pct && trade.live_pnl_pct > 0
+                            ? "bg-emerald-500 hover:bg-emerald-600 text-white"
+                            : "bg-rose-100 hover:bg-rose-200 text-rose-700"
+                        }`}
+                      >
+                        {selling === trade.id ? "..." : (trade.side === "SHORT" ? "COVER" : "CLOSE")}
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
                 {trade.live_pnl_pct !== null && (
