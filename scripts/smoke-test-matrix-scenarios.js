@@ -470,6 +470,83 @@ ok(priceRes.snapshots[1].price === 680, "F4: later snapshot.price = 680 preserve
 near(priceRes.snapshots[1].pnlPct, ((680 - 667) / 667) * 100, 0.01, "F4: pnlPct still computed alongside price");
 
 // ---------------------------------------------------------------------------
+// Hotfix #4 — asOfKey picks LATEST intraday snapshot, not just latest day
+// ---------------------------------------------------------------------------
+section("hotfix #4 — asOfKey respects intraday ordinal");
+
+// Case A: cohort of two tickers. Ticker X is latest at d3_close; ticker Y is
+// latest at d4_morning. d4_morning must win even though morning < close in
+// ordinal-within-day, because day 4 > day 3.
+{
+  const tX = { symbol: "X", entryPrice: 100, dayChangePct: 1 };
+  const tlX = [
+    { key: "d3_morning", price: 101 },
+    { key: "d3_midday", price: 102 },
+    { key: "d3_close", price: 103 },
+  ];
+  const tY = { symbol: "Y", entryPrice: 100, dayChangePct: 1 };
+  const tlY = [
+    { key: "d4_morning", price: 101 },
+  ];
+  const rX = evaluateScenario("momentum", tX, tlX, params1x);
+  const rY = evaluateScenario("momentum", tY, tlY, params1x);
+  const rep = summarizeScenario("momentum", [rX, rY], params1x);
+  ok(rep.asOfKey === "d4_morning", `H4-A: d4_morning > d3_close (got ${rep.asOfKey})`);
+}
+
+// Case B: both tickers on day 4 — d4_midday > d4_morning, d4_close > d4_midday.
+{
+  const tA = { symbol: "A", entryPrice: 100, dayChangePct: 1 };
+  const tlA = [{ key: "d4_morning", price: 101 }];
+  const tB = { symbol: "B", entryPrice: 100, dayChangePct: 1 };
+  const tlB = [{ key: "d4_midday", price: 102 }];
+  const tC = { symbol: "C", entryPrice: 100, dayChangePct: 1 };
+  const tlC = [{ key: "d4_close", price: 103 }];
+  const rep = summarizeScenario(
+    "momentum",
+    [tA, tB, tC].map((t, i) => evaluateScenario("momentum", t, [tlA, tlB, tlC][i], params1x)),
+    params1x,
+  );
+  ok(rep.asOfKey === "d4_close", `H4-B: d4_close is latest within day 4 (got ${rep.asOfKey})`);
+}
+
+// Case C: same-day ordering test with only morning + midday — midday wins.
+{
+  const tA = { symbol: "A", entryPrice: 100, dayChangePct: 1 };
+  const tlA = [{ key: "d4_morning", price: 101 }];
+  const tB = { symbol: "B", entryPrice: 100, dayChangePct: 1 };
+  const tlB = [{ key: "d4_midday", price: 102 }];
+  const rep = summarizeScenario(
+    "momentum",
+    [evaluateScenario("momentum", tA, tlA, params1x), evaluateScenario("momentum", tB, tlB, params1x)],
+    params1x,
+  );
+  ok(rep.asOfKey === "d4_midday", `H4-C: d4_midday > d4_morning (got ${rep.asOfKey})`);
+}
+
+// Case D (regression): d3_close > d3_midday > d3_morning — the pre-hotfix
+// dayIndexFromKey would tie ALL of these at 3 and pick whichever was seen
+// first. The new ordinal must strictly prefer close.
+{
+  const tA = { symbol: "A", entryPrice: 100, dayChangePct: 1 };
+  const tlA = [{ key: "d3_morning", price: 101 }];
+  const tB = { symbol: "B", entryPrice: 100, dayChangePct: 1 };
+  const tlB = [{ key: "d3_midday", price: 102 }];
+  const tC = { symbol: "C", entryPrice: 100, dayChangePct: 1 };
+  const tlC = [{ key: "d3_close", price: 103 }];
+  const rep = summarizeScenario(
+    "momentum",
+    [
+      evaluateScenario("momentum", tA, tlA, params1x),
+      evaluateScenario("momentum", tB, tlB, params1x),
+      evaluateScenario("momentum", tC, tlC, params1x),
+    ],
+    params1x,
+  );
+  ok(rep.asOfKey === "d3_close", `H4-D: d3_close is latest within day 3 (got ${rep.asOfKey})`);
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 
