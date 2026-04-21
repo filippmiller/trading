@@ -165,7 +165,9 @@ async function test1_snapshotWrite(accountId) {
     const equityCorrect =
       Math.abs(Number(s.equity) - (Number(s.cash) + Number(s.reserved_cash) + Number(s.positions_value))) < PRECISION_EPS;
     assert(equityCorrect, `snapshot equity = cash + reserved + positions (got equity=${s.equity})`);
-    assert(Number(s.positions_value) === 5000, `snapshot positions_value = 5000 (got ${s.positions_value})`);
+    // W4 — buy_price is slippage-adjusted ($100 × 1.0005 = $100.05), so
+    // `qty × buy_price` = 50 × $100.05 = $5002.50 instead of nominal $5000.
+    assert(Number(s.positions_value) === 5002.5, `snapshot positions_value = 5002.50 (qty × adjusted buy_price, got ${s.positions_value})`);
   }
 }
 
@@ -282,11 +284,16 @@ async function test4_reconciliationInvariant(accountId) {
   };
 
   const [openT] = await pool.execute(
-    "SELECT COALESCE(SUM(investment_usd),0) AS v FROM paper_trades WHERE account_id = ? AND status = 'OPEN'",
+    `SELECT COALESCE(SUM(investment_usd),0) AS v,
+            COALESCE(SUM(slippage_usd),0) AS slip,
+            COALESCE(SUM(commission_usd),0) AS comm
+       FROM paper_trades WHERE account_id = ? AND status = 'OPEN'`,
     [accountId]
   );
   const [closedT] = await pool.execute(
-    "SELECT COALESCE(SUM(pnl_usd),0) AS v FROM paper_trades WHERE account_id = ? AND status = 'CLOSED'",
+    `SELECT COALESCE(SUM(pnl_usd),0) AS v,
+            COALESCE(SUM(commission_usd),0) AS comm
+       FROM paper_trades WHERE account_id = ? AND status = 'CLOSED'`,
     [accountId]
   );
   const [openS] = await pool.execute(
@@ -302,14 +309,22 @@ async function test4_reconciliationInvariant(accountId) {
     [accountId]
   );
   const openInvestment = Number(openT[0].v) + Number(openS[0].v);
+  const openSlip = Number(openT[0].slip);
+  const openComm = Number(openT[0].comm);
+  const closedComm = Number(closedT[0].comm);
   const realized = Number(closedT[0].v) + Number(closedS[0].v);
 
-  const lhs = acct.cash + acct.reserved_cash + openInvestment;
+  // W4 conservation ledger (matches W1 test5): cash + reserved + open_invest
+  // + open_slip + open_comm + closed_comm == initial + realized. paper_signals
+  // do not have slippage/commission columns — they follow the legacy
+  // zero-cost model, so only paper_trades contribute economic costs to LHS.
+  const lhs = acct.cash + acct.reserved_cash + openInvestment + openSlip + openComm + closedComm;
   const rhs = acct.initial_cash + realized;
   console.log(`    cash=${acct.cash.toFixed(6)} reserved=${acct.reserved_cash.toFixed(6)} open_invest=${openInvestment.toFixed(6)}`);
+  console.log(`    open_slip=${openSlip.toFixed(6)} open_comm=${openComm.toFixed(6)} closed_comm=${closedComm.toFixed(6)}`);
   console.log(`    initial=${acct.initial_cash.toFixed(6)} realized=${realized.toFixed(6)}`);
   console.log(`    lhs=${lhs.toFixed(6)} rhs=${rhs.toFixed(6)} drift=${(lhs - rhs).toFixed(9)}`);
-  assert(Math.abs(lhs - rhs) < PRECISION_EPS, `invariant cash+reserved+open_invest == initial+realized (drift < ${PRECISION_EPS})`);
+  assert(Math.abs(lhs - rhs) < PRECISION_EPS, `invariant cash+reserved+open_invest+open_slip+open_comm+closed_comm == initial+realized (drift < ${PRECISION_EPS})`);
 }
 
 // ── Test 5: STOP BUY fill ─────────────────────────────────────────────────

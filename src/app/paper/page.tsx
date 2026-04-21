@@ -92,6 +92,16 @@ export default function PaperTradingPage() {
   const [stopPrice, setStopPrice] = useState("");
   const [buyError, setBuyError] = useState("");
 
+  // W4 — position sizing mode. "$ Fixed" keeps the legacy behaviour where
+  // buyAmount = investment_usd directly. "% of equity" computes investment
+  // from the account's current equity; "% risk on stop" computes it from the
+  // user's stop-loss distance (requires bracketStopLossPct). In all cases the
+  // resulting `investment_usd` is what goes to the API — the server does not
+  // know about sizing mode, keeping the existing validation path untouched.
+  const [sizingMode, setSizingMode] = useState<"USD" | "PCT_EQUITY" | "PCT_RISK">("USD");
+  const [livePrice, setLivePrice] = useState<number | null>(null);
+  const [fractionalEnabled, setFractionalEnabled] = useState<boolean>(true);
+
   // W3: optional exit-bracket fields for opening orders.
   const [bracketStopLossPct, setBracketStopLossPct] = useState("");
   const [bracketTakeProfitPct, setBracketTakeProfitPct] = useState("");
@@ -125,6 +135,44 @@ export default function PaperTradingPage() {
     } catch { /* ignore */ }
   }, []);
 
+  // W4 — load the risk config's fractional toggle so the buy form can warn
+  // the user when their investment is too small to buy even 1 whole share.
+  // The /api/settings endpoint already reads app_settings; we reuse it.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/paper/settings");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        if (typeof data.allow_fractional_shares === "boolean") {
+          setFractionalEnabled(data.allow_fractional_shares);
+        }
+      } catch { /* optional — defaults to fractional allowed */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // W4 — probe a live quote when the user blurs / tabs out of the ticker
+  // field, so the sizing calculator can derive share count for fractional
+  // warnings and the % risk calculation.
+  const fetchQuote = useCallback(async (sym: string) => {
+    if (!sym) { setLivePrice(null); return; }
+    try {
+      const res = await fetch(`/api/paper/quote?symbol=${encodeURIComponent(sym)}`);
+      if (!res.ok) { setLivePrice(null); return; }
+      const data = await res.json();
+      if (typeof data.price === "number" && isFinite(data.price) && data.price > 0) {
+        setLivePrice(data.price);
+      } else {
+        setLivePrice(null);
+      }
+    } catch {
+      setLivePrice(null);
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -138,14 +186,53 @@ export default function PaperTradingPage() {
     };
   }, [loadData]);
 
+  // W4 — compute investment_usd from the user's sizing mode. The server
+  // still sees a single investment_usd number; the three modes just feed
+  // different formulas into it on the client. Returns null + sets error
+  // when the mode's required inputs are missing or invalid.
+  const computeInvestmentUsd = (amountField: number): number | null => {
+    if (sizingMode === "USD") return amountField;
+    if (!account) { setBuyError("Account data not loaded yet."); return null; }
+    if (sizingMode === "PCT_EQUITY") {
+      if (!(amountField > 0 && amountField <= 100)) {
+        setBuyError("% of equity must be between 0 and 100.");
+        return null;
+      }
+      return account.equity * (amountField / 100);
+    }
+    // PCT_RISK — requires stop-loss distance.
+    const stopPct = parseFloat(bracketStopLossPct);
+    if (!(stopPct > 0)) {
+      setBuyError("% risk sizing needs a stop-loss % (enter under Exit brackets).");
+      return null;
+    }
+    if (!(amountField > 0 && amountField <= 100)) {
+      setBuyError("Risk % must be between 0 and 100.");
+      return null;
+    }
+    // investment = (equity * risk_pct / 100) / (stop_distance_pct / 100)
+    //            = (equity * risk_pct) / stop_pct
+    return (account.equity * amountField) / stopPct;
+  };
+
   const handleBuy = async () => {
     setBuyError("");
     const symbol = buySymbol.trim().toUpperCase();
-    const investment = parseFloat(buyAmount);
+    const amountField = parseFloat(buyAmount);
     if (!symbol) { setBuyError("Enter a ticker."); return; }
-    if (!(investment > 0)) { setBuyError("Amount must be greater than zero."); return; }
+    if (!(amountField > 0)) { setBuyError("Amount must be greater than zero."); return; }
+    const investment = computeInvestmentUsd(amountField);
+    if (investment == null) return;
+    if (!(investment > 0)) { setBuyError("Computed investment is non-positive."); return; }
     if (orderType === "LIMIT" && !(parseFloat(limitPrice) > 0)) { setBuyError("Provide a valid limit price."); return; }
     if (orderType === "STOP" && !(parseFloat(stopPrice) > 0)) { setBuyError("Provide a valid stop price."); return; }
+    // W4 — whole-share warning. If fractional is off and the live price is
+    // known and the investment can't buy 1 share, warn upfront; the server
+    // will reject with INSUFFICIENT_INVESTMENT either way.
+    if (!fractionalEnabled && livePrice != null && investment < livePrice) {
+      setBuyError(`At current price ($${livePrice.toFixed(2)}), $${investment.toFixed(2)} = 0 whole shares. Increase or enable fractional.`);
+      return;
+    }
 
     // W3 open semantics:
     //   LONG  → side=BUY,  position_side=LONG
@@ -159,7 +246,9 @@ export default function PaperTradingPage() {
         side: apiSide,
         position_side: positionSide,
         order_type: orderType,
-        investment_usd: investment,
+        // W4 — `investment` already reflects the sizing-mode math
+        // (USD / % equity / % risk); server receives a plain USD number.
+        investment_usd: Number(investment.toFixed(6)),
         limit_price: orderType === "LIMIT" ? parseFloat(limitPrice) : undefined,
         stop_price: orderType === "STOP" ? parseFloat(stopPrice) : undefined,
       };
@@ -471,19 +560,71 @@ export default function PaperTradingPage() {
               type="text"
               value={buySymbol}
               onChange={e => setBuySymbol(e.target.value.toUpperCase())}
+              onBlur={e => fetchQuote(e.target.value.toUpperCase())}
               placeholder="AAPL"
               className="w-full px-3 py-2 border rounded-lg text-sm font-mono"
             />
+            {livePrice != null && (
+              <p className="text-[10px] text-zinc-400 mt-0.5 font-mono">~${livePrice.toFixed(2)}</p>
+            )}
           </div>
           <div>
-            <label className="text-xs text-zinc-400 font-bold uppercase">Amount $</label>
-            <input
-              type="number"
-              value={buyAmount}
-              onChange={e => setBuyAmount(e.target.value)}
-              placeholder="1000"
-              className="w-full px-3 py-2 border rounded-lg text-sm font-mono"
-            />
+            <label className="text-xs text-zinc-400 font-bold uppercase">
+              {sizingMode === "USD" ? "Amount $" : sizingMode === "PCT_EQUITY" ? "% of equity" : "% risk on stop"}
+            </label>
+            <div className="flex gap-1">
+              <input
+                type="number"
+                value={buyAmount}
+                onChange={e => setBuyAmount(e.target.value)}
+                placeholder={sizingMode === "USD" ? "1000" : sizingMode === "PCT_EQUITY" ? "5" : "1"}
+                className="w-full px-3 py-2 border rounded-lg text-sm font-mono"
+              />
+              <select
+                value={sizingMode}
+                onChange={e => setSizingMode(e.target.value as "USD" | "PCT_EQUITY" | "PCT_RISK")}
+                className="px-1 py-2 border rounded-lg text-xs bg-zinc-50"
+                title="Sizing mode: fixed USD, % of equity, or % risk on stop (requires stop-loss bracket)"
+              >
+                <option value="USD">$</option>
+                <option value="PCT_EQUITY">%eq</option>
+                <option value="PCT_RISK">%risk</option>
+              </select>
+            </div>
+            {sizingMode !== "USD" && account && (() => {
+              const amt = parseFloat(buyAmount);
+              let projected = 0;
+              if (amt > 0) {
+                if (sizingMode === "PCT_EQUITY") projected = account.equity * (amt / 100);
+                else if (sizingMode === "PCT_RISK") {
+                  const stopPct = parseFloat(bracketStopLossPct);
+                  if (stopPct > 0) projected = (account.equity * amt) / stopPct;
+                }
+              }
+              return projected > 0 ? (
+                <p className="text-[10px] text-indigo-500 mt-0.5 font-mono">≈ ${projected.toFixed(2)}</p>
+              ) : null;
+            })()}
+            {!fractionalEnabled && livePrice != null && (() => {
+              // Whole-share warning — show when the projected investment
+              // can't buy a single share at current price.
+              const amt = parseFloat(buyAmount);
+              let investmentProbe = 0;
+              if (sizingMode === "USD") investmentProbe = amt;
+              else if (sizingMode === "PCT_EQUITY" && account) investmentProbe = account.equity * (amt / 100);
+              else if (sizingMode === "PCT_RISK" && account) {
+                const stopPct = parseFloat(bracketStopLossPct);
+                if (stopPct > 0) investmentProbe = (account.equity * amt) / stopPct;
+              }
+              if (investmentProbe > 0 && investmentProbe < livePrice) {
+                return (
+                  <p className="text-[10px] text-rose-500 mt-0.5">
+                    Buys 0 shares at ${livePrice.toFixed(2)} (fractional off).
+                  </p>
+                );
+              }
+              return null;
+            })()}
           </div>
           <div>
             <label className="text-xs text-zinc-400 font-bold uppercase">Type</label>

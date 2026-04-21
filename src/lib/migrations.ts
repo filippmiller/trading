@@ -438,6 +438,44 @@ async function runSchemaMigrations() {
     }
   }
 
+  // W4 (2026-04-21) — risk model: slippage, commission, whitelist, fractional, borrow.
+  //
+  // 1. paper_trades gains `commission_usd` and `slippage_usd` — per-fill
+  //    accounting so KPIs can show economic cost separately from P&L.
+  //    Both nullable-safe via DEFAULT 0.
+  // 2. tradable_symbols — whitelist table. API rejects orders for symbols not
+  //    present (active=1 AND asset_class='EQUITY'). Seed is loaded via
+  //    `scripts/sync-tradable-symbols.ts` — the table-creation itself stays
+  //    in ensureSchema so the schema is valid even on a fresh install.
+  // 3. app_settings seed rows — one key per risk param so the UI can PATCH
+  //    individual fields.
+  await ensureColumn("paper_trades", "commission_usd", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+  await ensureColumn("paper_trades", "slippage_usd", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+  await pool.execute(`CREATE TABLE IF NOT EXISTS tradable_symbols (
+    symbol VARCHAR(16) NOT NULL PRIMARY KEY,
+    exchange VARCHAR(16) NULL,
+    asset_class VARCHAR(16) NOT NULL DEFAULT 'EQUITY',
+    active TINYINT(1) NOT NULL DEFAULT 1,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    INDEX IX_tradable_symbols_active (active),
+    INDEX IX_tradable_symbols_class_active (asset_class, active)
+  ) ENGINE=InnoDB`);
+  // Seed risk params with INSERT IGNORE semantics so re-running is a no-op.
+  const riskSeed: Array<[string, string]> = [
+    ["risk.slippage_bps", "5"],
+    ["risk.commission_per_share", "0.005"],
+    ["risk.commission_min_per_leg", "1.0"],
+    ["risk.allow_fractional_shares", "true"],
+    ["risk.default_borrow_rate_pct", "2.5"],
+  ];
+  for (const [k, v] of riskSeed) {
+    await pool.execute(
+      "INSERT IGNORE INTO app_settings (`key`, `value`) VALUES (?, ?)",
+      [k, v]
+    );
+  }
+
   // Seed default paper account
   await pool.execute(
     "INSERT IGNORE INTO paper_accounts (name, initial_cash, cash) VALUES ('Default', 100000, 100000)"

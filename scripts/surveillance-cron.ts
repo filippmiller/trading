@@ -1850,6 +1850,83 @@ async function jobHourlyEquitySnapshots() {
   log(`  Hourly snapshots: wrote ${written} rows across ${accounts.length} non-dormant accounts`);
 }
 
+/**
+ * W4 — borrow-cost accrual for OPEN SHORT positions.
+ *
+ * For every `OPEN SHORT` with `borrow_daily_rate_pct > 0`, debit one day's
+ * interest from the account's cash balance. Runs once per weekday at
+ * 17:00 ET (post-close); skips weekends. Each run is additive — no internal
+ * "last accrued" timestamp yet, so operating the cron on a wall-clock
+ * schedule is the source of truth for daily cadence.
+ *
+ * Daily charge = quantity × buy_price × (borrow_daily_rate_pct / 100) / 365.
+ * Rationale: `borrow_daily_rate_pct` is persisted as an ANNUALIZED % (e.g.
+ * 2.5 = 2.5% APR — typical for liquid large-cap shorts). Dividing by 365
+ * gets the per-day dollar cost on the short's notional = qty × entry price.
+ *
+ * Logged in `surveillance_logs` with status='SUCCESS' (or PARTIAL on errors).
+ * Each per-position debit is its own transaction so one bad row cannot
+ * poison the batch.
+ *
+ * Testing hook: pass `ymdOverride` to simulate a specific day-count. The
+ * smoke test uses `accrueBorrowCostOnce` directly to debit 7 days at once
+ * by looping the function with distinct YMDs; the production schedule just
+ * calls it daily.
+ */
+export async function jobAccrueBorrowCost() {
+  const db = getPool();
+  const [shorts] = await db.execute<mysql.RowDataPacket[]>(
+    `SELECT t.id, t.account_id, t.quantity, t.closed_quantity, t.buy_price, t.borrow_daily_rate_pct
+       FROM paper_trades t
+      WHERE t.status = 'OPEN'
+        AND t.side = 'SHORT'
+        AND COALESCE(t.borrow_daily_rate_pct, 0) > 0`
+  );
+  let debited = 0;
+  let errors = 0;
+  let totalUsd = 0;
+  for (const row of shorts) {
+    const qty = Math.max(0, Number(row.quantity) - Number(row.closed_quantity ?? 0));
+    const entryPrice = Number(row.buy_price);
+    const annualPct = Number(row.borrow_daily_rate_pct);
+    const daily = qty * entryPrice * (annualPct / 100) / 365;
+    if (!(daily > 0)) continue;
+    const conn = await db.getConnection();
+    try {
+      await conn.beginTransaction();
+      // Canonical lock order — account first.
+      const [acct] = await conn.execute<mysql.RowDataPacket[]>(
+        "SELECT id FROM paper_accounts WHERE id = ? FOR UPDATE",
+        [row.account_id]
+      );
+      if (acct.length === 0) { await conn.rollback(); continue; }
+      const [debitRes] = await conn.execute<mysql.ResultSetHeader>(
+        "UPDATE paper_accounts SET cash = cash - ? WHERE id = ?",
+        [daily, row.account_id]
+      );
+      if (debitRes.affectedRows !== 1) { await conn.rollback(); errors++; continue; }
+      await conn.commit();
+      debited++;
+      totalUsd += daily;
+    } catch (err) {
+      try { await conn.rollback(); } catch { /* ignore */ }
+      errors++;
+      log(`  borrow accrual error trade=${row.id}: ${err}`);
+    } finally {
+      conn.release();
+    }
+  }
+  await db.execute(
+    `INSERT INTO surveillance_logs (status, stats_json, finished_at)
+     VALUES (?, ?, CURRENT_TIMESTAMP(6))`,
+    [
+      errors > 0 ? "PARTIAL" : "SUCCESS",
+      JSON.stringify({ job: "borrow_accrual", open_shorts: shorts.length, debited, errors, total_usd: totalUsd }),
+    ]
+  );
+  log(`  Borrow accrual: ${debited}/${shorts.length} shorts debited, total $${totalUsd.toFixed(4)}, errors=${errors}`);
+}
+
 // ─── Schedule ───────────────────────────────────────────────────────────────
 
 /**
@@ -1947,6 +2024,13 @@ cron.schedule("7 9-16 * * 1-5", async () => {
 cron.schedule("0 3 * * *", async () => {
   log("=== RETENTION: Prune old paper_position_prices ===");
   try { await jobPruneOldPrices(); } catch (err) { log(`ERROR pruning: ${err}`); }
+}, CRON_OPTIONS);
+
+// W4 — Borrow cost accrual. Weekdays 17:00 ET (post-close). Debits one day
+// of interest per OPEN SHORT with a non-zero borrow rate.
+cron.schedule("0 17 * * 1-5", async () => {
+  log("=== BORROW ACCRUAL: Debit daily interest on OPEN SHORTs ===");
+  try { await jobAccrueBorrowCost(); } catch (err) { log(`ERROR borrow accrual: ${err}`); }
 }, CRON_OPTIONS);
 
 // ─── Startup ────────────────────────────────────────────────────────────────

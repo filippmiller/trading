@@ -14,11 +14,58 @@ type Defaults = {
   base_capital_usd: number;
 };
 
+/** W4 — paper-trading risk-model config. Edited via /api/paper/settings. */
+type RiskSettings = {
+  slippage_bps: number;
+  commission_per_share: number;
+  commission_min_per_leg: number;
+  allow_fractional_shares: boolean;
+  default_borrow_rate_pct: number;
+};
+
 export default function SettingsPage() {
   const [defaults, setDefaults] = useState<Defaults | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+
+  // W4 — paper-trading risk model section (separate from the legacy
+  // backtest defaults above; they live in different app_settings keys).
+  const [risk, setRisk] = useState<RiskSettings | null>(null);
+  const [riskSaving, setRiskSaving] = useState(false);
+  const [riskMessage, setRiskMessage] = useState<string | null>(null);
+
+  const loadRisk = async () => {
+    try {
+      const res = await fetch("/api/paper/settings");
+      if (!res.ok) return;
+      const data = await res.json();
+      setRisk({
+        slippage_bps: Number(data.slippage_bps ?? 0),
+        commission_per_share: Number(data.commission_per_share ?? 0),
+        commission_min_per_leg: Number(data.commission_min_per_leg ?? 0),
+        allow_fractional_shares: Boolean(data.allow_fractional_shares),
+        default_borrow_rate_pct: Number(data.default_borrow_rate_pct ?? 0),
+      });
+    } catch { /* keep section hidden on error */ }
+  };
+  useEffect(() => { loadRisk(); }, []);
+
+  const saveRisk = async () => {
+    if (!risk) return;
+    setRiskSaving(true);
+    setRiskMessage(null);
+    try {
+      const res = await fetch("/api/paper/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(risk),
+      });
+      setRiskMessage(res.ok ? "Saved." : "Failed to save risk settings.");
+    } finally {
+      setRiskSaving(false);
+    }
+  };
 
   // Previous version silently hung on "Loading..." whenever the DB tunnel dropped —
   // fetch rejected, nothing caught it, user never knew. Now any failure surfaces
@@ -85,6 +132,7 @@ export default function SettingsPage() {
   }
 
   return (
+    <div className="space-y-6">
     <Card>
       <CardHeader>
         <CardTitle>Defaults</CardTitle>
@@ -132,5 +180,40 @@ export default function SettingsPage() {
         {message && <div className="text-sm text-zinc-500">{message}</div>}
       </CardContent>
     </Card>
+
+    {/* W4 — paper-trading risk model */}
+    {risk && (
+      <Card>
+        <CardHeader>
+          <CardTitle>Paper trading — risk model</CardTitle>
+          <CardDescription>
+            Slippage, commission, fractional shares, and default short-borrow rate.
+            Applied to every paper fill immediately after saving.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <label className="text-sm text-zinc-600">Slippage (bps) — MARKET orders only</label>
+          <Input type="number" step={0.5} value={risk.slippage_bps}
+            onChange={e => setRisk({ ...risk, slippage_bps: Number(e.target.value) })} />
+          <label className="text-sm text-zinc-600">Commission — per share ($)</label>
+          <Input type="number" step={0.001} value={risk.commission_per_share}
+            onChange={e => setRisk({ ...risk, commission_per_share: Number(e.target.value) })} />
+          <label className="text-sm text-zinc-600">Commission — minimum per leg ($)</label>
+          <Input type="number" step={0.1} value={risk.commission_min_per_leg}
+            onChange={e => setRisk({ ...risk, commission_min_per_leg: Number(e.target.value) })} />
+          <label className="text-sm text-zinc-600 flex items-center gap-2">
+            <input type="checkbox" checked={risk.allow_fractional_shares}
+              onChange={e => setRisk({ ...risk, allow_fractional_shares: e.target.checked })} />
+            Allow fractional shares (off = floor quantity to whole shares)
+          </label>
+          <label className="text-sm text-zinc-600">Default short borrow rate (annual %)</label>
+          <Input type="number" step={0.1} value={risk.default_borrow_rate_pct}
+            onChange={e => setRisk({ ...risk, default_borrow_rate_pct: Number(e.target.value) })} />
+          <Button onClick={saveRisk} disabled={riskSaving}>Save risk settings</Button>
+          {riskMessage && <div className="text-sm text-zinc-500">{riskMessage}</div>}
+        </CardContent>
+      </Card>
+    )}
+    </div>
   );
 }

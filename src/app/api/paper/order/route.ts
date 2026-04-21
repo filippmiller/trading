@@ -13,6 +13,7 @@ import {
   cancelOrderWithRefund,
   modifyPendingOrder,
 } from "@/lib/paper-fill";
+import { isSymbolTradable } from "@/lib/paper-risk";
 
 type OrderBody = {
   symbol: string;
@@ -78,6 +79,15 @@ export async function POST(req: Request) {
     const sym = symbol.toUpperCase();
     if (!SYMBOL_RE.test(sym)) {
       return NextResponse.json({ error: "invalid symbol" }, { status: 400 });
+    }
+    // W4 — whitelist check. tradable_symbols is seeded from NASDAQ+NYSE
+    // listings (see scripts/sync-tradable-symbols.ts). Symbols not in the
+    // table are rejected with SYMBOL_NOT_TRADABLE so nonsense tickers never
+    // make it past submit. The whitelist enforces equity-only via
+    // asset_class='EQUITY'; non-equity symbols (ETFs/crypto/etc) currently
+    // fail-closed. Closes a hole where "NONSENSE123" would pass SYMBOL_RE.
+    if (!(await isSymbolTradable(sym))) {
+      return NextResponse.json({ error: "SYMBOL_NOT_TRADABLE" }, { status: 400 });
     }
     if (side !== "BUY" && side !== "SELL") {
       return NextResponse.json({ error: "side must be BUY or SELL" }, { status: 400 });

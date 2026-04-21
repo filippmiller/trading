@@ -54,6 +54,13 @@
  */
 
 import type mysqlTypes from "mysql2/promise";
+import {
+  applyCommission,
+  applySlippage,
+  loadRiskConfig,
+  normalizeQuantity,
+  slippageCostUsd,
+} from "@/lib/paper-risk";
 
 export type FillOrderResult =
   | {
@@ -122,6 +129,11 @@ const SOFT_REJECT = new Set([
   "TRADE_MISMATCH",
   "NO_OPEN_POSITION",
   "DUPLICATE_SHORT_POSITION",
+  // W4 — fractional-off rejection where the investment can't buy 1 whole
+  // share. The rejectOrder() call above persists status='REJECTED' + the
+  // reason; without this tag the outer transaction would roll back, leaving
+  // the order PENDING and the rejection invisible.
+  "INSUFFICIENT_INVESTMENT",
 ]);
 
 /**
@@ -254,6 +266,12 @@ async function fillOrderCore(
     return { filled: false, rejection: "INVALID_PRICE" };
   }
 
+  // W4 — load risk config once per fill. Cached in the module so the DB hit
+  // is amortized across many fills; no-op when an override is pinned for
+  // testing. Loaded OUTSIDE the caller's transaction-locked reads so the
+  // app_settings table never contends with paper_accounts locks.
+  const riskCfg = await loadRiskConfig();
+
   // Preliminary non-locking read purely to discover account_id / side so we
   // can lock in canonical order (accounts first). We re-read the order
   // under FOR UPDATE below to get authoritative state + status guard.
@@ -298,6 +316,18 @@ async function fillOrderCore(
   const side = order.side as "BUY" | "SELL";
   const positionSide: "LONG" | "SHORT" = (order.position_side === "SHORT") ? "SHORT" : "LONG";
   const symbol = String(order.symbol);
+  const orderType = String(order.order_type ?? "MARKET") as "MARKET" | "LIMIT" | "STOP";
+
+  // W4 — compute slippage-adjusted fill price + per-fill commission BEFORE
+  // any cash move. These two are the source of truth for the trade row's
+  // `buy_price`, `slippage_usd`, and `commission_usd` columns and for the
+  // cash ledger arithmetic below. Keeping them up top means every branch
+  // (open LONG / open SHORT / close LONG / cover SHORT) uses the same
+  // adjusted-price + commission numbers without re-deriving them.
+  const adjustedPrice = applySlippage(fillPrice, side, orderType, riskCfg);
+  if (!Number.isFinite(adjustedPrice) || adjustedPrice <= 0) {
+    return { filled: false, rejection: "INVALID_PRICE" };
+  }
 
   // ── OPEN LONG (BUY + LONG) ───────────────────────────────────────────
   if (side === "BUY" && positionSide === "LONG") {
@@ -307,14 +337,30 @@ async function fillOrderCore(
       return { filled: false, rejection: "INVALID_INVESTMENT" };
     }
 
-    // P1 — Validate quantity BEFORE any cash movement. If fillPrice is
-    // tiny (e.g. 1e-30) the resulting quantity is Infinity; if we let that
-    // through we'd debit cash and THEN reject, leaving funds stranded.
-    const quantity = investment / fillPrice;
-    if (!Number.isFinite(quantity) || quantity <= 0) {
-      await rejectOrder(conn, orderId, "INVALID_QUANTITY");
-      return { filled: false, rejection: "INVALID_QUANTITY" };
+    // P1 — Validate quantity BEFORE any cash movement. Quantity is computed
+    // from the BASE price (pre-slippage) so the user's "$1000 buys $1000
+    // worth" contract still holds; slippage becomes an extra cash debit
+    // rather than reducing share count. If fillPrice is tiny the resulting
+    // quantity is Infinity; reject before any debit.
+    const rawQuantity = investment / fillPrice;
+    const { quantity, rejected: qtyRejected } = normalizeQuantity(rawQuantity, riskCfg);
+    if (qtyRejected || !Number.isFinite(quantity) || quantity <= 0) {
+      // When fractional is OFF and investment is too small for 1 whole share
+      // we surface INSUFFICIENT_INVESTMENT so the user understands the mode;
+      // otherwise (invalid math / tiny price) INVALID_QUANTITY stands.
+      const reason = !riskCfg.allowFractionalShares && rawQuantity < 1
+        ? "INSUFFICIENT_INVESTMENT"
+        : "INVALID_QUANTITY";
+      await rejectOrder(conn, orderId, reason);
+      return { filled: false, rejection: reason };
     }
+
+    // W4 — economic costs for this fill. Slippage is the dollar gap between
+    // base and adjusted price times qty; commission is a max(min, per-share)
+    // fee. Both are debited from cash IN ADDITION to the investment.
+    const slippageUsd = slippageCostUsd(fillPrice, adjustedPrice, quantity);
+    const commissionUsd = applyCommission(quantity, investment, riskCfg);
+    const extraCashNeeded = slippageUsd + commissionUsd;
 
     const reservedAmount = Number(order.reserved_amount ?? 0);
 
@@ -328,6 +374,9 @@ async function fillOrderCore(
         await rejectOrder(conn, orderId, "RESERVATION_MISSING");
         return { filled: false, rejection: "RESERVATION_MISSING" };
       }
+      // Reconcile investment vs reservation delta, THEN deduct the W4
+      // extras (slippage + commission) which weren't in the reservation
+      // bucket because they depend on the fill price (not known at submit).
       const delta = reservedAmount - investment;
       if (delta !== 0) {
         if (delta > 0) {
@@ -345,10 +394,22 @@ async function fillOrderCore(
           }
         }
       }
+      if (extraCashNeeded > 0) {
+        const [extra] = await conn.execute(
+          "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
+          [extraCashNeeded, accountId, extraCashNeeded]
+        ) as [mysqlTypes.ResultSetHeader, unknown];
+        if (extra.affectedRows !== 1) {
+          return { filled: false, rejection: "INSUFFICIENT_CASH_ON_FILL" };
+        }
+      }
     } else {
+      // MARKET path — debit investment + extras in one atomic UPDATE so a
+      // partial debit never persists. Guard on full required amount.
+      const totalDebit = investment + extraCashNeeded;
       const [cashResult] = await conn.execute(
         "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
-        [investment, accountId, investment]
+        [totalDebit, accountId, totalDebit]
       ) as [mysqlTypes.ResultSetHeader, unknown];
       if (cashResult.affectedRows !== 1) {
         await rejectOrder(conn, orderId, "INSUFFICIENT_CASH");
@@ -357,8 +418,9 @@ async function fillOrderCore(
     }
 
     return await insertOpenTrade(conn, {
-      accountId, symbol, quantity, fillPrice, investment,
+      accountId, symbol, quantity, fillPrice: adjustedPrice, investment,
       positionSide: "LONG", side: "BUY", order, orderId, opts,
+      slippageUsd, commissionUsd,
     });
   }
 
@@ -369,11 +431,20 @@ async function fillOrderCore(
       await rejectOrder(conn, orderId, "INVALID_INVESTMENT");
       return { filled: false, rejection: "INVALID_INVESTMENT" };
     }
-    const quantity = investment / fillPrice;
-    if (!Number.isFinite(quantity) || quantity <= 0) {
-      await rejectOrder(conn, orderId, "INVALID_QUANTITY");
-      return { filled: false, rejection: "INVALID_QUANTITY" };
+    const rawQuantity = investment / fillPrice;
+    const { quantity, rejected: qtyRejected } = normalizeQuantity(rawQuantity, riskCfg);
+    if (qtyRejected || !Number.isFinite(quantity) || quantity <= 0) {
+      const reason = !riskCfg.allowFractionalShares && rawQuantity < 1
+        ? "INSUFFICIENT_INVESTMENT"
+        : "INVALID_QUANTITY";
+      await rejectOrder(conn, orderId, reason);
+      return { filled: false, rejection: reason };
     }
+    // W4 — slippage/commission for short-open, same model as LONG open.
+    // Slippage goes out of cash (short sale "gets less"), commission too.
+    const slippageUsd = slippageCostUsd(fillPrice, adjustedPrice, quantity);
+    const commissionUsd = applyCommission(quantity, investment, riskCfg);
+    const extraCashNeeded = slippageUsd + commissionUsd;
 
     // PF2 — reject new SHORT if an OPEN SHORT already exists for this
     // (account, symbol). The cover path resolves "which position to close"
@@ -421,12 +492,23 @@ async function fillOrderCore(
           }
         }
       }
+      // W4 — slippage + commission come out of cash (not margin).
+      if (extraCashNeeded > 0) {
+        const [extra] = await conn.execute(
+          "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
+          [extraCashNeeded, accountId, extraCashNeeded]
+        ) as [mysqlTypes.ResultSetHeader, unknown];
+        if (extra.affectedRows !== 1) {
+          return { filled: false, rejection: "INSUFFICIENT_CASH_ON_FILL" };
+        }
+      }
     } else {
       // No pre-reservation — this is a MARKET short. Atomically debit cash
-      // into reserved_short_margin.
+      // into reserved_short_margin AND pay extras (slippage + commission)
+      // from cash in the same statement.
       const [move] = await conn.execute(
         "UPDATE paper_accounts SET cash = cash - ?, reserved_short_margin = reserved_short_margin + ? WHERE id = ? AND cash >= ?",
-        [investment, investment, accountId, investment]
+        [investment + extraCashNeeded, investment, accountId, investment + extraCashNeeded]
       ) as [mysqlTypes.ResultSetHeader, unknown];
       if (move.affectedRows !== 1) {
         await rejectOrder(conn, orderId, "INSUFFICIENT_CASH");
@@ -435,8 +517,9 @@ async function fillOrderCore(
     }
 
     return await insertOpenTrade(conn, {
-      accountId, symbol, quantity, fillPrice, investment,
+      accountId, symbol, quantity, fillPrice: adjustedPrice, investment,
       positionSide: "SHORT", side: "SELL", order, orderId, opts,
+      slippageUsd, commissionUsd,
     });
   }
 
@@ -496,16 +579,27 @@ async function fillOrderCore(
   }
 
   const investmentShare = totalQty > 0 ? investment * (closeQty / totalQty) : 0;
-  // Proceeds for LONG close = qty * fillPrice.
-  // Proceeds semantic for SHORT cover = qty * fillPrice (cash we pay to buy
-  // back). Margin release happens separately.
-  const closeValue = closeQty * fillPrice;
+  // W4 — commission and slippage are separate economic cost lines, tracked
+  // on paper_trades (*.slippage_usd, *.commission_usd). They do NOT reduce
+  // `pnl_usd` — pnl_usd remains the pure price-delta × qty number so the
+  // conservation invariant stays clean:
+  //   cash + open_investment + sum(slippage_usd + commission_usd on all trades) = initial + realized_pnl
+  // UIs that want "net of costs" can subtract `commission_usd + slippage_usd`
+  // from `pnl_usd` at display time. Keeping the ledger dimensions separate
+  // means the W1/W2/W3 conservation tests only need an additive adjustment.
+  const closeCommissionUsd = applyCommission(closeQty, investmentShare, riskCfg);
+  const closeSlippageUsd = slippageCostUsd(fillPrice, adjustedPrice, closeQty);
 
-  // Direction-aware P&L on the closed slice. LONG profits when fill > entry;
-  // SHORT profits when entry > fill.
+  // Proceeds for LONG close = qty * adjustedPrice.
+  // Proceeds semantic for SHORT cover = qty * adjustedPrice.
+  const closeValue = closeQty * adjustedPrice;
+
+  // Direction-aware GROSS P&L on the closed slice. LONG profits when
+  // fill > entry; SHORT profits when entry > fill. Pure price-delta
+  // measure — commission/slippage are tracked on their own columns.
   const pnlSlice = expectedTradeSide === "SHORT"
-    ? (buyPrice - fillPrice) * closeQty
-    : (fillPrice - buyPrice) * closeQty;
+    ? (buyPrice - adjustedPrice) * closeQty
+    : (adjustedPrice - buyPrice) * closeQty;
   const pnlPctSlice = investmentShare > 0 ? (pnlSlice / investmentShare) * 100 : 0;
 
   const newClosedQty = alreadyClosed + closeQty;
@@ -517,7 +611,9 @@ async function fillOrderCore(
   // closed_quantity and the `closed_quantity + ? <= quantity` guard (enforced
   // by the subquery) rejects with TRADE_RACE_LOST.
   if (willBeFullyClosed) {
-    // Full close — flip to CLOSED.
+    // Full close — flip to CLOSED. Commission + slippage from this leg are
+    // ACCUMULATED onto existing columns (each partial already deposited its
+    // own leg; this tops up the final one).
     const existingPnl = Number(trade.pnl_usd ?? 0);
     const finalPnl = existingPnl + pnlSlice;
     const investmentShareTotal = investment; // full investment realized
@@ -526,9 +622,11 @@ async function fillOrderCore(
       `UPDATE paper_trades
           SET status='CLOSED', sell_price=?, sell_date=CURRENT_DATE,
               pnl_usd=?, pnl_pct=?,
-              closed_quantity=quantity
+              closed_quantity=quantity,
+              commission_usd=commission_usd + ?,
+              slippage_usd=slippage_usd + ?
         WHERE id=? AND status='OPEN' AND closed_quantity = ?`,
-      [fillPrice, finalPnl, finalPnlPct, tradeId, alreadyClosed]
+      [adjustedPrice, finalPnl, finalPnlPct, closeCommissionUsd, closeSlippageUsd, tradeId, alreadyClosed]
     ) as [mysqlTypes.ResultSetHeader, unknown];
     if (tradeUpdate.affectedRows !== 1) {
       return { filled: false, rejection: "TRADE_RACE_LOST" };
@@ -540,21 +638,27 @@ async function fillOrderCore(
     const accumulatedPnl = existingPnl + pnlSlice;
     const [tradeUpdate] = await conn.execute(
       `UPDATE paper_trades
-          SET pnl_usd=?, closed_quantity=closed_quantity + ?
+          SET pnl_usd=?, closed_quantity=closed_quantity + ?,
+              commission_usd=commission_usd + ?,
+              slippage_usd=slippage_usd + ?
         WHERE id=? AND status='OPEN' AND closed_quantity + ? <= quantity + 1e-9`,
-      [accumulatedPnl, closeQty, tradeId, closeQty]
+      [accumulatedPnl, closeQty, closeCommissionUsd, closeSlippageUsd, tradeId, closeQty]
     ) as [mysqlTypes.ResultSetHeader, unknown];
     if (tradeUpdate.affectedRows !== 1) {
       return { filled: false, rejection: "TRADE_RACE_LOST" };
     }
   }
 
-  // Cash + margin arithmetic — differs by side.
+  // Cash + margin arithmetic — differs by side. W4: commission is debited
+  // from the net cash credit so a round-trip on a winning trade that lands
+  // ON the commission floor ($1 min each leg) correctly shows a tiny
+  // commission drag on realized P&L.
   if (expectedTradeSide === "LONG") {
-    // Credit closeValue (proceeds) to cash. No margin involvement.
+    // Credit (closeValue - commission) to cash. No margin involvement.
+    const netCredit = closeValue - closeCommissionUsd;
     const [creditResult] = await conn.execute(
       "UPDATE paper_accounts SET cash = cash + ? WHERE id = ?",
-      [closeValue, accountId]
+      [netCredit, accountId]
     ) as [mysqlTypes.ResultSetHeader, unknown];
     if (creditResult.affectedRows !== 1) {
       return { filled: false, rejection: "ACCOUNT_VANISHED" };
@@ -575,13 +679,14 @@ async function fillOrderCore(
     //          Equivalently: cash += (2 * investmentShare - closeValue)
     //                                = investmentShare + pnlSlice.
     //          reserved_short_margin -= investmentShare.
+    //          W4: commission additionally shaves the cash credit on cover.
     //
     // Concrete example: open $1000 short at $100 (qty 10), cover at $90.
-    //   At open: cash 100k→99k, margin 0→1k, equity 100k.
+    //   At open: cash 100k→99k, margin 0→1k, equity 100k (+ extras on W4).
     //   At cover: closeValue = 10*90 = 900. investmentShare = 1000.
-    //   cash += (1000 + 1000 - 900) = 1100. margin -= 1000.
-    //   Final: cash 99k+1.1k = 100.1k, margin 0, equity 100.1k = initial + pnl(+100) ✓
-    const cashCredit = 2 * investmentShare - closeValue;
+    //   cash += (1000 + 1000 - 900) - commission = 1100 - $1. margin -= 1000.
+    //   Final: cash 99k + 1099 = 100099, margin 0, equity = initial + pnl_net.
+    const cashCredit = 2 * investmentShare - closeValue - closeCommissionUsd;
     const [release] = await conn.execute(
       "UPDATE paper_accounts SET reserved_short_margin = reserved_short_margin - ?, cash = cash + ? WHERE id = ? AND reserved_short_margin >= ?",
       [investmentShare, cashCredit, accountId, investmentShare]
@@ -592,12 +697,13 @@ async function fillOrderCore(
   }
 
   // Status-guarded order fill — regardless of partial vs full, this order
-  // is now FILLED.
+  // is now FILLED. Persists the slippage-adjusted price so the order row
+  // shows what the trader actually got, not the pre-slippage quote.
   const [orderUpdate] = await conn.execute(
     `UPDATE paper_orders
         SET status='FILLED', filled_price=?, filled_at=CURRENT_TIMESTAMP(6), trade_id=?
       WHERE id=? AND status='PENDING'`,
-    [fillPrice, tradeId, orderId]
+    [adjustedPrice, tradeId, orderId]
   ) as [mysqlTypes.ResultSetHeader, unknown];
   if (orderUpdate.affectedRows !== 1) {
     return { filled: false, rejection: "ORDER_RACE_LOST" };
@@ -610,7 +716,7 @@ async function fillOrderCore(
     filled: true,
     tradeId,
     quantity: closeQty,
-    fillPrice,
+    fillPrice: adjustedPrice,
     side,
     positionSide: expectedTradeSide,
     pnlUsd: pnlSlice,
@@ -642,9 +748,15 @@ async function insertOpenTrade(
     order: mysqlTypes.RowDataPacket;
     orderId: number;
     opts?: FillOrderOptions;
+    /** W4 — per-fill slippage cost in USD (qty × |adjusted − base|). */
+    slippageUsd?: number;
+    /** W4 — per-fill commission in USD. */
+    commissionUsd?: number;
   }
 ): Promise<FillOrderResult> {
   const { accountId, symbol, quantity, fillPrice, investment, positionSide, side, order, orderId, opts } = args;
+  const slippageUsd = args.slippageUsd ?? 0;
+  const commissionUsd = args.commissionUsd ?? 0;
 
   const strategyLabel = opts?.strategyLabel ?? `${order.order_type} ${side}`;
   const strategyId = opts?.strategyId ?? null;
@@ -679,9 +791,10 @@ async function insertOpenTrade(
         stop_loss_price, take_profit_price,
         trailing_stop_pct, trailing_activates_at_profit_pct,
         time_exit_date,
-        closed_quantity)
+        closed_quantity,
+        slippage_usd, commission_usd)
      VALUES (?, ?, ?, ?, ?, CURRENT_DATE, ?, ?, ?, 'OPEN', ?,
-             ?, ?, ?, ?, ?, 0)`,
+             ?, ?, ?, ?, ?, 0, ?, ?)`,
     [
       accountId,
       symbol,
@@ -697,6 +810,8 @@ async function insertOpenTrade(
       trailingPct,
       trailingActivatesPct,
       timeExitDate,
+      slippageUsd,
+      commissionUsd,
     ]
   ) as [mysqlTypes.ResultSetHeader, unknown];
 
