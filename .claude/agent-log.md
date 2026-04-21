@@ -9,6 +9,63 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-21 11:40] — Railway production deploy + auth retrospective log + prod smoke
+
+**Area:** Trading/Ops, Trading/Auth, Trading/Infra, Trading/Verification
+**Type:** docs (retroactive) + verification
+**Commit documented:** `fe6bccc` (feat: add Railway production deploy and app auth, 2026-04-21 07:17 UTC+3)
+**Prod URL:** https://trading-production-06fe.up.railway.app
+
+### Why this retroactive entry
+`fe6bccc` shipped the Railway production infrastructure but did not include an agent-log entry. The subsequent data-restore entry (`f9f343a` / PR #10) documents the VPS → Railway data move but not the underlying deploy. This entry closes that gap and records the end-to-end prod verification done today via Playwright.
+
+### What `fe6bccc` introduced
+- `Dockerfile` (multi-stage Next.js standalone) + `Dockerfile.worker` (tsx-runtime scheduler)
+- `docker/init-db.sql` — bootstrap schema for Railway MySQL first-start
+- `middleware.ts` — session-cookie auth gate; public paths: `/login`, `/api/auth/login|logout`, `/api/healthz`; everything else redirects to `/login?next=…`
+- `src/app/login/*` + `src/app/api/auth/{login,logout,me}/route.ts` + `src/lib/auth/{constants,password,server,session}.ts` — admin-only login backed by `SESSION_SECRET`
+- `src/lib/bootstrap.ts` + `src/lib/migrations.ts` — first-boot admin provisioning from `ADMIN_EMAIL` / `ADMIN_PASSWORD` env
+- `src/app/api/healthz/route.ts` — `{ ok: true, service: "web" }`
+- `scripts/surveillance-cron.ts` — updated to accept Railway-style `MYSQL*` envs in addition to `MYSQL_*`
+- `docs/RAILWAY.md` — 3-service deploy plan (`web` + `worker` + `MySQL`)
+
+### Railway topology (confirmed today)
+| Service | Railway name | Latest deploy | Status |
+|---|---|---|---|
+| Web (Next.js) | `trading` | 2026-04-21T04:19Z | SUCCESS |
+| Scheduler | `worker` | 2026-04-21T04:19Z | SUCCESS |
+| Database | `MySQL` | 2026-02-04T15:07Z | SUCCESS |
+
+Note: docs in `docs/RAILWAY.md` call the web service `web`, but the actual Railway service name is `trading`. Not worth renaming — just documenting the drift here.
+
+### Verification (prod smoke via Playwright, 2026-04-21)
+Added `scripts/prod-smoke.mjs` — logs in with `ADMIN_EMAIL` / `ADMIN_PASSWORD` and walks the seven user-facing routes, capturing screenshots and console errors.
+
+| Route | HTTP | Rendered heading | Console errs |
+|---|---:|---|---:|
+| `/api/healthz` | 200 | `{"ok":true,"service":"web"}` | — |
+| `/` (dashboard) | 200 | "Mean reversion research, automation, and paper execution" | 1 ⚠ |
+| `/reversal` | 200 | "Surveillance Command" — 491 tickers, $70.72 P&L, 46.5% WR | 0 |
+| `/research` | 200 | "Strategy Research" | 0 |
+| `/paper` | 200 | "Paper Trading Simulator" | 0 |
+| `/markets` | 200 | "Markets" | 0 |
+| `/strategies` | 200 | "Strategy Dashboard" | 0 |
+| `/settings` | 200 | (sidebar-only layout) | 0 |
+
+Matrix tab on `/reversal`: 1 table, 922 rows, "All 891 / Gainers 553 / Losers 338" — row counts match the post-restore target (`reversal_entries=891`) exactly. 2026-04-20 cohort renders 134 tickers. Full D1–D10 morning/midday/close column grid intact.
+
+### Known issue surfaced by the smoke
+`/` dashboard logs one console error: `Dashboard stats error: TypeError: Failed to fetch` (client-side fetch in a SSR-hydrated dashboard widget). Page still renders; not a blocker for this verification, but a follow-up candidate. Not introduced by `fe6bccc` — likely pre-existing behavior now visible because the dashboard is in a logged-in production context for the first time.
+
+### Files Changed (this entry)
+- `.claude/agent-log.md` — this entry
+- `scripts/prod-smoke.mjs` — new; reusable Playwright smoke against any SMOKE_BASE
+
+### Database Tables
+- Read-only via the app — no schema or data changes in this pass.
+
+---
+
 ## [2026-04-21 09:18] — Railway data restore from VPS (matrix recovery)
 
 **Area:** Trading/Ops, Trading/Data, Trading/Docs
