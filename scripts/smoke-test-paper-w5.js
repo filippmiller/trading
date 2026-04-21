@@ -214,20 +214,34 @@ async function test4_accountListing(defaultId, alt1Id) {
   assert(ids.includes(alt1Id), "alt1 account id in list");
 }
 
-// ── Test 5: resolveAccount — honors account_id, falls back to Default ────
+// ── Test 5: resolveAccount — honors account_id, Default only for null/empty ──
+// Round-2: fallback to Default now ONLY happens for null/empty param. A bogus
+// explicit account_id throws AccountNotFoundError so routes can 404 instead
+// of silently wiping Default on reset (the original attack vector).
 async function test5_resolveAccount(defaultId, alt1Id) {
-  console.log("\nTest 5: resolveAccount — honors param, falls back on missing/invalid");
+  console.log("\nTest 5: resolveAccount — honors param, Default only for null/empty, throws on bogus");
   const resolvedAlt = await paperLib.resolveAccount(String(alt1Id));
   assert(resolvedAlt.id === alt1Id, `resolveAccount('${alt1Id}') → alt1 (got id=${resolvedAlt.id})`);
 
   const resolvedDefault = await paperLib.resolveAccount(null);
   assert(resolvedDefault.name === "Default", `resolveAccount(null) → real 'Default' (got '${resolvedDefault.name}')`);
 
-  const resolvedInvalid = await paperLib.resolveAccount("99999999");
-  assert(resolvedInvalid.name === "Default", `resolveAccount('99999999') falls back to Default (got '${resolvedInvalid.name}')`);
+  const resolvedEmpty = await paperLib.resolveAccount("");
+  assert(resolvedEmpty.name === "Default", `resolveAccount('') → Default (backward compat)`);
 
-  const resolvedGarbage = await paperLib.resolveAccount("not-a-number");
-  assert(resolvedGarbage.name === "Default", `resolveAccount('not-a-number') falls back to Default`);
+  // Bogus numeric id MUST throw, not fall back.
+  let invalidErr = null;
+  try { await paperLib.resolveAccount("99999999"); } catch (e) { invalidErr = e; }
+  assert(invalidErr !== null, `resolveAccount('99999999') throws instead of fallback`);
+  assert(invalidErr && invalidErr.name === "AccountNotFoundError",
+    `throws AccountNotFoundError (got ${invalidErr && invalidErr.name})`);
+
+  // Non-numeric garbage MUST throw too.
+  let garbageErr = null;
+  try { await paperLib.resolveAccount("not-a-number"); } catch (e) { garbageErr = e; }
+  assert(garbageErr !== null, `resolveAccount('not-a-number') throws`);
+  assert(garbageErr && garbageErr.name === "AccountNotFoundError",
+    `garbage input throws AccountNotFoundError (got ${garbageErr && garbageErr.name})`);
 }
 
 // ── Test 6: Account isolation — ordering on Alt doesn't touch Default ────
@@ -334,6 +348,153 @@ async function test9_getAccountById(alt1Id) {
   assert(missing === null, "getAccountById(99999999) → null");
 }
 
+// ── HTTP helper — only used by tests that need the Next.js route layer ───
+// Tests hit the dev server to exercise the route-level 404 handling added in
+// round-2. If the server isn't reachable these tests are skipped (the core
+// resolveAccount-level assertions in Test 5 already cover the throw path).
+const HTTP_BASE = process.env.PAPER_W5_BASE_URL || "http://localhost:3013";
+
+async function httpJson(method, path, body) {
+  const res = await fetch(HTTP_BASE + path, {
+    method,
+    headers: body ? { "content-type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let json = null;
+  try { json = await res.json(); } catch { /* body might be empty */ }
+  return { status: res.status, json };
+}
+
+async function isDevServerUp() {
+  try {
+    const res = await fetch(HTTP_BASE + "/api/paper", { signal: AbortSignal.timeout(2000) });
+    return res.status === 200 || res.status === 500; // any response = server up
+  } catch { return false; }
+}
+
+// ── Test 10: HTTP 404 on bogus account_id + Default untouched (Bug #1) ──
+// This is the core round-2 regression test for the "wiped Default" attack
+// vector: stale localStorage.account_id → user clicks Reset → silent fallback
+// to Default → Default's data gone. Post-fix the API MUST return 404 and
+// Default MUST be untouched.
+async function test10_httpAccountNotFound(defaultId) {
+  console.log("\nTest 10: HTTP — bogus account_id returns 404, Default untouched");
+  if (!(await isDevServerUp())) {
+    console.log("  SKIP (dev server not up at " + HTTP_BASE + "; start `npm run dev` on port 3013)");
+    return;
+  }
+
+  // Snapshot Default's real state (the at-risk account is id=1, NOT our
+  // test account). The attack wipes the real Default.
+  const [[realDefBefore]] = await pool.execute(
+    "SELECT cash, initial_cash, reserved_cash FROM paper_accounts WHERE name = 'Default' LIMIT 1"
+  );
+  const [[realDefOrdersBefore]] = await pool.execute(
+    "SELECT COUNT(*) AS c FROM paper_orders WHERE account_id = (SELECT id FROM paper_accounts WHERE name='Default')"
+  );
+  const [[realDefTradesBefore]] = await pool.execute(
+    "SELECT COUNT(*) AS c FROM paper_trades WHERE account_id = (SELECT id FROM paper_accounts WHERE name='Default')"
+  );
+
+  // GET with bogus id → 404.
+  const g = await httpJson("GET", "/api/paper?account_id=999999");
+  assert(g.status === 404, `GET /api/paper?account_id=999999 → 404 (got ${g.status})`);
+  assert(g.json && g.json.error === "Account not found",
+    `GET 404 body has error='Account not found' (got ${JSON.stringify(g.json)})`);
+
+  // POST (reset) with bogus id → 404. This is THE attack vector — must 404.
+  const r = await httpJson("POST", "/api/paper/account?account_id=999999", {});
+  assert(r.status === 404, `POST /api/paper/account?account_id=999999 → 404 (got ${r.status})`);
+  assert(r.json && r.json.error === "Account not found",
+    `POST reset 404 body has error='Account not found' (got ${JSON.stringify(r.json)})`);
+
+  // GET /api/paper/account with bogus id → 404.
+  const ga = await httpJson("GET", "/api/paper/account?account_id=999999");
+  assert(ga.status === 404, `GET /api/paper/account?account_id=999999 → 404 (got ${ga.status})`);
+
+  // POST /api/paper/order with bogus id → 404.
+  const o = await httpJson("POST", "/api/paper/order?account_id=999999",
+    { symbol: "AAPL", side: "BUY", order_type: "MARKET", investment_usd: 1000 });
+  assert(o.status === 404, `POST /api/paper/order?account_id=999999 → 404 (got ${o.status})`);
+
+  // Backward compat: empty and missing param both use Default (real).
+  const ge = await httpJson("GET", "/api/paper?account_id=");
+  assert(ge.status === 200, `GET /api/paper?account_id= (empty) → 200 via Default (got ${ge.status})`);
+
+  const gn = await httpJson("GET", "/api/paper");
+  assert(gn.status === 200, `GET /api/paper (no param) → 200 via Default (got ${gn.status})`);
+
+  // CRITICAL INVARIANT — real Default untouched by all the 404s above.
+  const [[realDefAfter]] = await pool.execute(
+    "SELECT cash, initial_cash, reserved_cash FROM paper_accounts WHERE name = 'Default' LIMIT 1"
+  );
+  const [[realDefOrdersAfter]] = await pool.execute(
+    "SELECT COUNT(*) AS c FROM paper_orders WHERE account_id = (SELECT id FROM paper_accounts WHERE name='Default')"
+  );
+  const [[realDefTradesAfter]] = await pool.execute(
+    "SELECT COUNT(*) AS c FROM paper_trades WHERE account_id = (SELECT id FROM paper_accounts WHERE name='Default')"
+  );
+  assert(Number(realDefAfter.cash) === Number(realDefBefore.cash),
+    `Default.cash unchanged (${realDefBefore.cash} → ${realDefAfter.cash})`);
+  assert(Number(realDefAfter.initial_cash) === Number(realDefBefore.initial_cash),
+    `Default.initial_cash unchanged`);
+  assert(Number(realDefOrdersAfter.c) === Number(realDefOrdersBefore.c),
+    `Default paper_orders count unchanged (${realDefOrdersBefore.c} → ${realDefOrdersAfter.c})`);
+  assert(Number(realDefTradesAfter.c) === Number(realDefTradesBefore.c),
+    `Default paper_trades count unchanged (${realDefTradesBefore.c} → ${realDefTradesAfter.c})`);
+}
+
+// ── Test 11: Idempotent replay consistency (Bug #2) ──────────────────────
+// Place a LIMIT order (safer than MARKET — no market-hours dependency and a
+// deterministic PENDING state on both responses). Post-Option-B fix, both
+// responses must converge to the same `status`, `order_id`, and `filled_price`.
+//
+// The spec allowed a LIMIT-based fallback if MARKET is flaky. We use LIMIT
+// here because (a) MARKET requires RTH (test flakes weekends/nights) and
+// (b) for LIMIT, both responses see PENDING — we're asserting consistency,
+// not fill convergence. The FOR-UPDATE fence still exercises the new code
+// path; a full MARKET-fill convergence test is noted as the residual race
+// window mitigation in the buildIdempotentResponse comment.
+async function test11_idempotentReplayConsistency(defaultId) {
+  console.log("\nTest 11: Idempotent replay — duplicate POST converges to same state");
+  if (!(await isDevServerUp())) {
+    console.log("  SKIP (dev server not up at " + HTTP_BASE + ")");
+    return;
+  }
+
+  const clientRequestId = "smoke-w5-r2-replay-" + Date.now();
+  const body = {
+    symbol: "AAPL",
+    side: "BUY",
+    order_type: "LIMIT",
+    investment_usd: 500,
+    limit_price: 1.00, // well below market — stays PENDING
+    client_request_id: clientRequestId,
+  };
+
+  // Fire two POSTs simultaneously against the W5 test account (NOT real
+  // Default). Both should resolve to the same order_id and terminal status.
+  const qs = "?account_id=" + defaultId;
+  const [r1, r2] = await Promise.all([
+    httpJson("POST", "/api/paper/order" + qs, body),
+    httpJson("POST", "/api/paper/order" + qs, body),
+  ]);
+
+  assert(r1.status === 200, `first POST → 200 (got ${r1.status}, body=${JSON.stringify(r1.json)})`);
+  assert(r2.status === 200, `second POST → 200 (got ${r2.status}, body=${JSON.stringify(r2.json)})`);
+  const id1 = r1.json && r1.json.order_id;
+  const id2 = r2.json && r2.json.order_id;
+  assert(id1 && id2 && id1 === id2,
+    `both POSTs return same order_id (got ${id1} vs ${id2})`);
+  assert(r1.json.status === r2.json.status,
+    `both POSTs return same status (got '${r1.json.status}' vs '${r2.json.status}')`);
+
+  // Clean up the LIMIT order (teardown() below also wipes the test account).
+  if (id1) {
+    await httpJson("DELETE", "/api/paper/order?id=" + id1);
+  }
+}
+
 (async () => {
   let defaultId, alt1Id;
   try {
@@ -352,6 +513,8 @@ async function test9_getAccountById(alt1Id) {
     await test7_resetScope(defaultId, alt1Id);
     await test8_uniqueNameEnforcement();
     await test9_getAccountById(alt1Id);
+    await test10_httpAccountNotFound(defaultId);
+    await test11_idempotentReplayConsistency(defaultId);
 
     console.log(`\n== SUMMARY: ${passed} passed, ${failed} failed ==`);
     if (failed > 0) {

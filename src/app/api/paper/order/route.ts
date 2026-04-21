@@ -4,6 +4,7 @@ import { ensureSchema } from "@/lib/migrations";
 import {
   fetchLivePrice,
   resolveAccount,
+  AccountNotFoundError,
   SYMBOL_RE,
 } from "@/lib/paper";
 import {
@@ -71,28 +72,52 @@ type PoolType = Awaited<ReturnType<typeof getPool>>;
  * the exact same `success: true, order_id: N` it got the first time. Reads
  * enough of the row to mirror the normal POST response including `status`,
  * `filled_price`, `trade_id`.
+ *
+ * W5 round-2 (Bug #2 fix — Option B): the SELECT runs inside a short
+ * transaction with `FOR UPDATE` so that if the original request's
+ * `fillOrder` is still in-flight (holds an X-lock on this row), we BLOCK
+ * until it commits. This flips the replay from returning stale `PENDING`
+ * to returning the final post-fill state (usually `FILLED` for MARKET).
+ *
+ * Residual race window (~milliseconds): if the replay's FOR UPDATE SELECT
+ * runs BEFORE the original request has begun fillOrder's transaction
+ * (i.e. after INSERT but before `conn.beginTransaction()` inside
+ * fillOrder), the replay will see PENDING. In practice the window is the
+ * time between the INSERT commit and the next line of code; the client's
+ * retry must land inside that window. We accept this as the documented
+ * best-effort mitigation — the task spec explicitly calls this out.
  */
 async function buildIdempotentResponse(
   pool: PoolType,
   orderId: number
 ) {
-  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT status, filled_price, rejection_reason, trade_id FROM paper_orders WHERE id = ?",
-    [orderId]
-  );
-  if (rows.length === 0) {
-    return NextResponse.json({ error: "order vanished mid-request" }, { status: 500 });
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+      "SELECT status, filled_price, rejection_reason, trade_id FROM paper_orders WHERE id = ? FOR UPDATE",
+      [orderId]
+    );
+    await conn.commit();
+    if (rows.length === 0) {
+      return NextResponse.json({ error: "order vanished mid-request" }, { status: 500 });
+    }
+    const r = rows[0];
+    return NextResponse.json({
+      success: r.status === "FILLED" || r.status === "PENDING",
+      order_id: orderId,
+      status: r.status,
+      filled_price: r.filled_price != null ? Number(r.filled_price) : null,
+      rejection_reason: r.rejection_reason,
+      trade_id: r.trade_id,
+      idempotent_replay: true,
+    });
+  } catch (err) {
+    try { await conn.rollback(); } catch { /* ignore */ }
+    throw err;
+  } finally {
+    conn.release();
   }
-  const r = rows[0];
-  return NextResponse.json({
-    success: r.status === "FILLED" || r.status === "PENDING",
-    order_id: orderId,
-    status: r.status,
-    filled_price: r.filled_price != null ? Number(r.filled_price) : null,
-    rejection_reason: r.rejection_reason,
-    trade_id: r.trade_id,
-    idempotent_replay: true,
-  });
 }
 
 /**
@@ -190,7 +215,15 @@ export async function POST(req: Request) {
     }
 
     const pool = await getPool();
-    const account = await resolveAccount(accountIdParam);
+    let account;
+    try {
+      account = await resolveAccount(accountIdParam);
+    } catch (err) {
+      if (err instanceof AccountNotFoundError) {
+        return NextResponse.json({ error: "Account not found" }, { status: 404 });
+      }
+      throw err;
+    }
 
     // For MARKET close: verify an open position of the correct side exists
     // up-front so the user sees an immediate error. Account/side match is

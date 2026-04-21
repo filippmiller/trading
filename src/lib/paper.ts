@@ -164,20 +164,49 @@ export async function listPaperAccounts(): Promise<PaperAccount[]> {
 }
 
 /**
+ * W5 round-2 — thrown by `resolveAccount` when the caller passed an explicit
+ * account_id that doesn't match any row. Used to let routes return 404
+ * instead of silently falling back to Default. Silent fallback was a data-
+ * loss hazard: stale localStorage pointing at a deleted account + user
+ * clicks Reset → wipes Default instead of 404'ing.
+ */
+export class AccountNotFoundError extends Error {
+  readonly accountId: number;
+  constructor(accountId: number) {
+    super(`Account ${accountId} not found`);
+    this.name = "AccountNotFoundError";
+    this.accountId = accountId;
+  }
+}
+
+/**
  * W5 — resolve the account to operate on. Honors an optional `account_id`
- * query param (from `?account_id=<n>`); falls back to the Default account
- * when the param is absent or points at a non-existent row. Backward-compat:
- * any caller that doesn't thread account_id through keeps getting Default,
- * so existing cron + background paths don't break.
+ * query param (from `?account_id=<n>`).
+ *
+ * Semantics:
+ *   - `null` / empty / missing param → Default account (backward compat;
+ *     cron + background paths that don't thread account_id still work).
+ *   - Numeric param matching an existing row → that account.
+ *   - Numeric param with no matching row → throws `AccountNotFoundError`
+ *     so callers can return 404. (Round-2 fix: previously fell through to
+ *     Default, which let a stale client-side account_id wipe Default on
+ *     reset.)
+ *   - Non-numeric / garbage param → throws `AccountNotFoundError` as well;
+ *     only `null`/empty triggers the Default fallback.
  */
 export async function resolveAccount(
   accountIdParam: string | null
 ): Promise<PaperAccount> {
-  if (accountIdParam && /^\d+$/.test(accountIdParam)) {
-    const acct = await getAccountById(Number(accountIdParam));
-    if (acct) return acct;
+  if (accountIdParam == null || accountIdParam === "") {
+    return getDefaultAccount();
   }
-  return getDefaultAccount();
+  if (!/^\d+$/.test(accountIdParam)) {
+    throw new AccountNotFoundError(NaN);
+  }
+  const id = Number(accountIdParam);
+  const acct = await getAccountById(id);
+  if (!acct) throw new AccountNotFoundError(id);
+  return acct;
 }
 
 export type PositionMark = {

@@ -6,6 +6,7 @@ import {
   resolveAccount,
   computeAccountEquity,
   fillPendingOrders,
+  AccountNotFoundError,
 } from "@/lib/paper";
 
 /**
@@ -25,7 +26,15 @@ export async function GET(req: Request) {
     await ensureSchema();
     const pool = await getPool();
     const accountIdParam = new URL(req.url).searchParams.get("account_id");
-    const account = await resolveAccount(accountIdParam);
+    let account;
+    try {
+      account = await resolveAccount(accountIdParam);
+    } catch (err) {
+      if (err instanceof AccountNotFoundError) {
+        return NextResponse.json({ error: "Account not found" }, { status: 404 });
+      }
+      throw err;
+    }
 
     const filled = await fillPendingOrders();
 

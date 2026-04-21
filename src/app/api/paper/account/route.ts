@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getPool } from "@/lib/db";
 import { ensureSchema } from "@/lib/migrations";
-import { resolveAccount, computeAccountEquity } from "@/lib/paper";
+import { resolveAccount, computeAccountEquity, AccountNotFoundError } from "@/lib/paper";
 
 /**
  * GET /api/paper/account
@@ -14,7 +14,15 @@ export async function GET(req: Request) {
   try {
     await ensureSchema();
     const accountIdParam = new URL(req.url).searchParams.get("account_id");
-    const account = await resolveAccount(accountIdParam);
+    let account;
+    try {
+      account = await resolveAccount(accountIdParam);
+    } catch (err) {
+      if (err instanceof AccountNotFoundError) {
+        return NextResponse.json({ error: "Account not found" }, { status: 404 });
+      }
+      throw err;
+    }
     const equity = await computeAccountEquity(account.id);
     return NextResponse.json({
       id: account.id,
@@ -56,7 +64,18 @@ export async function POST(req: Request) {
       : null;
 
     const pool = await getPool();
-    const account = await resolveAccount(accountIdParam);
+    let account;
+    try {
+      account = await resolveAccount(accountIdParam);
+    } catch (err) {
+      if (err instanceof AccountNotFoundError) {
+        // Critical: reset on a stale/deleted account_id MUST NOT silently
+        // fall through to Default. Returning 404 here is what prevents the
+        // "wiped Default" data-loss scenario.
+        return NextResponse.json({ error: "Account not found" }, { status: 404 });
+      }
+      throw err;
+    }
 
     // Clear trades and orders SCOPED to the targeted account — W5 acceptance:
     // resetting "Alt1" must leave Default's data untouched.
