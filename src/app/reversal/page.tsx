@@ -31,9 +31,11 @@ import {
   type PerTickerResult,
   type PerSnapshotResult,
   type ScenarioReport,
+  type RecurrenceInfo,
   evaluateScenario,
   summarizeScenario,
   compareAllScenarios,
+  computeRecurrences,
 } from "@/lib/matrix-scenarios";
 
 const DEFAULT_SETTINGS: ReversalSettings = {
@@ -116,6 +118,21 @@ export default function ReversalDashboard() {
       .filter(([, entries]) => entries.every(e => e.status === 'COMPLETED'))
       .sort(([a], [b]) => b.localeCompare(a));
     return sorted;
+  }, [cohorts]);
+
+  // F3: recurrence aggregation — which tickers have appeared across multiple
+  // cohort dates? Visible in ALL views (live, matrix, history) because the
+  // semantic is "how many times has this name been in the matrix", independent
+  // of any scenario.
+  const recurrences = useMemo(() => {
+    const allEntries = Object.values(cohorts).flat();
+    return computeRecurrences(allEntries.map(e => ({
+      symbol: e.symbol,
+      cohort_date: e.cohort_date,
+      direction: e.direction,
+      entry_price: Number(e.entry_price),
+      day_change_pct: Number(e.day_change_pct),
+    })));
   }, [cohorts]);
 
   return (
@@ -209,6 +226,7 @@ export default function ReversalDashboard() {
           <SurveillanceMatrix
             entries={Object.values(cohorts).flat()}
             settings={settings}
+            recurrences={recurrences}
           />
         ) : (
           <>
@@ -223,7 +241,7 @@ export default function ReversalDashboard() {
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                   {entries.map(entry => (
-                    <SurveillanceCard key={entry.id} entry={entry} settings={settings} />
+                    <SurveillanceCard key={entry.id} entry={entry} settings={settings} recurrence={recurrences.get(entry.symbol) ?? null} />
                   ))}
                 </div>
               </div>
@@ -258,7 +276,7 @@ function KpiCard({ title, value, icon, description, color = "text-zinc-900" }: a
   );
 }
 
-function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings: any }) {
+function SurveillanceCard({ entry, settings, recurrence }: { entry: ReversalEntry, settings: any, recurrence?: RecurrenceInfo | null }) {
   const pnl = calculateEntryPnL(entry, settings);
   
   const points = [];
@@ -279,6 +297,7 @@ function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings:
           <div>
             <div className="flex items-center gap-2">
               <h3 className="text-lg font-bold text-zinc-900">{entry.symbol}</h3>
+              {recurrence && recurrence.count >= 2 && <RecurrenceBadge info={recurrence} />}
               <Badge className="text-[10px] font-mono border-zinc-200 bg-white">
                 {entry.consecutive_days}D Trend
               </Badge>
@@ -334,6 +353,65 @@ function SurveillanceCard({ entry, settings }: { entry: ReversalEntry, settings:
   );
 }
 
+/**
+ * F3: Recurrence badge — small purple pill that flags tickers which have been
+ * re-enrolled across multiple cohort dates ("aggressive-swing" names). On
+ * hover, shows a tooltip with each appearance: date, direction, entry price,
+ * day change %.
+ *
+ * Only rendered when count >= 2 (decided by the caller).
+ */
+function RecurrenceBadge({ info }: { info: RecurrenceInfo }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <span
+      className="relative inline-flex items-center"
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      data-testid="recurrence-badge"
+    >
+      <span
+        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-purple-100 text-purple-700 ring-1 ring-purple-200 cursor-help"
+        title={`This ticker has been in the matrix ${info.count} times`}
+      >
+        <span className="text-purple-500">◉</span>
+        {info.count}
+      </span>
+      {open && (
+        <div className="absolute z-40 top-full left-0 mt-1 p-2 bg-white ring-1 ring-zinc-200 rounded-md shadow-lg min-w-[220px]">
+          <div className="text-[9px] font-bold uppercase tracking-wider text-zinc-500 mb-1">
+            Appearances ({info.count})
+          </div>
+          <table className="w-full text-[10px] font-mono">
+            <thead>
+              <tr className="text-zinc-400 border-b border-zinc-100">
+                <th className="text-left py-0.5 pr-2 font-normal">Cohort</th>
+                <th className="text-left py-0.5 pr-2 font-normal">Dir</th>
+                <th className="text-right py-0.5 pr-2 font-normal">Entry</th>
+                <th className="text-right py-0.5 font-normal">Day %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {info.appearances.map((a) => (
+                <tr key={a.cohortDate} className="border-b border-zinc-50 last:border-b-0">
+                  <td className="py-0.5 pr-2 text-zinc-700">{a.cohortDate}</td>
+                  <td className={`py-0.5 pr-2 ${a.direction === 'LONG' ? 'text-emerald-600' : 'text-rose-600'}`}>
+                    {a.direction}
+                  </td>
+                  <td className="py-0.5 pr-2 text-right text-zinc-700">${a.entryPrice.toFixed(2)}</td>
+                  <td className={`py-0.5 text-right ${a.dayChangePct >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                    {a.dayChangePct >= 0 ? '+' : ''}{a.dayChangePct.toFixed(1)}%
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </span>
+  );
+}
+
 /** Compute trading days offset from a date (skips weekends) */
 function addBusinessDays(dateStr: string, days: number): string {
   const d = new Date(dateStr + 'T12:00:00Z');
@@ -371,12 +449,23 @@ function entryToScenarioInput(entry: ReversalEntry): ScenarioTickerInput {
   };
 }
 
-function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], settings: any }) {
+function SurveillanceMatrix({ entries, settings, recurrences }: { entries: ReversalEntry[], settings: any, recurrences: Map<string, RecurrenceInfo> }) {
   const [sideFilter, setSideFilter] = useState<'all' | 'gainers' | 'losers'>(() => {
     if (typeof window === 'undefined') return 'all';
     const q = new URLSearchParams(window.location.search).get('filter');
     return q === 'gainers' || q === 'losers' ? q : 'all';
   });
+
+  // --- F1: cohort-date filter state --------------------------------------
+  // List of cohort dates present in the data (derived further down); selection
+  // persists across scenario/side-filter changes. When everything is checked
+  // (default) behaviour is identical to v1.
+  const [selectedCohortDates, setSelectedCohortDates] = useState<Set<string> | null>(null);
+
+  // --- F2: individual-ticker filter state ---------------------------------
+  // A selection of enrollment row ids (matrix row = one (symbol, cohort_date)
+  // enrollment). null = "no explicit selection" = all rows on.
+  const [selectedRowIds, setSelectedRowIds] = useState<Set<number> | null>(null);
 
   // --- Scenario overlay state ---------------------------------------------
   // Collapsed by default so existing UX is unchanged until the user opts in.
@@ -419,12 +508,66 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
     return Object.entries(map).sort(([a], [b]) => b.localeCompare(a));
   }, [entries, sideFilter]);
 
+  // All cohort dates present in the currently-displayed matrix (side-filter aware).
+  // When F1 state is null we treat "all dates checked" as the default.
+  const allCohortDates = useMemo(() => grouped.map(([d]) => d), [grouped]);
+
   // Use the first cohort date for header dates (they shift per cohort, but header is generic)
   const refDate = grouped[0]?.[0] || new Date().toISOString().slice(0, 10);
 
-  // Scenario evaluation over the currently-filtered cohort. Recomputes only
-  // when a scenario is applied or inputs/entries change.
-  const visibleEntries = useMemo(() => grouped.flatMap(([, arr]) => arr), [grouped]);
+  // F1+F2: compute the "effective sample" — entries that pass both the cohort-date
+  // check (F1) AND the per-row check (F2). Single source of truth for both the
+  // scenario evaluator AND the report, so the counts never diverge.
+  const effectiveEntries = useMemo(() => {
+    const allVisible = grouped.flatMap(([, arr]) => arr);
+    return allVisible.filter(e => {
+      const d = typeof e.cohort_date === 'string' ? e.cohort_date.slice(0, 10) : new Date(e.cohort_date).toISOString().slice(0, 10);
+      if (selectedCohortDates && !selectedCohortDates.has(d)) return false;
+      if (selectedRowIds && !selectedRowIds.has(e.id)) return false;
+      return true;
+    });
+  }, [grouped, selectedCohortDates, selectedRowIds]);
+
+  // Kept for back-compat with existing modal/comparison code; now points at
+  // the effective (post-F1/F2) sample so scenario results reflect the filters.
+  const visibleEntries = effectiveEntries;
+
+  // Row-selection helpers for F2 — expose full visible ID list so Select Visible / Clear work.
+  const allVisibleRowIds = useMemo(() => grouped.flatMap(([, arr]) => arr.map(e => e.id)), [grouped]);
+
+  // Flag: is any filter narrowing the default sample? Used to switch between
+  // "all" / "narrowed" language in the panel + to prevent rendering the report
+  // when zero rows are selected.
+  const hasNarrowingFilter =
+    (selectedCohortDates !== null && selectedCohortDates.size < allCohortDates.length) ||
+    (selectedRowIds !== null && selectedRowIds.size < allVisibleRowIds.length);
+
+  // F1/F2 selection helpers — these mutate Sets so callers can pass a single handler.
+  const toggleCohortDate = (d: string) => {
+    setSelectedCohortDates(prev => {
+      const base = prev ?? new Set(allCohortDates);
+      const next = new Set(base);
+      if (next.has(d)) next.delete(d); else next.add(d);
+      return next;
+    });
+  };
+  const selectAllCohortDates = () => setSelectedCohortDates(null); // null = all
+  const selectNoCohortDates = () => setSelectedCohortDates(new Set());
+  const isCohortDateChecked = (d: string) =>
+    selectedCohortDates === null ? true : selectedCohortDates.has(d);
+
+  const toggleRowId = (id: number) => {
+    setSelectedRowIds(prev => {
+      const base = prev ?? new Set(allVisibleRowIds);
+      const next = new Set(base);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const selectVisibleRows = () => setSelectedRowIds(null); // null = all
+  const clearRowSelection = () => setSelectedRowIds(new Set());
+  const isRowChecked = (id: number) =>
+    selectedRowIds === null ? true : selectedRowIds.has(id);
 
   const scenarioResults = useMemo(() => {
     if (!applied) return null;
@@ -468,6 +611,9 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
 
   const applyScenario = () => {
     if (!(investment > 0) || !(leverage >= 1)) return;
+    // Guard: don't apply with an empty selection — prevents division-by-zero
+    // in the report and makes the "no tickers selected" state visible to the user.
+    if (effectiveEntries.length === 0) return;
     setApplied({ id: scenarioId, investment, leverage });
   };
 
@@ -490,6 +636,16 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
         onClear={clearOverlay}
         onOpenReport={() => setReportOpen(true)}
         report={report}
+        allCohortDates={allCohortDates}
+        isCohortDateChecked={isCohortDateChecked}
+        toggleCohortDate={toggleCohortDate}
+        selectAllCohortDates={selectAllCohortDates}
+        selectNoCohortDates={selectNoCohortDates}
+        effectiveCount={effectiveEntries.length}
+        totalCount={allVisibleRowIds.length}
+        onSelectVisibleRows={selectVisibleRows}
+        onClearRowSelection={clearRowSelection}
+        hasNarrowingFilter={hasNarrowingFilter}
       />
       <div className="px-3 py-2 bg-zinc-50 border-b border-zinc-100 flex items-center justify-between gap-4 flex-wrap">
         <div className="inline-flex items-center gap-1 rounded-lg bg-white ring-1 ring-zinc-200 p-0.5">
@@ -546,7 +702,8 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
         <table className="border-collapse text-xs" style={{ minWidth: '2400px' }}>
           <thead className="sticky top-0 z-20">
             <tr className="bg-zinc-800 text-zinc-300">
-              <th className="sticky left-0 z-30 bg-zinc-800 px-3 py-2 text-left text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[120px]">Ticker</th>
+              <th className="sticky left-0 z-30 bg-zinc-800 px-2 py-2 text-center text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 w-[32px]" title="F2: select which tickers are included in the scenario analysis">✓</th>
+              <th className="sticky left-[32px] z-30 bg-zinc-800 px-3 py-2 text-left text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[120px]">Ticker</th>
               <th className="px-2 py-2 text-right text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[70px]">Entry $</th>
               <th className="px-2 py-2 text-right text-[10px] font-bold uppercase tracking-widest border-r border-zinc-700 min-w-[55px]">Trigger</th>
               {Array.from({ length: 10 }).map((_, d) => (
@@ -557,6 +714,7 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
             </tr>
             <tr className="bg-zinc-700 text-zinc-400">
               <th className="sticky left-0 z-30 bg-zinc-700 border-r border-zinc-600" />
+              <th className="sticky left-[32px] z-30 bg-zinc-700 border-r border-zinc-600" />
               <th className="border-r border-zinc-600" />
               <th className="border-r border-zinc-600" />
               {Array.from({ length: 10 }).map((_, d) => (
@@ -571,7 +729,7 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
           <tbody>
             {grouped.length === 0 && (
               <tr>
-                <td colSpan={33} className="px-6 py-16 text-center text-zinc-400 text-xs">
+                <td colSpan={34} className="px-6 py-16 text-center text-zinc-400 text-xs">
                   No {sideFilter === 'gainers' ? 'gainers' : sideFilter === 'losers' ? 'losers' : 'entries'} in the current data.
                   {sideFilter !== 'all' && (
                     <button onClick={() => setSideFilter('all')} className="ml-2 underline text-zinc-600 hover:text-zinc-900">
@@ -584,7 +742,16 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
             {grouped.map(([date, group]) => (
               <React.Fragment key={date}>
                 <tr className="bg-zinc-100">
-                  <td className="sticky left-0 z-10 bg-zinc-100 px-3 py-1.5 text-[10px] font-bold text-zinc-500 uppercase tracking-widest font-mono border-r border-zinc-200">
+                  <td className="sticky left-0 z-10 bg-zinc-100 px-2 py-1.5 text-center border-r border-zinc-200 w-[32px]">
+                    <input
+                      type="checkbox"
+                      checked={isCohortDateChecked(date)}
+                      onChange={() => toggleCohortDate(date)}
+                      title="F1: include this cohort date in the scenario analysis"
+                      className="h-3 w-3 accent-indigo-600 cursor-pointer"
+                    />
+                  </td>
+                  <td className="sticky left-[32px] z-10 bg-zinc-100 px-3 py-1.5 text-[10px] font-bold text-zinc-500 uppercase tracking-widest font-mono border-r border-zinc-200">
                     {date}
                     <span className="ml-2 text-zinc-400 font-normal">{group.length} tickers</span>
                   </td>
@@ -604,9 +771,22 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
                   const dimmed = applied !== null && perTicker !== null && !perTicker.matches;
                   // Direction in scenario mode comes from the overlay, not entry.direction.
                   const scnDirection = perTicker?.direction ?? 0;
+                  const recurrence = recurrences.get(entry.symbol) ?? null;
+                  // F2 visual cue: unchecked rows de-emphasize so users see what's in scope.
+                  const rowUnchecked = !isRowChecked(entry.id);
+                  const rowOpacityCls = rowUnchecked ? 'opacity-40' : dimmed ? 'opacity-40' : '';
                   return (
-                  <tr key={entry.id} className={`hover:bg-amber-50/30 transition-colors border-b border-zinc-100 ${dimmed ? 'opacity-40' : ''}`}>
-                    <td className="sticky left-0 z-10 bg-white px-3 py-2 font-bold border-r border-zinc-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
+                  <tr key={entry.id} className={`hover:bg-amber-50/30 transition-colors border-b border-zinc-100 ${rowOpacityCls}`}>
+                    <td className="sticky left-0 z-10 bg-white px-2 py-2 text-center border-r border-zinc-100 w-[32px]">
+                      <input
+                        type="checkbox"
+                        checked={isRowChecked(entry.id)}
+                        onChange={() => toggleRowId(entry.id)}
+                        title={`F2: include ${entry.symbol} in the scenario analysis`}
+                        className="h-3 w-3 accent-indigo-600 cursor-pointer"
+                      />
+                    </td>
+                    <td className="sticky left-[32px] z-10 bg-white px-3 py-2 font-bold border-r border-zinc-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
                       <div className="flex items-center gap-1.5">
                         {applied ? (
                           <span className={`inline-block w-1.5 h-1.5 rounded-full ${scnDirection === 1 ? 'bg-emerald-500' : scnDirection === -1 ? 'bg-rose-500' : 'bg-zinc-300'}`} />
@@ -614,6 +794,7 @@ function SurveillanceMatrix({ entries, settings }: { entries: ReversalEntry[], s
                           <span className={`inline-block w-1.5 h-1.5 rounded-full ${entry.direction === 'LONG' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
                         )}
                         <span>{entry.symbol}</span>
+                        {recurrence && recurrence.count >= 2 && <RecurrenceBadge info={recurrence} />}
                         <span className="text-[8px] text-zinc-400 font-normal">
                           {applied
                             ? (scnDirection === 1 ? 'buy' : scnDirection === -1 ? 'short' : 'n/a')
@@ -707,7 +888,8 @@ function MatrixCell({
     if (liq) {
       return (
         <td className={`px-1 py-1 text-center font-mono cursor-default ${border} bg-black text-white`}
-            title={`${entry.symbol} — LIQUIDATED @ ${dayLabel}\nInvestment wiped (-100%).`}>
+            title={`${entry.symbol} — LIQUIDATED @ ${dayLabel}\nPrice: $${price.toFixed(2)}  Entry: $${entry.entry_price.toFixed(2)}\nInvestment wiped (-100%).`}>
+          <div className="text-[9px] font-semibold text-zinc-300">${price.toFixed(0)}</div>
           <div className="text-[9px] font-bold">LIQ</div>
           <div className="text-[8px] text-red-300">-${Math.abs(pnlUsd).toFixed(0)}</div>
         </td>
@@ -726,6 +908,7 @@ function MatrixCell({
     ].join('\n');
     return (
       <td className={`px-1 py-1 text-center font-mono cursor-default ${border}`} style={{ backgroundColor: bg }} title={tooltip}>
+        <div className="text-[10px] font-semibold text-zinc-700">${price.toFixed(0)}</div>
         <div className={`text-[10px] font-semibold ${isProfit ? 'text-emerald-800' : 'text-rose-800'}`}>
           {pnlUsd >= 0 ? '+' : ''}${pnlUsd.toFixed(0)}
         </div>
@@ -791,6 +974,16 @@ function ScenarioPanel({
   onClear,
   onOpenReport,
   report,
+  allCohortDates,
+  isCohortDateChecked,
+  toggleCohortDate,
+  selectAllCohortDates,
+  selectNoCohortDates,
+  effectiveCount,
+  totalCount,
+  onSelectVisibleRows,
+  onClearRowSelection,
+  hasNarrowingFilter,
 }: {
   open: boolean;
   onToggle: () => void;
@@ -805,8 +998,19 @@ function ScenarioPanel({
   onClear: () => void;
   onOpenReport: () => void;
   report: ScenarioReport | null;
+  allCohortDates: string[];
+  isCohortDateChecked: (d: string) => boolean;
+  toggleCohortDate: (d: string) => void;
+  selectAllCohortDates: () => void;
+  selectNoCohortDates: () => void;
+  effectiveCount: number;
+  totalCount: number;
+  onSelectVisibleRows: () => void;
+  onClearRowSelection: () => void;
+  hasNarrowingFilter: boolean;
 }) {
   const current = SCENARIOS.find((s) => s.id === scenarioId);
+  const emptySelection = effectiveCount === 0;
 
   if (!open) {
     return (
@@ -891,7 +1095,9 @@ function ScenarioPanel({
         </label>
         <button
           onClick={onApply}
-          className="text-xs px-4 py-1.5 rounded-md bg-indigo-600 text-white font-semibold hover:bg-indigo-700 shadow-sm"
+          disabled={emptySelection}
+          title={emptySelection ? 'No tickers selected — pick at least one ticker or cohort date' : undefined}
+          className={`text-xs px-4 py-1.5 rounded-md font-semibold shadow-sm ${emptySelection ? 'bg-zinc-200 text-zinc-400 cursor-not-allowed' : 'bg-indigo-600 text-white hover:bg-indigo-700'}`}
         >
           Apply
         </button>
@@ -914,6 +1120,65 @@ function ScenarioPanel({
       {current && (
         <p className="mt-2 text-[10px] text-zinc-500 italic">{current.description}</p>
       )}
+
+      {/* F1: cohort date selection */}
+      <div className="mt-3 border-t border-indigo-100/80 pt-3">
+        <div className="flex items-center flex-wrap gap-x-3 gap-y-1">
+          <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">Cohort dates</span>
+          <button
+            onClick={selectAllCohortDates}
+            className="text-[10px] text-indigo-600 hover:text-indigo-800 underline"
+          >
+            Select all
+          </button>
+          <button
+            onClick={selectNoCohortDates}
+            className="text-[10px] text-indigo-600 hover:text-indigo-800 underline"
+          >
+            Select none
+          </button>
+          {allCohortDates.length === 0 && (
+            <span className="text-[10px] text-zinc-400 italic">no dates loaded</span>
+          )}
+        </div>
+        <div className="flex flex-wrap gap-2 mt-2">
+          {allCohortDates.map((d) => (
+            <label
+              key={d}
+              className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-mono cursor-pointer border transition-colors ${isCohortDateChecked(d) ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-zinc-200 text-zinc-400'}`}
+            >
+              <input
+                type="checkbox"
+                checked={isCohortDateChecked(d)}
+                onChange={() => toggleCohortDate(d)}
+                className="h-3 w-3 accent-indigo-600"
+              />
+              {d}
+            </label>
+          ))}
+        </div>
+      </div>
+
+      {/* F2: ticker selection bulk actions + effective-sample readout */}
+      <div className="mt-3 flex items-center flex-wrap gap-x-4 gap-y-1">
+        <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-500">Ticker selection</span>
+        <button
+          onClick={onSelectVisibleRows}
+          className="text-[10px] text-indigo-600 hover:text-indigo-800 underline"
+        >
+          Select visible
+        </button>
+        <button
+          onClick={onClearRowSelection}
+          className="text-[10px] text-indigo-600 hover:text-indigo-800 underline"
+        >
+          Clear selection
+        </button>
+        <span className={`text-[10px] font-mono ${emptySelection ? 'text-rose-600 font-semibold' : 'text-zinc-500'}`}>
+          {emptySelection ? 'No tickers selected' : `Sample: ${effectiveCount} / ${totalCount}`}
+          {hasNarrowingFilter && !emptySelection && <span className="ml-1 text-indigo-600">(filtered)</span>}
+        </span>
+      </div>
     </div>
   );
 }
