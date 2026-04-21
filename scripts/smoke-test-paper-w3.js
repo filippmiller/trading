@@ -438,6 +438,63 @@ async function test8_orderModify(accountId) {
   assert(adjAfter.ok === false, `adjustReservation on non-PENDING rejected (got ${JSON.stringify(adjAfter)})`);
 }
 
+// ── Test H1 (hotfix #1): partial close then auto-exit — pnl_pct consistent ─
+async function testH1_partialThenAutoExit(accountId) {
+  console.log("\nTest H1 (hotfix #1): partial-close then auto-exit keeps pnl_pct consistent");
+  await pool.execute("DELETE FROM paper_trades WHERE account_id = ?", [accountId]);
+  await pool.execute("DELETE FROM paper_orders WHERE account_id = ?", [accountId]);
+  await pool.execute("UPDATE paper_accounts SET cash = ?, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?", [TEST_INITIAL_CASH, accountId]);
+
+  // Open LONG with $1000 investment at $100 → qty 10.
+  const buyOrder = await insertOrder(accountId, "WTST", "BUY", "LONG", "MARKET", {
+    investment_usd: 1000, bracket_stop_loss_pct: 5, // stop at $95
+  });
+  const buyFill = await paperFill.fillOrder(pool, buyOrder, 100);
+  assert(buyFill.filled === true, `H1 open`);
+  assert(Math.abs(buyFill.quantity - 10) < PRECISION_EPS, `H1 qty = 10`);
+
+  // Partial close 4 at $110 → slice pnl = 4*10 = +$40, closed_quantity=4, remaining=6.
+  const partial = await insertOrder(accountId, "WTST", "SELL", "LONG", "MARKET", {
+    trade_id: buyFill.tradeId, close_quantity: 4,
+  });
+  const partialFill = await paperFill.fillOrder(pool, partial, 110);
+  assert(partialFill.filled === true, `H1 partial fill`);
+  assert(Math.abs(partialFill.pnlUsd - 40) < PRECISION_EPS, `H1 partial pnl = +$40 (got ${partialFill.pnlUsd})`);
+  assert(partialFill.remainingQuantity === 6, `H1 remaining = 6 (got ${partialFill.remainingQuantity})`);
+
+  // Trigger auto-exit (stop) at $105 (above the stop but we force via
+  // applyExitDecisionToTrade to model the auto-exit path regardless of
+  // evaluateExits logic). This remaining 6 at $105 vs entry $100 → slice pnl
+  // = 6*5 = +$30. Total pnl across both legs = $40 + $30 = +$70.
+  // pnl_pct must be 70/1000*100 = 7.0, NOT the buggy slice value 30/600*100 = 5.0.
+  const [rows] = await pool.execute("SELECT * FROM paper_trades WHERE id = ?", [buyFill.tradeId]);
+  const trade = rows[0];
+  const input = paperExits.inputsFromTradeRow(trade, null, null);
+  // Force a HARD_STOP decision synthetically — we just need the apply path.
+  const decision = {
+    reason: "HARD_STOP",
+    closePrice: 105,
+    watermarks: {
+      maxPnlPct: Number(trade.max_pnl_pct ?? 0),
+      minPnlPct: Number(trade.min_pnl_pct ?? 0),
+      trailingActive: Boolean(trade.trailing_active),
+      trailingStopPrice: trade.trailing_stop_price != null ? Number(trade.trailing_stop_price) : null,
+    },
+  };
+  const applied = await paperExits.applyExitDecisionToTrade(pool, buyFill.tradeId, 105, decision);
+  assert(applied.closed === true, `H1 auto-exit closed`);
+
+  // Read final pnl_usd and pnl_pct.
+  const [finalRows] = await pool.execute("SELECT status, pnl_usd, pnl_pct, investment_usd FROM paper_trades WHERE id = ?", [buyFill.tradeId]);
+  const f = finalRows[0];
+  assert(f.status === "CLOSED", `H1 status = CLOSED (got ${f.status})`);
+  assert(Math.abs(Number(f.pnl_usd) - 70) < PRECISION_EPS, `H1 pnl_usd = $70 (got ${f.pnl_usd})`);
+  // The WHOLE point of the hotfix: pnl_pct must be relative to the ORIGINAL
+  // full investment ($1000), giving 7.0%. The bug would write 5.0% (derived
+  // from the remaining slice's investmentShare = $600).
+  assert(Math.abs(Number(f.pnl_pct) - 7.0) < 1e-3, `H1 pnl_pct = 7.0 (got ${f.pnl_pct}) — must be total/investment, not slice-based`);
+}
+
 // ── Test 9b: PF2 — duplicate SHORT position rejection ────────────────────
 async function test9b_duplicateShort(accountId) {
   console.log("\nTest 9b: PF2 — second SHORT on same (account, symbol) rejected as DUPLICATE_SHORT_POSITION");
@@ -529,6 +586,7 @@ async function test9_invariant(accountId) {
     await test6_timeExit(accountId);
     await test7_partialClose(accountId);
     await test8_orderModify(accountId);
+    await testH1_partialThenAutoExit(accountId);
     await test9b_duplicateShort(accountId);
     await test9_invariant(accountId);
 

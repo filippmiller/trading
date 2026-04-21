@@ -363,12 +363,18 @@ export async function applyExitDecisionToTrade(
     const pnlUsd = side === "SHORT"
       ? (entryPrice - currentPrice) * remaining
       : (currentPrice - entryPrice) * remaining;
-    const pnlPct = investmentShare > 0 ? (pnlUsd / investmentShare) * 100 : 0;
 
     // Mark CLOSED. Include accumulated pnl from any prior partial closes
     // (existing pnl_usd value) plus this final leg.
     const existingPnl = Number(trade.pnl_usd ?? 0);
     const finalPnl = existingPnl + pnlUsd;
+    // pnl_pct is ALWAYS measured against the full original investment in this
+    // project's model (matches paper-fill.ts:521 full-close path). If the user
+    // already partial-closed part of the position, `finalPnl` accumulates
+    // those realized legs; dividing by `investmentShare` (slice) would give a
+    // pct that's inconsistent with `finalPnl` (total). So divide by the full
+    // `investment`. See hotfix #1 (2026-04-21).
+    const finalPnlPct = investment > 0 ? (finalPnl / investment) * 100 : 0;
     // For LONG: sell_price = close. For SHORT: same — sell_price is the
     // closing (cover) price regardless of direction; the sign of pnl_usd
     // tells direction-aware profitability.
@@ -384,7 +390,7 @@ export async function applyExitDecisionToTrade(
       [
         currentPrice,
         finalPnl,
-        pnlPct,
+        finalPnlPct,
         decision.watermarks.maxPnlPct,
         decision.watermarks.minPnlPct,
         decision.watermarks.trailingActive ? 1 : 0,
