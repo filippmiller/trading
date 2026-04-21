@@ -108,32 +108,7 @@ export type PaperAccount = {
   created_at: string;
 };
 
-/** Fetch the default paper account, creating it if missing. */
-export async function getDefaultAccount(): Promise<PaperAccount> {
-  const pool = await getPool();
-  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT * FROM paper_accounts WHERE name = 'Default' LIMIT 1"
-  );
-  if (rows.length > 0) {
-    const r = rows[0];
-    return {
-      id: r.id,
-      name: r.name,
-      initial_cash: Number(r.initial_cash),
-      cash: Number(r.cash),
-      reserved_cash: Number(r.reserved_cash ?? 0),
-      reserved_short_margin: Number(r.reserved_short_margin ?? 0),
-      created_at: r.created_at,
-    };
-  }
-  await pool.execute(
-    "INSERT INTO paper_accounts (name, initial_cash, cash) VALUES ('Default', 100000, 100000)"
-  );
-  const [created] = await pool.execute<mysql.RowDataPacket[]>(
-    "SELECT * FROM paper_accounts WHERE name = 'Default' LIMIT 1"
-  );
-  if (created.length === 0) throw new Error("Failed to create default paper account");
-  const r = created[0];
+function rowToAccount(r: mysql.RowDataPacket): PaperAccount {
   return {
     id: r.id,
     name: r.name,
@@ -143,6 +118,95 @@ export async function getDefaultAccount(): Promise<PaperAccount> {
     reserved_short_margin: Number(r.reserved_short_margin ?? 0),
     created_at: r.created_at,
   };
+}
+
+/** Fetch the default paper account, creating it if missing. */
+export async function getDefaultAccount(): Promise<PaperAccount> {
+  const pool = await getPool();
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_accounts WHERE name = 'Default' LIMIT 1"
+  );
+  if (rows.length > 0) return rowToAccount(rows[0]);
+  await pool.execute(
+    "INSERT INTO paper_accounts (name, initial_cash, cash) VALUES ('Default', 100000, 100000)"
+  );
+  const [created] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_accounts WHERE name = 'Default' LIMIT 1"
+  );
+  if (created.length === 0) throw new Error("Failed to create default paper account");
+  return rowToAccount(created[0]);
+}
+
+/**
+ * W5 — multi-account. Fetch an account by id. Returns null if not found.
+ * Used by `resolveAccount` to honor the `?account_id=<n>` query param.
+ */
+export async function getAccountById(id: number): Promise<PaperAccount | null> {
+  const pool = await getPool();
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_accounts WHERE id = ? LIMIT 1",
+    [id]
+  );
+  return rows.length > 0 ? rowToAccount(rows[0]) : null;
+}
+
+/**
+ * W5 — list every paper account with basic info. Used by the account-switcher
+ * dropdown. Order: id ASC (so 'Default' — the first-created — tends to appear
+ * first in the UI).
+ */
+export async function listPaperAccounts(): Promise<PaperAccount[]> {
+  const pool = await getPool();
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+    "SELECT * FROM paper_accounts ORDER BY id ASC"
+  );
+  return rows.map(rowToAccount);
+}
+
+/**
+ * W5 round-2 — thrown by `resolveAccount` when the caller passed an explicit
+ * account_id that doesn't match any row. Used to let routes return 404
+ * instead of silently falling back to Default. Silent fallback was a data-
+ * loss hazard: stale localStorage pointing at a deleted account + user
+ * clicks Reset → wipes Default instead of 404'ing.
+ */
+export class AccountNotFoundError extends Error {
+  readonly accountId: number;
+  constructor(accountId: number) {
+    super(`Account ${accountId} not found`);
+    this.name = "AccountNotFoundError";
+    this.accountId = accountId;
+  }
+}
+
+/**
+ * W5 — resolve the account to operate on. Honors an optional `account_id`
+ * query param (from `?account_id=<n>`).
+ *
+ * Semantics:
+ *   - `null` / empty / missing param → Default account (backward compat;
+ *     cron + background paths that don't thread account_id still work).
+ *   - Numeric param matching an existing row → that account.
+ *   - Numeric param with no matching row → throws `AccountNotFoundError`
+ *     so callers can return 404. (Round-2 fix: previously fell through to
+ *     Default, which let a stale client-side account_id wipe Default on
+ *     reset.)
+ *   - Non-numeric / garbage param → throws `AccountNotFoundError` as well;
+ *     only `null`/empty triggers the Default fallback.
+ */
+export async function resolveAccount(
+  accountIdParam: string | null
+): Promise<PaperAccount> {
+  if (accountIdParam == null || accountIdParam === "") {
+    return getDefaultAccount();
+  }
+  if (!/^\d+$/.test(accountIdParam)) {
+    throw new AccountNotFoundError(NaN);
+  }
+  const id = Number(accountIdParam);
+  const acct = await getAccountById(id);
+  if (!acct) throw new AccountNotFoundError(id);
+  return acct;
 }
 
 export type PositionMark = {

@@ -438,6 +438,30 @@ async function runSchemaMigrations() {
     }
   }
 
+  // W5 (2026-04-21) — UX guardrails + multi-account.
+  //
+  // 1. paper_orders.client_request_id: client-generated idempotency key. A
+  //    POST /api/paper/order that carries the same id twice is a no-op — the
+  //    second call returns the existing row instead of inserting a duplicate.
+  //    Protects the engine from the "Buy button mashed twice" footgun.
+  // 2. UNIQUE INDEX on (client_request_id): enforces dedup at DB layer via
+  //    errno 1062. MySQL InnoDB allows multiple NULLs in a UNIQUE index, so
+  //    rows without an id stay unconstrained.
+  await ensureColumn("paper_orders", "client_request_id", "VARCHAR(64) NULL");
+  const [ridxRows] = await pool.execute<mysql.RowDataPacket[]>(
+    `SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME   = 'paper_orders'
+        AND INDEX_NAME   = 'idx_paper_orders_client_request_id'`
+  );
+  if ((ridxRows as IndexRow[]).length === 0) {
+    try {
+      await pool.execute("ALTER TABLE paper_orders ADD UNIQUE INDEX idx_paper_orders_client_request_id (client_request_id)");
+    } catch (err: unknown) {
+      if ((err as { errno?: number }).errno !== 1061) throw err;
+    }
+  }
+
   // Seed default paper account
   await pool.execute(
     "INSERT IGNORE INTO paper_accounts (name, initial_cash, cash) VALUES ('Default', 100000, 100000)"
