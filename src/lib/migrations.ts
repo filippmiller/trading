@@ -124,6 +124,7 @@ const schemaStatements = [
     name VARCHAR(64) NOT NULL DEFAULT 'Default',
     initial_cash DECIMAL(18,6) NOT NULL DEFAULT 100000,
     cash DECIMAL(18,6) NOT NULL DEFAULT 100000,
+    reserved_cash DECIMAL(18,6) NOT NULL DEFAULT 0,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     UNIQUE KEY UX_paper_account_name (name)
   ) ENGINE=InnoDB;`,
@@ -161,6 +162,7 @@ const schemaStatements = [
     filled_at DATETIME(6) NULL,
     trade_id INT NULL, -- linked paper_trade on fill
     rejection_reason VARCHAR(255) NULL,
+    reserved_amount DECIMAL(18,6) NOT NULL DEFAULT 0, -- cash held against this order while PENDING
     notes TEXT NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     INDEX IX_paper_orders_account (account_id),
@@ -247,6 +249,8 @@ const ALLOWED_TABLES = new Set([
   "reversal_entries",
   "paper_trades",
   "paper_signals",
+  "paper_accounts",
+  "paper_orders",
 ]);
 const COLUMN_REGEX = /^[a-z_][a-z0-9_]{0,63}$/;
 
@@ -318,6 +322,15 @@ async function runSchemaMigrations() {
   // Add account_id and quantity to existing paper_trades rows (created before the simulator)
   await ensureColumn("paper_trades", "account_id", "INT NULL");
   await ensureColumn("paper_trades", "quantity", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+
+  // W1 (2026-04-21) — cash reservation for PENDING LIMIT/STOP BUYs. When an
+  // order is submitted it atomically debits `cash` into `reserved_cash`; on
+  // fill / cancel / reject that amount is released. This is what prevents the
+  // classic overdraft race where a user queues 20 x $10k LIMIT BUYs on a
+  // $100k account, every symbol triggers, and the naive `cash >= investment`
+  // check passes for all 20.
+  await ensureColumn("paper_accounts", "reserved_cash", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+  await ensureColumn("paper_orders", "reserved_amount", "DECIMAL(18,6) NOT NULL DEFAULT 0");
 
   // Seed default paper account
   await pool.execute(

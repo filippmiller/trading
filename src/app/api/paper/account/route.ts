@@ -17,10 +17,14 @@ export async function GET() {
       name: account.name,
       initial_cash: account.initial_cash,
       cash: equity.cash,
+      reserved_cash: equity.reserved_cash,
       positions_value: equity.positions_value,
       equity: equity.equity,
       open_positions: equity.open_positions,
-      total_return_pct: ((equity.equity - account.initial_cash) / account.initial_cash) * 100,
+      stale_positions: equity.stale_positions,
+      total_return_pct: account.initial_cash > 0
+        ? ((equity.equity - account.initial_cash) / account.initial_cash) * 100
+        : 0,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -49,15 +53,17 @@ export async function POST(req: Request) {
     await pool.execute("DELETE FROM paper_trades WHERE account_id = ?", [account.id]);
     await pool.execute("DELETE FROM paper_equity_snapshots WHERE account_id = ?", [account.id]);
 
-    // Reset cash
+    // Reset cash AND clear reserved_cash — if we don't, a stale reservation
+    // from a pre-reset PENDING order would leave the account showing less
+    // cash than it should after reset.
     if (newInitial != null) {
       await pool.execute(
-        "UPDATE paper_accounts SET initial_cash = ?, cash = ? WHERE id = ?",
+        "UPDATE paper_accounts SET initial_cash = ?, cash = ?, reserved_cash = 0 WHERE id = ?",
         [newInitial, newInitial, account.id]
       );
     } else {
       await pool.execute(
-        "UPDATE paper_accounts SET cash = initial_cash WHERE id = ?",
+        "UPDATE paper_accounts SET cash = initial_cash, reserved_cash = 0 WHERE id = ?",
         [account.id]
       );
     }
