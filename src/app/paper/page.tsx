@@ -15,6 +15,8 @@ type Trade = {
   current_price: number | null;
   live_pnl_usd: number | null;
   live_pnl_pct: number | null;
+  as_of: string | null;
+  is_live: boolean;
   strategy: string;
   status: string;
   notes: string;
@@ -28,6 +30,7 @@ type PendingOrder = {
   investment_usd: number | null;
   limit_price: number | null;
   stop_price: number | null;
+  reserved_amount: number;
   created_at: string;
   notes: string | null;
 };
@@ -37,9 +40,11 @@ type AccountState = {
   name: string;
   initial_cash: number;
   cash: number;
+  reserved_cash: number;
   positions_value: number;
   equity: number;
   open_positions: number;
+  stale_positions: number;
   total_return_pct: number;
   realized_pnl_usd: number;
   win_rate_pct: number;
@@ -109,6 +114,10 @@ export default function PaperTradingPage() {
       const data = await res.json();
       if (!res.ok) {
         setBuyError(data.error || "Order placement failed.");
+      } else if (data.success === false) {
+        // MARKET order inserted but fill rejected (e.g. race).
+        setBuyError(`Order rejected: ${data.rejection_reason || data.error || "unknown reason"}`);
+        await loadData();
       } else {
         setBuySymbol("");
         setLimitPrice("");
@@ -190,12 +199,23 @@ export default function PaperTradingPage() {
           <div className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
             <p className="text-[10px] text-zinc-400 uppercase font-bold">Cash</p>
             <p className="text-2xl font-bold text-zinc-700">${account.cash.toFixed(2)}</p>
-            <p className="text-xs text-zinc-400 mt-1">of ${account.initial_cash.toFixed(0)}</p>
+            {account.reserved_cash > 0 ? (
+              <p className="text-xs text-amber-600 mt-1">
+                ${account.reserved_cash.toFixed(2)} reserved · of ${account.initial_cash.toFixed(0)}
+              </p>
+            ) : (
+              <p className="text-xs text-zinc-400 mt-1">of ${account.initial_cash.toFixed(0)}</p>
+            )}
           </div>
           <div className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
             <p className="text-[10px] text-zinc-400 uppercase font-bold">Positions</p>
             <p className="text-2xl font-bold text-zinc-700">${account.positions_value.toFixed(2)}</p>
-            <p className="text-xs text-zinc-400 mt-1">{account.open_positions} open</p>
+            <p className="text-xs text-zinc-400 mt-1">
+              {account.open_positions} open
+              {account.stale_positions > 0 && (
+                <span className="ml-1 text-amber-600">· {account.stale_positions} stale</span>
+              )}
+            </p>
           </div>
           <div className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
             <p className="text-[10px] text-zinc-400 uppercase font-bold">Realized P&L</p>
@@ -338,7 +358,14 @@ export default function PaperTradingPage() {
                     <div className="flex flex-wrap gap-4 mt-1 text-sm text-zinc-500">
                       <span>Qty: <b className="text-zinc-700">{trade.quantity.toFixed(4)}</b></span>
                       <span>Entry: <b className="text-zinc-700">${trade.buy_price.toFixed(2)}</b></span>
-                      <span>Live: <b className="text-zinc-700">{trade.current_price ? `$${trade.current_price.toFixed(2)}` : "..."}</b></span>
+                      <span>
+                        Live: <b className="text-zinc-700">{trade.current_price ? `$${trade.current_price.toFixed(2)}` : "..."}</b>
+                        {trade.current_price != null && !trade.is_live && (
+                          <span className="ml-1 px-1.5 py-0.5 text-[10px] rounded bg-amber-100 text-amber-700 font-semibold align-middle" title={trade.as_of ? `As of ${new Date(trade.as_of).toLocaleString()}` : "Market closed / stale"}>
+                            stale
+                          </span>
+                        )}
+                      </span>
                       <span>Allocated: ${trade.investment_usd.toFixed(2)}</span>
                       <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {trade.buy_date}</span>
                     </div>

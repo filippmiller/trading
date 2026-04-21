@@ -16,6 +16,7 @@
 import cron from "node-cron";
 import mysql from "mysql2/promise";
 import { ensureAppBootstrapReady } from "../src/lib/bootstrap";
+import { fillOrder as sharedFillOrder } from "../src/lib/paper-fill";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -1209,7 +1210,10 @@ async function jobMonitorPositionsImpl() {
     await db.query("INSERT INTO paper_position_prices (signal_id, price) VALUES ?", [priceInserts]);
   }
 
-  // 6. Fill triggered pending orders (limit/stop)
+  // 6. Fill triggered pending orders (limit/stop) via the shared
+  //    `fillOrder` in `src/lib/paper-fill.ts`. Both the UI path and this
+  //    cron call into the same transactional routine so there's one
+  //    implementation of atomic cash moves / status-guarded transitions.
   for (const order of pendingOrders) {
     const price = prices[order.symbol];
     if (price == null) continue;
@@ -1220,7 +1224,7 @@ async function jobMonitorPositionsImpl() {
     const type = order.order_type as string;
 
     let shouldFill = false;
-    if (type === "MARKET") shouldFill = true;
+    if (type === "MARKET") shouldFill = true; // cron runs during RTH; if it didn't, there's no live price above
     else if (type === "LIMIT" && limit != null) {
       shouldFill = side === "BUY" ? price <= limit : price >= limit;
     } else if (type === "STOP" && stop != null) {
@@ -1229,56 +1233,12 @@ async function jobMonitorPositionsImpl() {
 
     if (!shouldFill) continue;
 
-    // Fill via the existing paper trading engine
-    if (side === "BUY" && order.investment_usd) {
-      const investment = Number(order.investment_usd);
-      const [acctRows] = await db.execute<mysql.RowDataPacket[]>(
-        "SELECT cash FROM paper_accounts WHERE id = ?", [order.account_id]
-      );
-      if (acctRows.length === 0 || Number(acctRows[0].cash) < investment) {
-        await db.execute("UPDATE paper_orders SET status='REJECTED', rejection_reason='Insufficient cash' WHERE id=?", [order.id]);
-        continue;
-      }
-      const qty = investment / price;
-      const [tradeResult] = await db.execute<mysql.ResultSetHeader>(
-        `INSERT INTO paper_trades (account_id, symbol, quantity, buy_price, buy_date, investment_usd, strategy, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN')`,
-        [order.account_id, order.symbol, qty, price, todayET(), investment, `${type} BUY`]
-      );
-      await db.execute("UPDATE paper_accounts SET cash = cash - ? WHERE id = ?", [investment, order.account_id]);
-      await db.execute(
-        "UPDATE paper_orders SET status='FILLED', filled_price=?, filled_at=CURRENT_TIMESTAMP(6), trade_id=? WHERE id=?",
-        [price, tradeResult.insertId, order.id]
-      );
+    const result = await sharedFillOrder(db, Number(order.id), price);
+    if (result.filled) {
       ordersFilled++;
-      log(`    FILL ${order.symbol} ${type} BUY at $${price.toFixed(2)}`);
-    } else if (side === "SELL") {
-      const tradeId = order.trade_id ? Number(order.trade_id) : null;
-      const [tradeRows] = await db.execute<mysql.RowDataPacket[]>(
-        tradeId
-          ? "SELECT * FROM paper_trades WHERE id=? AND status='OPEN'"
-          : "SELECT * FROM paper_trades WHERE account_id=? AND symbol=? AND status='OPEN' ORDER BY id ASC LIMIT 1",
-        tradeId ? [tradeId] : [order.account_id, order.symbol]
-      );
-      if (tradeRows.length === 0) {
-        await db.execute("UPDATE paper_orders SET status='REJECTED', rejection_reason='No open position' WHERE id=?", [order.id]);
-        continue;
-      }
-      const trade = tradeRows[0];
-      const buyPrice = Number(trade.buy_price);
-      const investment = Number(trade.investment_usd);
-      const qty = Number(trade.quantity) || investment / buyPrice;
-      const proceeds = qty * price;
-      const pnlUsd = proceeds - investment;
-      const pnlPctVal = (pnlUsd / investment) * 100;
-
-      await db.execute("UPDATE paper_trades SET status='CLOSED', sell_price=?, sell_date=?, pnl_usd=?, pnl_pct=? WHERE id=?",
-        [price, todayET(), pnlUsd, pnlPctVal, trade.id]);
-      await db.execute("UPDATE paper_accounts SET cash = cash + ? WHERE id = ?", [proceeds, order.account_id]);
-      await db.execute("UPDATE paper_orders SET status='FILLED', filled_price=?, filled_at=CURRENT_TIMESTAMP(6), trade_id=? WHERE id=?",
-        [price, trade.id, order.id]);
-      ordersFilled++;
-      log(`    FILL ${order.symbol} ${type} SELL at $${price.toFixed(2)}`);
+      log(`    FILL ${order.symbol} ${type} ${side} at $${price.toFixed(2)}`);
+    } else {
+      log(`    SKIP ${order.symbol} ${type} ${side}: ${result.rejection}`);
     }
   }
 

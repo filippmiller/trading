@@ -10,8 +10,12 @@ import {
 
 /**
  * GET /api/paper
- * Returns account summary, open positions with live P&L, closed trades, and pending orders.
- * Also runs the order-matching engine to fill any triggered pending orders.
+ * Returns account summary, open positions with live P&L, closed trades, and
+ * pending orders. Also runs the order-matching engine to fill any triggered
+ * pending orders.
+ *
+ * Each open position carries `asOf` and `is_live` so the UI can show the
+ * user which marks are stale (e.g. outside RTH, or when Yahoo returned null).
  */
 export async function GET() {
   try {
@@ -19,16 +23,13 @@ export async function GET() {
     const pool = await getPool();
     const account = await getDefaultAccount();
 
-    // Fill any pending limit/stop orders that are triggered by current prices
     const filled = await fillPendingOrders();
 
-    // Fetch trades
     const [tradeRows] = await pool.execute<mysql.RowDataPacket[]>(
       "SELECT * FROM paper_trades WHERE account_id = ? ORDER BY status ASC, created_at DESC",
       [account.id]
     );
 
-    // Live prices for open positions
     const openTrades = tradeRows.filter(r => r.status === "OPEN");
     const prices = openTrades.length > 0
       ? await fetchLivePrices(openTrades.map(r => r.symbol))
@@ -37,20 +38,21 @@ export async function GET() {
     const trades = tradeRows.map(r => {
       const buyPrice = Number(r.buy_price);
       const investment = Number(r.investment_usd);
-      const quantity = Number(r.quantity) || (investment / buyPrice);
+      const quantity = Number(r.quantity) || (buyPrice > 0 ? investment / buyPrice : 0);
       const live = prices[r.symbol];
-      const currentPrice = r.status === "OPEN"
-        ? (live ?? null)
-        : (r.sell_price ? Number(r.sell_price) : null);
+      const isOpen = r.status === "OPEN";
+      const currentPrice = isOpen
+        ? (live?.price ?? null)
+        : (r.sell_price != null ? Number(r.sell_price) : null);
 
       let pnlPct: number | null = null;
       let pnlUsd: number | null = null;
-      if (currentPrice != null) {
+      if (isOpen && currentPrice != null && buyPrice > 0) {
         pnlPct = ((currentPrice - buyPrice) / buyPrice) * 100;
         pnlUsd = quantity * (currentPrice - buyPrice);
-      } else if (r.status === "CLOSED" && r.pnl_usd != null) {
+      } else if (!isOpen && r.pnl_usd != null) {
         pnlUsd = Number(r.pnl_usd);
-        pnlPct = Number(r.pnl_pct);
+        pnlPct = r.pnl_pct != null ? Number(r.pnl_pct) : null;
       }
 
       return {
@@ -60,11 +62,13 @@ export async function GET() {
         buy_price: buyPrice,
         buy_date: r.buy_date,
         sell_date: r.sell_date,
-        sell_price: r.sell_price ? Number(r.sell_price) : null,
+        sell_price: r.sell_price != null ? Number(r.sell_price) : null,
         investment_usd: investment,
         current_price: currentPrice,
         live_pnl_usd: pnlUsd,
         live_pnl_pct: pnlPct,
+        as_of: isOpen ? (live?.asOf?.toISOString() ?? null) : null,
+        is_live: isOpen ? (live?.isLive ?? false) : true,
         strategy: r.strategy,
         status: r.status,
         notes: r.notes,
@@ -72,7 +76,6 @@ export async function GET() {
       };
     });
 
-    // Pending orders
     const [orderRows] = await pool.execute<mysql.RowDataPacket[]>(
       "SELECT * FROM paper_orders WHERE account_id = ? AND status = 'PENDING' ORDER BY created_at DESC",
       [account.id]
@@ -82,20 +85,19 @@ export async function GET() {
       symbol: o.symbol,
       side: o.side,
       order_type: o.order_type,
-      investment_usd: o.investment_usd ? Number(o.investment_usd) : null,
-      limit_price: o.limit_price ? Number(o.limit_price) : null,
-      stop_price: o.stop_price ? Number(o.stop_price) : null,
+      investment_usd: o.investment_usd != null ? Number(o.investment_usd) : null,
+      limit_price: o.limit_price != null ? Number(o.limit_price) : null,
+      stop_price: o.stop_price != null ? Number(o.stop_price) : null,
+      reserved_amount: Number(o.reserved_amount ?? 0),
       created_at: o.created_at,
       notes: o.notes,
     }));
 
-    // Account metrics
     const equity = await computeAccountEquity(account.id);
     const totalReturn = account.initial_cash > 0
       ? ((equity.equity - account.initial_cash) / account.initial_cash) * 100
       : 0;
 
-    // Closed trade stats
     const closedTrades = tradeRows.filter(r => r.status === "CLOSED");
     const wins = closedTrades.filter(r => Number(r.pnl_usd) > 0).length;
     const winRate = closedTrades.length > 0 ? (wins / closedTrades.length) * 100 : 0;
@@ -107,9 +109,11 @@ export async function GET() {
         name: account.name,
         initial_cash: account.initial_cash,
         cash: equity.cash,
+        reserved_cash: equity.reserved_cash,
         positions_value: equity.positions_value,
         equity: equity.equity,
         open_positions: equity.open_positions,
+        stale_positions: equity.stale_positions,
         total_return_pct: totalReturn,
         realized_pnl_usd: realizedPnl,
         win_rate_pct: winRate,
@@ -118,6 +122,7 @@ export async function GET() {
       trades,
       pendingOrders,
       filledOnThisRequest: filled,
+      server_now: new Date().toISOString(),
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
