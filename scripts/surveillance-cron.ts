@@ -17,6 +17,12 @@ import cron from "node-cron";
 import mysql from "mysql2/promise";
 import { ensureAppBootstrapReady } from "../src/lib/bootstrap";
 import { fillOrder as sharedFillOrder, recordEquitySnapshotSafe } from "../src/lib/paper-fill";
+import {
+  evaluateExitsAlways as sharedEvaluateExitsAlways,
+  applyExitDecisionToTrade as sharedApplyExitToTrade,
+  type ExitInputs,
+  type ExitReason,
+} from "../src/lib/paper-exits";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -1062,7 +1068,22 @@ async function jobMonitorPositionsImpl() {
   // round-trip per signal per tick (~80 trips on today's portfolio).
   const priceInserts: Array<[number, number]> = [];
 
-  // 5. Record prices + update watermarks for open signals
+  // 5. Record prices + update watermarks for open signals.
+  //
+  // W3: exit-evaluation logic was extracted into `src/lib/paper-exits.ts` so
+  // the SAME algorithm drives both paper_signals (strategy engine, this loop)
+  // and paper_trades (new `monitorPaperTrades` hook below). Strategy `exits`
+  // config is translated into the shared `ExitInputs` struct — hard_stop_pct
+  // + take_profit_pct are percentages relative to the entry price so we
+  // compute absolute bracket prices up-front (same formula used by
+  // `insertOpenTrade` for user-placed brackets). time_exit_days uses signals'
+  // trading-days semantics (weekend compression); we keep that here rather
+  // than in the shared module because it's signal-specific.
+  //
+  // Exit-reason strings: the shared module emits TRAILING_STOP / TIME_EXIT
+  // but paper_signals historically used TRAIL_STOP / TIME. Translate back at
+  // write time so the paper_signals.exit_reason column keeps its historical
+  // values for analytics continuity.
   for (const sig of openSignals) {
     const price = prices[sig.symbol];
     if (price == null) continue;
@@ -1071,100 +1092,87 @@ async function jobMonitorPositionsImpl() {
     pricesRecorded++;
 
     const isShort = sig.direction === "SHORT";
+    const side: "LONG" | "SHORT" = isShort ? "SHORT" : "LONG";
     const entryPrice = Number(sig.entry_price);
     const leverage = Number(sig.leverage || 1);
 
-    // Raw price move % (positive = price went up)
-    const rawPricePct = entryPrice > 0 ? ((price - entryPrice) / entryPrice) * 100 : 0;
-    // Direction-aware PnL: LONG profits when price goes up, SHORT profits when price goes down
-    const pnlPct = isShort ? -rawPricePct : rawPricePct;
-    const leveragedPnl = pnlPct * leverage;
-
-    // Update max/min watermarks (track actual price extremes).
-    // Use null-checks rather than `|| fallback` — a legitimate watermark of 0
-    // is falsy and would otherwise get swapped with the sentinel, causing
-    // "best: -0.5%" displays for positions that truly peaked at 0% (their
-    // entry point). Same applies to max_price for any position insert where
-    // entry_price happened to be zero.
-    const maxPrice = sig.max_price == null ? price : Math.max(Number(sig.max_price), price);
-    const minPrice = sig.min_price == null ? price : Math.min(Number(sig.min_price), price);
-    const maxPnl = sig.max_pnl_pct == null ? leveragedPnl : Math.max(Number(sig.max_pnl_pct), leveragedPnl);
-    const minPnl = sig.min_pnl_pct == null ? leveragedPnl : Math.min(Number(sig.min_pnl_pct), leveragedPnl);
-
-    await db.execute(
-      `UPDATE paper_signals SET max_price = ?, min_price = ?, max_pnl_pct = ?, min_pnl_pct = ? WHERE id = ?`,
-      [maxPrice, minPrice, maxPnl, minPnl, sig.id]
-    );
-
-    // Check exit conditions — strategy config pre-fetched above.
+    // Build ExitInputs from signal row + strategy config.
     const stratInfo = stratConfigById.get(Number(sig.strategy_id));
-    if (!stratInfo) continue;
-    const config = JSON.parse(stratInfo.config_json);
-    const exits = config.exits || {};
+    const exits = stratInfo ? (JSON.parse(stratInfo.config_json).exits || {}) : {};
 
-    let exitReason: string | null = null;
+    // Pct → absolute price. `hard_stop_pct` is typically NEGATIVE (e.g. -5),
+    // `take_profit_pct` typically POSITIVE (e.g. 10). Formula:
+    //   LONG:  stop = entry * (1 + pct/100)   (pct negative → price drops)
+    //   SHORT: stop = entry * (1 - pct/100)   (pct negative → price rises)
+    const stopLossPrice = exits.hard_stop_pct != null && entryPrice > 0
+      ? (isShort ? entryPrice * (1 - exits.hard_stop_pct / 100) : entryPrice * (1 + exits.hard_stop_pct / 100))
+      : null;
+    const takeProfitPrice = exits.take_profit_pct != null && entryPrice > 0
+      ? (isShort ? entryPrice * (1 - exits.take_profit_pct / 100) : entryPrice * (1 + exits.take_profit_pct / 100))
+      : null;
 
-    // Hard stop (pnlPct is direction-aware: negative = losing)
-    if (exits.hard_stop_pct != null && pnlPct <= exits.hard_stop_pct) {
-      exitReason = "HARD_STOP";
-    }
-
-    // Leverage liquidation
-    if (leverage > 1 && leveragedPnl <= -90) {
-      exitReason = "LIQUIDATED";
-    }
-
-    // Take profit (pnlPct is direction-aware: positive = winning)
-    if (exits.take_profit_pct != null && pnlPct >= exits.take_profit_pct) {
-      exitReason = "TAKE_PROFIT";
-    }
-
-    // Trailing stop — direction-aware
-    if (exits.trailing_stop_pct != null) {
-      const activateAt = exits.trailing_activates_at_profit_pct ?? 0;
-      let trailActive = sig.trailing_active === 1;
-      let trailStop = sig.trailing_stop_price ? Number(sig.trailing_stop_price) : null;
-
-      if (!trailActive && pnlPct >= activateAt) {
-        trailActive = true;
-        // LONG: trail below price; SHORT: trail above price
-        trailStop = isShort
-          ? price * (1 + exits.trailing_stop_pct / 100)
-          : price * (1 - exits.trailing_stop_pct / 100);
-      }
-      if (trailActive) {
-        if (isShort) {
-          // SHORT: best price is the lowest (minPrice); trail stop goes above it
-          const newStop = minPrice * (1 + exits.trailing_stop_pct / 100);
-          if (trailStop == null || newStop < trailStop) trailStop = newStop;
-          if (price >= trailStop) exitReason = "TRAIL_STOP";
-        } else {
-          // LONG: best price is the highest (maxPrice); trail stop goes below it
-          const newStop = maxPrice * (1 - exits.trailing_stop_pct / 100);
-          if (trailStop == null || newStop > trailStop) trailStop = newStop;
-          if (price <= trailStop) exitReason = "TRAIL_STOP";
-        }
-      }
-
-      // Persist trailing state
-      await db.execute(
-        "UPDATE paper_signals SET trailing_active = ?, trailing_stop_price = ? WHERE id = ?",
-        [trailActive ? 1 : 0, trailStop, sig.id]
-      );
-    }
-
-    // Time exit (trading days)
+    // Translate time_exit_days (trading days) into an absolute date. Same
+    // weekend-compression formula the original cron used — trading_days =
+    // floor(calendar_days * 5/7) crossing the threshold means we're due.
+    let timeExitDate: string | null = null;
     if (exits.time_exit_days != null && sig.entry_at) {
       const entryMs = new Date(sig.entry_at).getTime();
-      const holdDays = (Date.now() - entryMs) / (1000 * 60 * 60 * 24);
-      const tradingDays = Math.floor(holdDays * 5 / 7);
-      if (tradingDays >= exits.time_exit_days) exitReason = "TIME";
+      // Find the minimum calendar_days such that floor(cal*5/7) >= time_exit_days.
+      // cal = ceil(time_exit_days * 7 / 5). Add to entry_date to get target date.
+      const targetCalDays = Math.ceil(exits.time_exit_days * 7 / 5);
+      const targetMs = entryMs + targetCalDays * 86_400_000;
+      timeExitDate = new Date(targetMs).toISOString().slice(0, 10);
     }
 
-    // Execute exit
-    if (exitReason) {
+    const input: ExitInputs = {
+      entryPrice,
+      side,
+      leverage,
+      stopLossPrice,
+      takeProfitPrice,
+      trailingStopPct: exits.trailing_stop_pct != null ? Number(exits.trailing_stop_pct) : null,
+      trailingActivatesAtProfitPct: exits.trailing_activates_at_profit_pct != null ? Number(exits.trailing_activates_at_profit_pct) : 0,
+      trailingStopPrice: sig.trailing_stop_price != null ? Number(sig.trailing_stop_price) : null,
+      trailingActive: Number(sig.trailing_active) === 1,
+      timeExitDate,
+      maxPnlPct: sig.max_pnl_pct != null ? Number(sig.max_pnl_pct) : null,
+      minPnlPct: sig.min_pnl_pct != null ? Number(sig.min_pnl_pct) : null,
+      maxPrice: sig.max_price != null ? Number(sig.max_price) : null,
+      minPrice: sig.min_price != null ? Number(sig.min_price) : null,
+    };
+
+    const result = sharedEvaluateExitsAlways(input, price, new Date());
+
+    // Always persist updated watermarks + trailing state. If no exit fires,
+    // these are the only changes; if an exit DOES fire, they're baked into
+    // the exit UPDATE below so the historical watermark isn't lost.
+    await db.execute(
+      `UPDATE paper_signals
+          SET max_price = ?, min_price = ?, max_pnl_pct = ?, min_pnl_pct = ?,
+              trailing_active = ?, trailing_stop_price = ?
+        WHERE id = ?`,
+      [
+        result.watermarks.maxPrice,
+        result.watermarks.minPrice,
+        result.watermarks.maxPnlPct,
+        result.watermarks.minPnlPct,
+        result.watermarks.trailingActive ? 1 : 0,
+        result.watermarks.trailingStopPrice,
+        sig.id,
+      ]
+    );
+
+    if (result.reason != null) {
+      // Translate shared reasons → paper_signals historical strings.
+      const legacyReason =
+        result.reason === "TRAILING_STOP" ? "TRAIL_STOP"
+        : result.reason === "TIME_EXIT"   ? "TIME"
+        : result.reason;
+
       const investment = Number(sig.investment_usd);
-      // Direction-aware final PnL
+      // Recompute final pnl at the close price (same math as before —
+      // direction-aware, leveraged, clamped at -100%).
+      const rawPricePct = entryPrice > 0 ? ((price - entryPrice) / entryPrice) * 100 : 0;
       const finalPnlPct = isShort ? -rawPricePct : rawPricePct;
       const leveragedPctFinal = Math.max(finalPnlPct * leverage, -100);
       const pnlUsd = investment * (leveragedPctFinal / 100);
@@ -1173,22 +1181,17 @@ async function jobMonitorPositionsImpl() {
         : null;
 
       // Conditional UPDATE — only exits a signal still in EXECUTED state.
-      // Prevents double cash credit if a concurrent monitor tick already exited this row.
       const [exitUpdate] = await db.execute<mysql.ResultSetHeader>(
         `UPDATE paper_signals SET
            status = CASE WHEN ? > 0 THEN 'WIN' ELSE 'LOSS' END,
            exit_price = ?, exit_at = CURRENT_TIMESTAMP(6), exit_reason = ?,
            pnl_usd = ?, pnl_pct = ?, holding_minutes = ?
          WHERE id = ? AND status = 'EXECUTED' AND exit_at IS NULL`,
-        [pnlUsd, price, exitReason, pnlUsd, leveragedPctFinal, holdMinutes, sig.id]
+        [pnlUsd, price, legacyReason, pnlUsd, leveragedPctFinal, holdMinutes, sig.id]
       );
 
-      if (exitUpdate.affectedRows === 0) {
-        // Already exited by another process; do NOT credit cash a second time.
-        continue;
-      }
+      if (exitUpdate.affectedRows === 0) continue;
 
-      // Return cash to strategy account
       const proceeds = investment + pnlUsd;
       if (proceeds > 0) {
         await db.execute(
@@ -1199,7 +1202,7 @@ async function jobMonitorPositionsImpl() {
 
       positionsClosed++;
       const dir = isShort ? "SHORT" : "LONG";
-      log(`    EXIT ${dir} ${sig.symbol} [${exitReason}] P&L: ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${leveragedPctFinal.toFixed(1)}%)`);
+      log(`    EXIT ${dir} ${sig.symbol} [${legacyReason}] P&L: ${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${leveragedPctFinal.toFixed(1)}%)`);
     }
   }
 
@@ -1256,6 +1259,149 @@ async function jobMonitorPositionsImpl() {
 
   log(`  Monitor: ${pricesRecorded} prices recorded, ${ordersFilled} orders filled, ${positionsClosed} positions closed`);
 }
+
+// ─── Paper Trades Monitor (W3) ────────────────────────────────────────────
+
+/**
+ * W3 — monitor user-placed `paper_trades` (NOT `paper_signals`) and close any
+ * that hit their protective exit bracket. Runs every 15 min during RTH
+ * alongside the existing `jobMonitorPositions`.
+ *
+ * Uses the SAME shared `paper-exits.ts` module as the signal-monitor loop
+ * above, so hard-stop / take-profit / trailing / time-exit semantics are
+ * identical across both tables. The adapter below maps the paper_trades row
+ * shape into `ExitInputs` and calls `applyExitDecisionToTrade` to close.
+ *
+ * Differences from the signals path:
+ *   - Brackets are stored ON THE TRADE ROW (stop_loss_price absolute, etc.)
+ *     rather than derived from a strategy config. No per-tick pct→price math.
+ *   - time_exit_date is an absolute DATE column; no trading-days compression.
+ *   - Direction-aware arithmetic is the same: LONG profits on rise, SHORT on fall.
+ */
+let monitorPaperTradesRunning = false;
+async function jobMonitorPaperTrades() {
+  if (monitorPaperTradesRunning) { log("  SKIP: paper-trades monitor already running"); return; }
+  if (!isTradingDay()) return;
+  monitorPaperTradesRunning = true;
+  try {
+    await jobMonitorPaperTradesImpl();
+  } finally {
+    monitorPaperTradesRunning = false;
+  }
+}
+
+async function jobMonitorPaperTradesImpl() {
+  const db = getPool();
+
+  // Scan only OPEN trades that have ANY bracket field set. If all four are
+  // NULL there's no way an exit triggers, so skip. The index
+  // IX_paper_trades_status_timeexit is still useful for the time-exit prefix
+  // scan; full bracket eligibility is evaluated in-memory after the scan.
+  const [openTrades] = await db.execute<mysql.RowDataPacket[]>(
+    `SELECT * FROM paper_trades
+      WHERE status = 'OPEN'
+        AND (stop_loss_price IS NOT NULL
+             OR take_profit_price IS NOT NULL
+             OR trailing_stop_pct IS NOT NULL
+             OR time_exit_date IS NOT NULL)`
+  );
+
+  if (openTrades.length === 0) {
+    log("  Paper-trades monitor: 0 positions with brackets — nothing to do");
+    return;
+  }
+
+  // Fetch live prices (batched).
+  const prices: Record<string, number> = {};
+  const symbols = Array.from(new Set(openTrades.map(t => t.symbol)));
+  for (let i = 0; i < symbols.length; i += 5) {
+    const batch = symbols.slice(i, i + 5);
+    await Promise.all(batch.map(async (sym) => {
+      try {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1d&interval=5m`;
+        const res = await fetchWithTimeout(url, { headers: { "User-Agent": UA } });
+        if (!res) return;
+        const data = await res.json();
+        const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+        if (typeof price === "number" && isFinite(price) && price > 0) {
+          prices[sym] = price;
+        }
+      } catch { /* skip */ }
+    }));
+    if (i + 5 < symbols.length) await sleep(300);
+  }
+
+  let closed = 0;
+  const now = new Date();
+
+  for (const trade of openTrades) {
+    const price = prices[trade.symbol];
+    if (price == null) continue;
+
+    const entryPrice = Number(trade.buy_price);
+    const side: "LONG" | "SHORT" = trade.side === "SHORT" ? "SHORT" : "LONG";
+
+    // Direction-aware PnL % for watermark tracking. Computed inside the
+    // shared module too, but we also need it to decide trailing activation.
+    // The shared module handles that internally.
+    const input: ExitInputs = {
+      entryPrice,
+      side,
+      leverage: 1,
+      stopLossPrice: trade.stop_loss_price != null ? Number(trade.stop_loss_price) : null,
+      takeProfitPrice: trade.take_profit_price != null ? Number(trade.take_profit_price) : null,
+      trailingStopPct: trade.trailing_stop_pct != null ? Number(trade.trailing_stop_pct) : null,
+      trailingActivatesAtProfitPct: trade.trailing_activates_at_profit_pct != null ? Number(trade.trailing_activates_at_profit_pct) : 0,
+      trailingStopPrice: trade.trailing_stop_price != null ? Number(trade.trailing_stop_price) : null,
+      trailingActive: Number(trade.trailing_active) === 1,
+      timeExitDate: trade.time_exit_date
+        ? (trade.time_exit_date instanceof Date
+            ? trade.time_exit_date.toISOString().slice(0, 10)
+            : String(trade.time_exit_date).slice(0, 10))
+        : null,
+      maxPnlPct: trade.max_pnl_pct != null ? Number(trade.max_pnl_pct) : null,
+      minPnlPct: trade.min_pnl_pct != null ? Number(trade.min_pnl_pct) : null,
+      maxPrice: null,  // paper_trades doesn't track max_price separately
+      minPrice: null,
+    };
+
+    const result = sharedEvaluateExitsAlways(input, price, now);
+
+    // Persist watermarks (same as signals path). Write even when no exit
+    // fires so trailing_active / trailing_stop_price advance between ticks.
+    await db.execute(
+      `UPDATE paper_trades
+          SET max_pnl_pct = ?, min_pnl_pct = ?,
+              trailing_active = ?, trailing_stop_price = ?
+        WHERE id = ? AND status = 'OPEN'`,
+      [
+        result.watermarks.maxPnlPct,
+        result.watermarks.minPnlPct,
+        result.watermarks.trailingActive ? 1 : 0,
+        result.watermarks.trailingStopPrice,
+        trade.id,
+      ]
+    );
+
+    if (result.reason != null) {
+      const applied = await sharedApplyExitToTrade(db, Number(trade.id), price, {
+        reason: result.reason,
+        closePrice: price,
+        watermarks: result.watermarks,
+      });
+      if (applied.closed) {
+        closed++;
+        log(`    EXIT_TRADE ${side} ${trade.symbol} [${result.reason}] P&L: ${applied.pnlUsd >= 0 ? '+' : ''}$${applied.pnlUsd.toFixed(2)}`);
+      }
+    }
+  }
+
+  log(`  Paper-trades monitor: ${closed} positions closed`);
+}
+
+// Silence unused ExitReason import without removing the type (it's part of
+// the contract with paper-exits.ts even if this module doesn't name it).
+void (null as unknown as ExitReason | null);
 
 // ─── Confirmation Strategy Engine ─────────────────────────────────────────
 
@@ -1773,6 +1919,14 @@ cron.schedule("0 18 * * 1-5", async () => {
 cron.schedule("*/15 9-16 * * 1-5", async () => {
   log("--- Monitor: checking positions + orders ---");
   try { await jobMonitorPositions(); } catch (err) { log(`ERROR monitoring: ${err}`); }
+}, CRON_OPTIONS);
+
+// W3 — paper_trades monitor (user-placed positions with exit brackets).
+// Runs 7 minutes offset from the signals monitor to avoid a thundering-herd
+// on Yahoo. Same 15-min cadence, same RTH gate.
+cron.schedule("7/15 9-16 * * 1-5", async () => {
+  log("--- Paper-trades monitor: checking bracketed positions ---");
+  try { await jobMonitorPaperTrades(); } catch (err) { log(`ERROR paper-trades monitor: ${err}`); }
 }, CRON_OPTIONS);
 
 // Hourly equity snapshot — at :07 to avoid stepping on the :00 / :15 ticks.
