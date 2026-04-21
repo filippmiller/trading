@@ -512,6 +512,16 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
   // When F1 state is null we treat "all dates checked" as the default.
   const allCohortDates = useMemo(() => grouped.map(([d]) => d), [grouped]);
 
+  // Seed the F1 selection with ALL cohort dates on first data arrival. Using null
+  // as "all-checked" sentinel proved brittle across SSR→client hydration and
+  // memo boundaries — chips rendered as unchecked on fresh load. An explicit Set
+  // is unambiguous: every checkbox's `checked` reads directly from Set.has(d).
+  useEffect(() => {
+    if (allCohortDates.length > 0 && selectedCohortDates === null) {
+      setSelectedCohortDates(new Set(allCohortDates));
+    }
+  }, [allCohortDates, selectedCohortDates]);
+
   // Use the first cohort date for header dates (they shift per cohort, but header is generic)
   const refDate = grouped[0]?.[0] || new Date().toISOString().slice(0, 10);
 
