@@ -253,6 +253,9 @@ const ALLOWED_TABLES = new Set([
   "paper_orders",
   "paper_equity_snapshots",
 ]);
+
+/** Shape of row returned from INFORMATION_SCHEMA.STATISTICS for index checks. */
+type IndexRow = { INDEX_NAME: string };
 const COLUMN_REGEX = /^[a-z_][a-z0-9_]{0,63}$/;
 
 async function ensureColumn(table: string, column: string, definition: string) {
@@ -367,6 +370,72 @@ async function runSchemaMigrations() {
     const errno = (err as { errno?: number }).errno;
     // 1826 = dup FK, 1022 = dup key, 3780 = FK incompat. Ignore first two.
     if (errno !== 1826 && errno !== 1022) throw err;
+  }
+
+  // W3 (2026-04-21) — shorts, protective exits, partial close, order modify.
+  //
+  // 1. paper_trades gains `side` (LONG/SHORT), exit bracket columns
+  //    (stop_loss_price, take_profit_price, trailing_*, time_exit_date),
+  //    P&L watermarks, partial-close tracking (closed_quantity), borrow-rate
+  //    placeholder (real modeling deferred to W4), and `exit_reason` for
+  //    post-hoc analytics (HARD_STOP / TAKE_PROFIT / TRAILING_STOP / TIME_EXIT).
+  // 2. paper_accounts gains `reserved_short_margin` — a SEPARATE bucket from
+  //    `reserved_cash`. Rationale: `reserved_cash` already has an invariant
+  //    tied to `paper_orders.reserved_amount`. Mixing shorts in the same
+  //    column would require a discriminator and fight the W2 reconciliation
+  //    view. Dedicated column keeps semantics crisp:
+  //      equity = cash + reserved_cash + reserved_short_margin + open positions
+  // 3. paper_orders gains `reserved_short_margin` — per-order short-margin hold
+  //    so PATCH (order modify) and cancel can refund atomically.
+  //
+  // All columns nullable or have defaults so existing rows work unchanged.
+  await ensureColumn("paper_trades", "side", "VARCHAR(8) NOT NULL DEFAULT 'LONG'");
+  await ensureColumn("paper_trades", "stop_loss_price", "DECIMAL(18,6) NULL");
+  await ensureColumn("paper_trades", "take_profit_price", "DECIMAL(18,6) NULL");
+  await ensureColumn("paper_trades", "trailing_stop_pct", "DECIMAL(10,4) NULL");
+  await ensureColumn("paper_trades", "trailing_activates_at_profit_pct", "DECIMAL(10,4) NULL");
+  await ensureColumn("paper_trades", "trailing_stop_price", "DECIMAL(18,6) NULL");
+  await ensureColumn("paper_trades", "trailing_active", "TINYINT(1) NOT NULL DEFAULT 0");
+  await ensureColumn("paper_trades", "time_exit_date", "DATE NULL");
+  await ensureColumn("paper_trades", "max_pnl_pct", "DECIMAL(10,4) NULL");
+  await ensureColumn("paper_trades", "min_pnl_pct", "DECIMAL(10,4) NULL");
+  await ensureColumn("paper_trades", "borrow_daily_rate_pct", "DECIMAL(10,6) NOT NULL DEFAULT 0");
+  await ensureColumn("paper_trades", "closed_quantity", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+  await ensureColumn("paper_trades", "exit_reason", "VARCHAR(32) NULL");
+  await ensureColumn("paper_accounts", "reserved_short_margin", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+  await ensureColumn("paper_orders", "reserved_short_margin", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+  await ensureColumn("paper_equity_snapshots", "reserved_short_margin", "DECIMAL(18,6) NOT NULL DEFAULT 0");
+  // `position_side` distinguishes LONG vs SHORT orders.
+  //   side='BUY'  + position_side='LONG'  → open LONG
+  //   side='SELL' + position_side='LONG'  → close LONG
+  //   side='SELL' + position_side='SHORT' → open SHORT
+  //   side='BUY'  + position_side='SHORT' → close SHORT (buy to cover)
+  await ensureColumn("paper_orders", "position_side", "VARCHAR(8) NOT NULL DEFAULT 'LONG'");
+  // Optional bracket fields captured on open-order submit. Persisted on the
+  // `paper_trades` row at fill time (absolute prices derived from fill price).
+  await ensureColumn("paper_orders", "bracket_stop_loss_pct", "DECIMAL(10,4) NULL");
+  await ensureColumn("paper_orders", "bracket_take_profit_pct", "DECIMAL(10,4) NULL");
+  await ensureColumn("paper_orders", "bracket_trailing_pct", "DECIMAL(10,4) NULL");
+  await ensureColumn("paper_orders", "bracket_trailing_activates_pct", "DECIMAL(10,4) NULL");
+  await ensureColumn("paper_orders", "bracket_time_exit_days", "INT NULL");
+  // Partial-close quantity on SELL/BUY-to-COVER orders. NULL = close remaining.
+  await ensureColumn("paper_orders", "close_quantity", "DECIMAL(18,6) NULL");
+  // Index the exit scanner reads: (status, time_exit_date) — lets the W3
+  // cron's monitorPaperTrades scan skip the OPEN-trades-table scan on every
+  // tick by going straight to the short prefix of rows that are actually at
+  // or near their time-exit deadline.
+  const [idxRows] = await pool.execute<mysql.RowDataPacket[]>(
+    `SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME   = 'paper_trades'
+        AND INDEX_NAME   = 'IX_paper_trades_status_timeexit'`
+  );
+  if ((idxRows as IndexRow[]).length === 0) {
+    try {
+      await pool.execute("ALTER TABLE paper_trades ADD INDEX IX_paper_trades_status_timeexit (status, time_exit_date)");
+    } catch (err: unknown) {
+      if ((err as { errno?: number }).errno !== 1061) throw err;
+    }
   }
 
   // Seed default paper account
