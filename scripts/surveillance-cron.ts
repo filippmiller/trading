@@ -1853,61 +1853,101 @@ async function jobHourlyEquitySnapshots() {
 /**
  * W4 — borrow-cost accrual for OPEN SHORT positions.
  *
- * For every `OPEN SHORT` with `borrow_daily_rate_pct > 0`, debit one day's
- * interest from the account's cash balance. Runs once per weekday at
- * 17:00 ET (post-close); skips weekends. Each run is additive — no internal
- * "last accrued" timestamp yet, so operating the cron on a wall-clock
- * schedule is the source of truth for daily cadence.
+ * For every `OPEN SHORT` with `borrow_daily_rate_pct > 0`, debit accrued
+ * interest since the last accrual. Runs once per weekday at 17:00 ET
+ * (post-close); skips weekends.
  *
  * Daily charge = quantity × buy_price × (borrow_daily_rate_pct / 100) / 365.
- * Rationale: `borrow_daily_rate_pct` is persisted as an ANNUALIZED % (e.g.
- * 2.5 = 2.5% APR — typical for liquid large-cap shorts). Dividing by 365
- * gets the per-day dollar cost on the short's notional = qty × entry price.
+ * `borrow_daily_rate_pct` is persisted as an ANNUALIZED % (e.g. 2.5 = 2.5%
+ * APR). Dividing by 365 gets the per-day dollar cost on the short's notional.
+ *
+ * CODEX ROUND-2 FIXES (2026-04-21):
+ *   - Bug #3 — race with concurrent cover. Each short is processed in its
+ *     own per-trade transaction that locks account + trade FOR UPDATE and
+ *     re-checks status='OPEN' under the lock, skipping cleanly if the
+ *     position was covered between snapshot-SELECT and per-trade tx.
+ *   - Bug #4 — idempotency via `paper_trades.last_borrow_accrued_date`.
+ *     `days_to_accrue = DATEDIFF(target_date, last_date)` where `last_date`
+ *     is `last_borrow_accrued_date` if set, else `buy_date`. Re-running
+ *     the same day → 0 days → no-op.
+ *   - Bug #5 — calendar-day accrual, NOT business-day. Monday's run after
+ *     Friday's run charges 3 days (Sat+Sun+Mon) via MySQL DATEDIFF.
+ *   - Bug #6 — partial-day accrual on cover is NOT implemented (documented
+ *     MVP limitation). Positions covered intraday before the day's 17:00
+ *     run miss that final day's borrow. Acceptable precision; daily is OK.
  *
  * Logged in `surveillance_logs` with status='SUCCESS' (or PARTIAL on errors).
  * Each per-position debit is its own transaction so one bad row cannot
  * poison the batch.
- *
- * Testing hook: pass `ymdOverride` to simulate a specific day-count. The
- * smoke test uses `accrueBorrowCostOnce` directly to debit 7 days at once
- * by looping the function with distinct YMDs; the production schedule just
- * calls it daily.
  */
 export async function jobAccrueBorrowCost() {
   const db = getPool();
+  const targetDate = new Date().toISOString().slice(0, 10);
   const [shorts] = await db.execute<mysql.RowDataPacket[]>(
-    `SELECT t.id, t.account_id, t.quantity, t.closed_quantity, t.buy_price, t.borrow_daily_rate_pct
+    `SELECT t.id, t.account_id
        FROM paper_trades t
       WHERE t.status = 'OPEN'
         AND t.side = 'SHORT'
         AND COALESCE(t.borrow_daily_rate_pct, 0) > 0`
   );
   let debited = 0;
+  let skipped = 0;
   let errors = 0;
   let totalUsd = 0;
   for (const row of shorts) {
-    const qty = Math.max(0, Number(row.quantity) - Number(row.closed_quantity ?? 0));
-    const entryPrice = Number(row.buy_price);
-    const annualPct = Number(row.borrow_daily_rate_pct);
-    const daily = qty * entryPrice * (annualPct / 100) / 365;
-    if (!(daily > 0)) continue;
     const conn = await db.getConnection();
     try {
       await conn.beginTransaction();
-      // Canonical lock order — account first.
+      // LOCK STEP 1 — account (canonical order).
       const [acct] = await conn.execute<mysql.RowDataPacket[]>(
         "SELECT id FROM paper_accounts WHERE id = ? FOR UPDATE",
         [row.account_id]
       );
-      if (acct.length === 0) { await conn.rollback(); continue; }
+      if (acct.length === 0) { await conn.rollback(); skipped++; continue; }
+
+      // LOCK STEP 2 — trade. Re-check status under lock; race-safe against
+      // a concurrent cover that committed between snapshot and this tx.
+      const [tradeRows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT status, quantity, closed_quantity, buy_price,
+                borrow_daily_rate_pct, buy_date, last_borrow_accrued_date
+           FROM paper_trades WHERE id = ? FOR UPDATE`,
+        [row.id]
+      );
+      if (tradeRows.length === 0) { await conn.rollback(); skipped++; continue; }
+      const t = tradeRows[0];
+      if (t.status !== "OPEN") { await conn.rollback(); skipped++; continue; }
+
+      // Calendar-day accrual via MySQL DATEDIFF (weekends included).
+      const lastDateRaw = t.last_borrow_accrued_date ?? t.buy_date;
+      const [[dd]] = await conn.execute<mysql.RowDataPacket[]>(
+        "SELECT DATEDIFF(?, ?) AS days",
+        [targetDate, lastDateRaw]
+      ) as unknown as [mysql.RowDataPacket[], unknown];
+      const daysToAccrue = Math.max(0, Number(dd.days ?? 0));
+      if (daysToAccrue <= 0) { await conn.rollback(); skipped++; continue; }
+
+      const qty = Math.max(0, Number(t.quantity) - Number(t.closed_quantity ?? 0));
+      const entryPrice = Number(t.buy_price);
+      const annualPct = Number(t.borrow_daily_rate_pct);
+      const daily = qty * entryPrice * (annualPct / 100) / 365;
+      if (!(daily > 0)) { await conn.rollback(); skipped++; continue; }
+      const accrual = daily * daysToAccrue;
+
       const [debitRes] = await conn.execute<mysql.ResultSetHeader>(
-        "UPDATE paper_accounts SET cash = cash - ? WHERE id = ?",
-        [daily, row.account_id]
+        "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
+        [accrual, row.account_id, accrual]
       );
       if (debitRes.affectedRows !== 1) { await conn.rollback(); errors++; continue; }
+
+      const [markRes] = await conn.execute<mysql.ResultSetHeader>(
+        "UPDATE paper_trades SET last_borrow_accrued_date = ? WHERE id = ? AND status = 'OPEN'",
+        [targetDate, row.id]
+      );
+      if (markRes.affectedRows !== 1) { await conn.rollback(); errors++; continue; }
+
       await conn.commit();
       debited++;
-      totalUsd += daily;
+      totalUsd += accrual;
     } catch (err) {
       try { await conn.rollback(); } catch { /* ignore */ }
       errors++;
@@ -1921,10 +1961,10 @@ export async function jobAccrueBorrowCost() {
      VALUES (?, ?, CURRENT_TIMESTAMP(6))`,
     [
       errors > 0 ? "PARTIAL" : "SUCCESS",
-      JSON.stringify({ job: "borrow_accrual", open_shorts: shorts.length, debited, errors, total_usd: totalUsd }),
+      JSON.stringify({ job: "borrow_accrual", open_shorts: shorts.length, debited, skipped, errors, total_usd: totalUsd }),
     ]
   );
-  log(`  Borrow accrual: ${debited}/${shorts.length} shorts debited, total $${totalUsd.toFixed(4)}, errors=${errors}`);
+  log(`  Borrow accrual: ${debited}/${shorts.length} shorts debited (skipped ${skipped}), total $${totalUsd.toFixed(4)}, errors=${errors}`);
 }
 
 // ─── Schedule ───────────────────────────────────────────────────────────────

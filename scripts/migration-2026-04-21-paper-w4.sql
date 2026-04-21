@@ -36,6 +36,17 @@ CREATE TABLE IF NOT EXISTS tradable_symbols (
   INDEX IX_tradable_symbols_class_active (asset_class, active)
 ) ENGINE=InnoDB;
 
+-- ── C2. paper_trades.last_borrow_accrued_date (codex round-2 fix #4) ─────
+-- Tracks the last calendar date this SHORT position was debited for borrow
+-- cost. Used by `surveillance-cron-borrow` to compute days-to-accrue and to
+-- make double-runs on the same day a no-op (idempotency guard).
+-- NULL on insert → first accrual falls back to `buy_date`.
+SET @col_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='paper_trades' AND COLUMN_NAME='last_borrow_accrued_date');
+SET @sql := IF(@col_exists = 0,
+  'ALTER TABLE paper_trades ADD COLUMN last_borrow_accrued_date DATE NULL',
+  'SELECT ''paper_trades.last_borrow_accrued_date present'' AS status');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 -- ── D. app_settings seed rows for risk model ─────────────────────────────
 -- Each row is key → JSON value. W4 uses individual keys (one per param) so
 -- the UI can PATCH them atomically. Existing `defaults` key from W0 stays.

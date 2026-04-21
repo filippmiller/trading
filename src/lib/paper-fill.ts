@@ -22,9 +22,24 @@
  * `recordEquitySnapshotSafe` catches + logs + returns false (so the hourly
  * cron never aborts on one bad account). Never swap them.
  *
+ * CODEX ROUND-2 FIXES (2026-04-21):
+ *   - Bug #1 — `cash + credit >= 0` guard on LONG close + SHORT cover cash
+ *     credits. A pathological partial-close (tiny notional, large commission)
+ *     or a deeply-adverse SHORT cover could otherwise push `cash` negative.
+ *     Guard fires → HARD REJECT (rolled back by outer tx), position stays
+ *     OPEN. NEW rejection tag: `CASH_UNDERFLOW_ON_CLOSE` — intentionally NOT
+ *     in SOFT_REJECT, so the fill transaction rolls back cleanly.
+ *   - Bug #2 — SHORT open now records `reserved_short_margin = adj*qty`
+ *     (the ACTUAL proceeds from the adverse-adjusted short sale), not
+ *     nominal `investment_usd`. This stops open-leg slippage from sneaking
+ *     back out of margin on cover as a phantom reimbursement. Same-price
+ *     LIMIT round-trip now yields `pnl = −2*commission` exactly.
+ *
  * Invariants maintained:
  *   1. `paper_accounts.cash` can never go negative — atomic
- *      `UPDATE ... WHERE cash >= ?` enforces this at the DB layer.
+ *      `UPDATE ... WHERE cash >= ?` enforces this at the DB layer. Round-2
+ *      extends this to the close/cover paths via `(cash + credit) >= 0`
+ *      guards.
  *   2. `paper_accounts.reserved_cash` can never go negative — atomic
  *      `UPDATE ... WHERE reserved_cash >= ?` enforces this, and every
  *      release asserts affectedRows === 1 so a missing account cannot
@@ -440,11 +455,27 @@ async function fillOrderCore(
       await rejectOrder(conn, orderId, reason);
       return { filled: false, rejection: reason };
     }
-    // W4 — slippage/commission for short-open, same model as LONG open.
-    // Slippage goes out of cash (short sale "gets less"), commission too.
+    // W4 — slippage/commission for short-open.
+    //
+    // Codex round-2 bug #2 fix — margin is the ADJUSTED proceeds, not nominal.
+    //   investmentAdjusted = adjustedPrice * quantity  (what we would have
+    //     actually received from selling borrowed shares at the adverse
+    //     price). Under the old model, margin = nominal investment, which
+    //     stored 0.5 bps of "phantom" money that leaked back to cash on
+    //     cover — making a same-price round trip LOOK free after slippage.
+    //
+    //   With margin = adj*qty, the slippage is captured once on
+    //   `slippage_usd` and is never paid out of cash separately on open
+    //   (only commission is a separate cash debit).
+    //
+    //   A same-price LIMIT cover then yields exactly `pnl = -2*commission`
+    //   — no phantom slippage recoup. See smoke test 10.
     const slippageUsd = slippageCostUsd(fillPrice, adjustedPrice, quantity);
     const commissionUsd = applyCommission(quantity, investment, riskCfg);
-    const extraCashNeeded = slippageUsd + commissionUsd;
+    const investmentAdjusted = adjustedPrice * quantity;
+    // Slippage is NOT added to cash debit — it's baked into the smaller
+    // `investmentAdjusted` margin. Only commission is a separate cash cost.
+    const extraCashNeeded = commissionUsd;
 
     // PF2 — reject new SHORT if an OPEN SHORT already exists for this
     // (account, symbol). The cover path resolves "which position to close"
@@ -462,14 +493,20 @@ async function fillOrderCore(
 
     // Short margin: held in paper_accounts.reserved_short_margin. If the order
     // pre-reserved via reserveShortMarginForOrder (LIMIT/STOP short), that
-    // column already reflects the hold — we only need to reconcile any delta
-    // between pre-reserved and actual short-value at fill. If not pre-reserved
+    // column already reflects the hold at NOMINAL investment — we reconcile
+    // to the ADJUSTED margin (adj*qty) at fill time. If not pre-reserved
     // (MARKET short), debit cash into reserved_short_margin now.
+    //
+    // Codex round-2 bug #2 — reconciliation target is now `investmentAdjusted`
+    // (not `investment`). LIMIT shorts with zero slippage still reconcile to
+    // the same nominal they reserved; MARKET shorts release 0.5 bps back to
+    // cash as the "over-reserved" surplus (the reservation held at nominal
+    // but the fill actually seats at the adverse-adjusted margin).
     const reservedShort = Number(order.reserved_short_margin ?? 0);
     if (reservedShort > 0) {
-      // Already held — nothing to do on cash / margin ledger other than
-      // adjust for delta between reserved amount and actual fill-value.
-      const delta = reservedShort - investment;
+      // Already held — adjust delta between reserved (nominal) and
+      // investmentAdjusted, then pay commission out of cash.
+      const delta = reservedShort - investmentAdjusted;
       if (delta !== 0) {
         if (delta > 0) {
           // Over-reserved — release the surplus back to cash.
@@ -492,7 +529,7 @@ async function fillOrderCore(
           }
         }
       }
-      // W4 — slippage + commission come out of cash (not margin).
+      // Commission comes out of cash (slippage is already absorbed in margin).
       if (extraCashNeeded > 0) {
         const [extra] = await conn.execute(
           "UPDATE paper_accounts SET cash = cash - ? WHERE id = ? AND cash >= ?",
@@ -504,11 +541,13 @@ async function fillOrderCore(
       }
     } else {
       // No pre-reservation — this is a MARKET short. Atomically debit cash
-      // into reserved_short_margin AND pay extras (slippage + commission)
-      // from cash in the same statement.
+      // into reserved_short_margin AT THE ADJUSTED VALUE and pay commission
+      // from cash in the same statement. Slippage is NOT a separate cash
+      // debit; it's baked into the smaller `investmentAdjusted` margin.
+      const totalDebit = investmentAdjusted + extraCashNeeded;
       const [move] = await conn.execute(
         "UPDATE paper_accounts SET cash = cash - ?, reserved_short_margin = reserved_short_margin + ? WHERE id = ? AND cash >= ?",
-        [investment + extraCashNeeded, investment, accountId, investment + extraCashNeeded]
+        [totalDebit, investmentAdjusted, accountId, totalDebit]
       ) as [mysqlTypes.ResultSetHeader, unknown];
       if (move.affectedRows !== 1) {
         await rejectOrder(conn, orderId, "INSUFFICIENT_CASH");
@@ -516,8 +555,14 @@ async function fillOrderCore(
       }
     }
 
+    // `investment_usd` on the trade row stores the ADJUSTED proceeds for
+    // shorts (= margin held). This keeps the close path's `investmentShare`
+    // derivation consistent with margin releases without changing formulas.
+    // The tradeoff: shorts' `investment_usd` is slightly smaller than the
+    // nominal amount the user asked for; LONGS still use nominal. That
+    // asymmetry is intentional and documented in the conservation test.
     return await insertOpenTrade(conn, {
-      accountId, symbol, quantity, fillPrice: adjustedPrice, investment,
+      accountId, symbol, quantity, fillPrice: adjustedPrice, investment: investmentAdjusted,
       positionSide: "SHORT", side: "SELL", order, orderId, opts,
       slippageUsd, commissionUsd,
     });
@@ -653,45 +698,100 @@ async function fillOrderCore(
   // from the net cash credit so a round-trip on a winning trade that lands
   // ON the commission floor ($1 min each leg) correctly shows a tiny
   // commission drag on realized P&L.
+  //
+  // Codex round-2 bug #1 — cash-underflow guard on close path. When a small
+  // partial close meets a disproportionately large commission (or the SHORT
+  // cover formula `2*I − cv − comm` lands negative on a wildly-underwater
+  // cover), the cash credit can be negative. Blindly applying `cash = cash +
+  // credit` could push `cash` below zero, violating the W1 "cash never goes
+  // negative" invariant. Guard with `cash + credit >= 0`; if the guard fires
+  // we HARD REJECT (rollback) so the position remains OPEN. Left out of the
+  // SOFT_REJECT set intentionally — this is pathological (position wiped out
+  // cash reserves), not a state-based "order was invalid" rejection.
   if (expectedTradeSide === "LONG") {
     // Credit (closeValue - commission) to cash. No margin involvement.
     const netCredit = closeValue - closeCommissionUsd;
     const [creditResult] = await conn.execute(
-      "UPDATE paper_accounts SET cash = cash + ? WHERE id = ?",
-      [netCredit, accountId]
+      "UPDATE paper_accounts SET cash = cash + ? WHERE id = ? AND (cash + ?) >= 0",
+      [netCredit, accountId, netCredit]
     ) as [mysqlTypes.ResultSetHeader, unknown];
     if (creditResult.affectedRows !== 1) {
-      return { filled: false, rejection: "ACCOUNT_VANISHED" };
+      // Distinguish "account vanished" (no row) from "underflow" (row exists
+      // but guard fired). Accepting a quick extra SELECT here is cheap — we
+      // only pay it on the rare failure path.
+      const [stillThere] = await conn.execute(
+        "SELECT id FROM paper_accounts WHERE id = ?", [accountId]
+      ) as [mysqlTypes.RowDataPacket[], unknown];
+      return { filled: false, rejection: stillThere.length === 0 ? "ACCOUNT_VANISHED" : "CASH_UNDERFLOW_ON_CLOSE" };
     }
   } else {
-    // SHORT cover. Accounting model:
-    //   OPEN:  cash -= investment    (deposit collateral)
-    //          reserved_short_margin += investment
-    //          Conceptually margin holds BOTH collateral AND the short-sale
-    //          proceeds — a standard cash-account short requires 100% of
-    //          position value as margin, and the short-sale generates the
-    //          other 100% which is also held. So equity is unchanged at open:
-    //            equity = cash + margin = (C - I) + I = C.
+    // SHORT cover. Accounting model (codex round-2 bug #2 fix):
+    //   OPEN:  cash -= (adj*qty + commission)   (slippage baked into margin)
+    //          reserved_short_margin += adj*qty
+    //          Margin equals the actual proceeds we would have received at
+    //          the adverse-adjusted price — the old nominal-margin model hid
+    //          the open-leg slippage inside the margin pot, letting it sneak
+    //          back out on cover as a phantom reimbursement. Using adj*qty
+    //          means slippage is a real cost recorded once on the trade row
+    //          and not double-counted through the cash ledger.
     //
-    //   COVER: release investmentShare of margin, pay closeValue to buy back.
-    //          Net cash delta = investmentShare_released_from_margin + pnl
-    //          where pnl = investmentShare - closeValue = (entry - close) * qty.
-    //          Equivalently: cash += (2 * investmentShare - closeValue)
-    //                                = investmentShare + pnlSlice.
-    //          reserved_short_margin -= investmentShare.
-    //          W4: commission additionally shaves the cash credit on cover.
+    //   COVER: release `marginRelease = buy_price * closeQty` from margin
+    //          (buy_price on the trade row is the ADJUSTED open price, so
+    //          marginRelease == adj_open * closeQty — exactly what went into
+    //          margin at open). Pay `closeValue = adj_close * closeQty` to
+    //          buy back. Net cash delta = 2*marginRelease − closeValue − comm
+    //                                   = marginRelease + pnlSlice − comm
+    //          reserved_short_margin -= marginRelease.
     //
-    // Concrete example: open $1000 short at $100 (qty 10), cover at $90.
-    //   At open: cash 100k→99k, margin 0→1k, equity 100k (+ extras on W4).
-    //   At cover: closeValue = 10*90 = 900. investmentShare = 1000.
-    //   cash += (1000 + 1000 - 900) - commission = 1100 - $1. margin -= 1000.
-    //   Final: cash 99k + 1099 = 100099, margin 0, equity = initial + pnl_net.
-    const cashCredit = 2 * investmentShare - closeValue - closeCommissionUsd;
+    //          W4: commission shaves the cash credit on cover.
+    //
+    // Concrete example: open $1000 short at quote $100 MARKET, 5bps adverse.
+    //   adj_open = $99.95, qty = 10, marginRelease_stored = $999.50.
+    //   At open: cash -1000.50 (adj*qty + $1 comm), margin +999.50.
+    //   Cover at $90 LIMIT (adj_close = $90 exactly).
+    //     closeValue = 10*90 = 900. marginRelease = 999.50.
+    //     cash += (2*999.50 - 900 - 1) = 1098.00. margin -= 999.50.
+    //     Realized pnl = (99.95 - 90)*10 = 99.50; cash delta round-trip
+    //     = -1000.50 + 1098.00 = 97.50 = pnl - 2*commission. ✓
+    //
+    // Codex round-2 bug #6 — partial-day borrow accrual on cover is NOT
+    // computed here. The borrow cron runs end-of-day (17:00 ET weekdays);
+    // positions covered intraday before that day's run miss that final
+    // day's borrow. Deemed acceptable MVP precision — daily granularity is
+    // sufficient for paper-trading realism. If real borrow desks adopt
+    // intraday accrual we'll revisit.
+    const adjustedMarginRelease = buyPrice * closeQty;
+    const cashCredit = 2 * adjustedMarginRelease - closeValue - closeCommissionUsd;
+    // Codex round-2 bug #1 — cash-underflow guard. A deeply-adverse cover
+    // on a partial position can produce a negative cashCredit (closeValue
+    // exceeds 2*marginRelease by more than the margin itself — i.e. the
+    // price doubled against the short). HARD REJECT (not SOFT) so the
+    // position stays OPEN; the user must close in smaller slices or top
+    // up cash before closing.
     const [release] = await conn.execute(
-      "UPDATE paper_accounts SET reserved_short_margin = reserved_short_margin - ?, cash = cash + ? WHERE id = ? AND reserved_short_margin >= ?",
-      [investmentShare, cashCredit, accountId, investmentShare]
+      "UPDATE paper_accounts SET reserved_short_margin = reserved_short_margin - ?, cash = cash + ? WHERE id = ? AND reserved_short_margin >= ? AND (cash + ?) >= 0",
+      [adjustedMarginRelease, cashCredit, accountId, adjustedMarginRelease, cashCredit]
     ) as [mysqlTypes.ResultSetHeader, unknown];
     if (release.affectedRows !== 1) {
+      // Distinguish the two failure modes. Margin-missing is a corrupted
+      // state (position existed but margin was released elsewhere); underflow
+      // is a pathological cover on an underwater position.
+      const [acctCheck] = await conn.execute(
+        "SELECT cash, reserved_short_margin FROM paper_accounts WHERE id = ?",
+        [accountId]
+      ) as [mysqlTypes.RowDataPacket[], unknown];
+      if (acctCheck.length === 0) {
+        return { filled: false, rejection: "ACCOUNT_VANISHED" };
+      }
+      const curMargin = Number(acctCheck[0].reserved_short_margin ?? 0);
+      const curCash = Number(acctCheck[0].cash ?? 0);
+      if (curMargin < adjustedMarginRelease - 1e-9) {
+        return { filled: false, rejection: "SHORT_MARGIN_MISSING" };
+      }
+      if (curCash + cashCredit < -1e-9) {
+        return { filled: false, rejection: "CASH_UNDERFLOW_ON_CLOSE" };
+      }
+      // Fell through — treat as margin-missing (shouldn't happen in practice).
       return { filled: false, rejection: "SHORT_MARGIN_MISSING" };
     }
   }

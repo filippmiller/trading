@@ -348,39 +348,42 @@ async function test7_fractionalOn(accountId) {
   assert(Math.abs(fill.quantity - (100 / 333)) < 1e-6, `qty = 100/333 ≈ 0.3003003 (got ${fill.quantity})`);
 }
 
-// ── Test 8: Borrow cost accrual ──────────────────────────────────────────
+// ── Test 8: Borrow cost accrual — multi-day via targetDate override ──────
 async function test8_borrowAccrual(accountId) {
-  console.log("\nTest 8: Borrow cost — open SHORT $1000 @ $100, 2.5% annual, accrue 7 days");
+  console.log("\nTest 8: Borrow cost — open SHORT $1000 @ $100, 2.5% annual, accrue 7 calendar days");
   await resetAcctState(accountId);
   paperRisk._setRiskConfigForTest({
     slippageBps: 0, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
     allowFractionalShares: true, defaultBorrowRatePct: 2.5,
   });
-  // Open SHORT $1000 @ $100 → qty 10
-  const orderId = await insertOrder(accountId, "ZTEST_SHORT", "SELL", "SHORT", "MARKET", { investment_usd: 1000 });
+  // Open SHORT $1000 @ $100 (LIMIT to skip slippage). qty = 10.
+  const orderId = await insertOrder(accountId, "ZTEST_SHORT", "SELL", "SHORT", "LIMIT", { investment_usd: 1000 });
   const fill = await paperFill.fillOrder(pool, orderId, 100);
   assert(fill.filled === true, `SHORT open ok (got ${JSON.stringify(fill)})`);
 
-  // Seed the trade row's borrow_daily_rate_pct = 2.5 (the fill path does NOT
-  // auto-seed this yet; the smoke test sets it explicitly to exercise the
-  // cron. Production will eventually set it at open time — noted as follow-up).
-  await pool.execute("UPDATE paper_trades SET borrow_daily_rate_pct = 2.5 WHERE id = ?", [fill.tradeId]);
+  // Seed the trade row's borrow_daily_rate_pct = 2.5 and pin buy_date so the
+  // DATEDIFF calc is deterministic across wall-clock drift.
+  const baseDate = "2026-04-01"; // buy date for this test
+  await pool.execute(
+    "UPDATE paper_trades SET borrow_daily_rate_pct = 2.5, buy_date = ?, last_borrow_accrued_date = NULL WHERE id = ?",
+    [baseDate, fill.tradeId]
+  );
 
   const acctBefore = await getAccount(accountId);
   const { jobAccrueBorrowCost } = require("./surveillance-cron-borrow.cjs");
-  // Call 7 times — simulates 7 weekdays of accrual.
-  for (let i = 0; i < 7; i++) await jobAccrueBorrowCost(pool);
+  // Run cron with targetDate = baseDate + 7 days — one call accrues all 7.
+  const target = "2026-04-08"; // 7 calendar days after base
+  const res = await jobAccrueBorrowCost(pool, { targetDate: target });
   const acctAfter = await getAccount(accountId);
-  // Daily: qty * price * 2.5/100 / 365 = 10 * 100 * 0.025 / 365 ≈ 0.0684931
-  // 7 days: ≈ 0.4794520
   const expectedDebit = 7 * (10 * 100 * 0.025 / 365);
   const delta = Number(acctBefore.cash) - Number(acctAfter.cash);
   assert(Math.abs(delta - expectedDebit) < 1e-4, `7-day borrow debit = ${expectedDebit.toFixed(6)} (got ${delta.toFixed(6)})`);
+  assert(res.debited === 1 && res.skipped === 0, `one trade debited, none skipped (got debited=${res.debited} skipped=${res.skipped})`);
 }
 
-// ── Test 9: SHORT open ledger ───────────────────────────────────────────
+// ── Test 9: SHORT open ledger (round-2 bug #2 fix) ──────────────────────
 async function test9_shortOpenLedger(accountId) {
-  console.log("\nTest 9: SHORT open — slippage adverse (price down) + commission");
+  console.log("\nTest 9 (round-2 #2): SHORT open — margin = adj*qty (not nominal)");
   await resetAcctState(accountId);
   paperRisk._setRiskConfigForTest({
     slippageBps: 5, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
@@ -391,15 +394,264 @@ async function test9_shortOpenLedger(accountId) {
   assert(fill.filled === true, `SHORT open ok`);
   // SELL slippage: 100 * 0.9995 = 99.95. qty = 1000/100 = 10.
   assert(Math.abs(fill.fillPrice - 99.95) < EPS, `adj SHORT fillPrice = 99.95 (got ${fill.fillPrice})`);
-  const [[t]] = await pool.execute("SELECT buy_price, slippage_usd, commission_usd FROM paper_trades WHERE id = ?", [fill.tradeId]);
-  assert(Math.abs(Number(t.slippage_usd) - 0.5) < EPS, `slip = 0.50`);
+  const [[t]] = await pool.execute(
+    "SELECT buy_price, slippage_usd, commission_usd, investment_usd FROM paper_trades WHERE id = ?",
+    [fill.tradeId]
+  );
+  assert(Math.abs(Number(t.slippage_usd) - 0.5) < EPS, `slip = 0.50 (tracked)`);
   assert(Math.abs(Number(t.commission_usd) - 1.0) < EPS, `comm = 1.00`);
-
-  // Cash flow: investment $1000 moved into short margin, extras $0.50 + $1.00 out of cash.
+  // Margin now = adj*qty = 99.95*10 = 999.5, NOT nominal 1000.
+  const expectedMargin = 99.95 * 10;
   const acct = await getAccount(accountId);
-  const expectedCash = TEST_INITIAL_CASH - 1000 - 0.5 - 1.0;
-  assert(Math.abs(Number(acct.cash) - expectedCash) < EPS, `cash = ${expectedCash} (got ${acct.cash})`);
-  assert(Math.abs(Number(acct.reserved_short_margin) - 1000) < EPS, `short margin = 1000 (got ${acct.reserved_short_margin})`);
+  assert(Math.abs(Number(acct.reserved_short_margin) - expectedMargin) < EPS,
+    `short margin = ${expectedMargin} (got ${acct.reserved_short_margin})`);
+  // investment_usd on trade row = adjusted margin (for shorts).
+  assert(Math.abs(Number(t.investment_usd) - expectedMargin) < EPS,
+    `paper_trades.investment_usd = ${expectedMargin} for SHORT (got ${t.investment_usd})`);
+  // Cash flow: adj*qty moved to margin, commission out of cash. Slippage is
+  // NOT a separate cash debit under round-2 fix — it's baked into the smaller
+  // margin, captured only informationally on slippage_usd.
+  const expectedCash = TEST_INITIAL_CASH - expectedMargin - 1.0;
+  assert(Math.abs(Number(acct.cash) - expectedCash) < EPS,
+    `cash = ${expectedCash} (got ${acct.cash})`);
+}
+
+// ── Test 10 (round-2 #2): SHORT round-trip same adj price → PnL = -2*comm ─
+async function test10_shortRoundTripSamePriceNoPhantomRecoup(accountId) {
+  console.log("\nTest 10 (round-2 #2): SHORT round-trip same adj price → PnL = -2*commission");
+  await resetAcctState(accountId);
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 5, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
+    allowFractionalShares: true, defaultBorrowRatePct: 0,
+  });
+  // Open short MARKET at $100 quote → adj = $99.95, qty = 10, margin = $999.50.
+  const openId = await insertOrder(accountId, "ZTEST_SHORT", "SELL", "SHORT", "MARKET", { investment_usd: 1000 });
+  const open = await paperFill.fillOrder(pool, openId, 100);
+  assert(open.filled === true, `SHORT open ok`);
+  // Cover LIMIT at $99.95 (no cover-leg slippage). closeValue = $999.50.
+  const coverId = await insertOrder(accountId, "ZTEST_SHORT", "BUY", "SHORT", "LIMIT", { trade_id: open.tradeId });
+  const cover = await paperFill.fillOrder(pool, coverId, 99.95);
+  assert(cover.filled === true, `cover ok (got ${JSON.stringify(cover)})`);
+
+  const acct = await getAccount(accountId);
+  const expectedCashDelta = -2 * 1.0; // -2*commission; zero slippage recoup
+  const actualCashDelta = Number(acct.cash) - TEST_INITIAL_CASH;
+  assert(Math.abs(actualCashDelta - expectedCashDelta) < EPS,
+    `round-trip cash delta = -2*commission = ${expectedCashDelta} (got ${actualCashDelta.toFixed(6)})`);
+  // Margin fully released.
+  assert(Math.abs(Number(acct.reserved_short_margin)) < EPS,
+    `reserved_short_margin released to 0 (got ${acct.reserved_short_margin})`);
+}
+
+// ── Test 11 (round-2 #1): LONG close — commission > proceeds → underflow HARD REJECT ──
+async function test11_cashUnderflowOnLongClose(accountId) {
+  console.log("\nTest 11 (round-2 #1): LONG close commission > cash+proceeds → HARD REJECT, cash untouched");
+  await resetAcctState(accountId);
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 0, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
+    allowFractionalShares: true, defaultBorrowRatePct: 0,
+  });
+  // Open tiny LONG, then drain cash to near-zero, then try to close with huge
+  // commission. Goal: (closeValue - commission) < -cash so (cash + credit) < 0.
+  const openId = await insertOrder(accountId, "ZTEST_AAPL", "BUY", "LONG", "MARKET", { investment_usd: 10 });
+  const open = await paperFill.fillOrder(pool, openId, 100); // qty = 0.1, cash -11 (10 inv + 1 comm)
+  assert(open.filled === true, `open ok`);
+  // Drain remaining cash to -$5 worth below threshold via direct UPDATE.
+  await pool.execute("UPDATE paper_accounts SET cash = 0.05 WHERE id = ?", [accountId]);
+  // Jack up commission to $50 so close-value ($10) - $50 commission = -$40 credit,
+  // cash would become 0.05 - 40 < 0.
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 0, commissionPerShare: 0.005, commissionMinPerLeg: 50.0,
+    allowFractionalShares: true, defaultBorrowRatePct: 0,
+  });
+  const closeId = await insertOrder(accountId, "ZTEST_AAPL", "SELL", "LONG", "MARKET", { trade_id: open.tradeId });
+  const close = await paperFill.fillOrder(pool, closeId, 100);
+  assert(close.filled === false, `close rejected (got ${JSON.stringify(close)})`);
+  assert(close.rejection === "CASH_UNDERFLOW_ON_CLOSE",
+    `rejection = CASH_UNDERFLOW_ON_CLOSE (got ${close.rejection})`);
+  // Cash must be UNTOUCHED (0.05) — HARD REJECT rolled back.
+  const acct = await getAccount(accountId);
+  assert(Math.abs(Number(acct.cash) - 0.05) < EPS, `cash unchanged = 0.05 (got ${acct.cash})`);
+  // Position must remain OPEN.
+  const [[trade]] = await pool.execute("SELECT status FROM paper_trades WHERE id = ?", [open.tradeId]);
+  assert(trade.status === "OPEN", `trade stays OPEN (got ${trade.status})`);
+}
+
+// ── Test 12 (round-2 #3): concurrent cover vs borrow cron — race-safe skip ──
+async function test12_borrowCronSkipsClosedShort(accountId) {
+  console.log("\nTest 12 (round-2 #3): borrow cron re-checks status='OPEN' under trade lock → skip if raced to CLOSED");
+  await resetAcctState(accountId);
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 0, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
+    allowFractionalShares: true, defaultBorrowRatePct: 2.5,
+  });
+  // Open SHORT, seed borrow rate + buy_date.
+  const openId = await insertOrder(accountId, "ZTEST_SHORT", "SELL", "SHORT", "LIMIT", { investment_usd: 1000 });
+  const open = await paperFill.fillOrder(pool, openId, 100);
+  assert(open.filled === true, `short open ok`);
+  await pool.execute(
+    "UPDATE paper_trades SET borrow_daily_rate_pct = 2.5, buy_date = '2026-04-01', last_borrow_accrued_date = NULL WHERE id = ?",
+    [open.tradeId]
+  );
+
+  // To exercise the per-trade re-check under lock, we use a cron variant
+  // that accepts an injected hook fired BETWEEN the outer snapshot SELECT
+  // and each per-trade transaction. The hook flips the row to CLOSED; the
+  // per-trade tx's `FOR UPDATE` re-read must see it and skip.
+  //
+  // Instead of duplicating the cron, we simulate here by opening a race
+  // window: spawn two "workers" — the flip and the cron — on separate
+  // connections. In a single-threaded JS runner we serialize as: (a) the
+  // outer SELECT in the cron picks up the trade as OPEN, (b) before the
+  // per-trade tx hits the FOR UPDATE re-read, we flip to CLOSED on a
+  // sibling connection, (c) the tx must see CLOSED and skip.
+  //
+  // Easiest simulation: wrap the cron so we can monkeypatch the pool to
+  // flip the row right before tradeRows is read. Since we can't do that
+  // cleanly with the current signature, we instead exercise the status
+  // re-check path DIRECTLY by running the per-trade block ourselves.
+  const conn = await pool.getConnection();
+  let skipped = false;
+  try {
+    await conn.beginTransaction();
+    // Lock account, then flip status=CLOSED (simulating a commit from another
+    // worker that already released the margin & closed the trade).
+    await conn.execute("SELECT id FROM paper_accounts WHERE id = ? FOR UPDATE", [accountId]);
+    // Flip status on a separate connection — simulates another tx already
+    // committed the cover.
+    await pool.execute("UPDATE paper_trades SET status = 'CLOSED' WHERE id = ?", [open.tradeId]);
+    // Now, from within our tx, re-read trade under FOR UPDATE (same query
+    // the cron uses). It must see CLOSED.
+    const [rows] = await conn.execute(
+      "SELECT status FROM paper_trades WHERE id = ? FOR UPDATE",
+      [open.tradeId]
+    );
+    if (rows.length > 0 && rows[0].status !== "OPEN") {
+      skipped = true;
+      await conn.rollback();
+    } else {
+      await conn.rollback();
+    }
+  } finally {
+    conn.release();
+  }
+  assert(skipped === true, `per-trade FOR UPDATE re-read sees CLOSED and skips`);
+
+  // Additionally: running the full cron on the now-closed trade must yield
+  // zero debits (trade filtered out by the outer WHERE status='OPEN').
+  const cashBefore = Number((await getAccount(accountId)).cash);
+  const { jobAccrueBorrowCost } = require("./surveillance-cron-borrow.cjs");
+  const res = await jobAccrueBorrowCost(pool, { targetDate: "2026-04-08" });
+  const cashAfter = Number((await getAccount(accountId)).cash);
+  assert(Math.abs(cashAfter - cashBefore) < EPS,
+    `cash unchanged when trade already closed (before=${cashBefore} after=${cashAfter})`);
+  assert(res.debited === 0,
+    `cron debited=0 for already-closed position (got ${res.debited})`);
+}
+
+// ── Test 13 (round-2 #4): cron runs twice same day → second run no-ops ──
+async function test13_cronIdempotencySameDay(accountId) {
+  console.log("\nTest 13 (round-2 #4): cron twice same day → 2nd run no-op (0 days to accrue)");
+  await resetAcctState(accountId);
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 0, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
+    allowFractionalShares: true, defaultBorrowRatePct: 2.5,
+  });
+  const openId = await insertOrder(accountId, "ZTEST_SHORT", "SELL", "SHORT", "LIMIT", { investment_usd: 1000 });
+  const open = await paperFill.fillOrder(pool, openId, 100);
+  assert(open.filled === true, `short open ok`);
+  await pool.execute(
+    "UPDATE paper_trades SET borrow_daily_rate_pct = 2.5, buy_date = '2026-04-01', last_borrow_accrued_date = NULL WHERE id = ?",
+    [open.tradeId]
+  );
+
+  const { jobAccrueBorrowCost } = require("./surveillance-cron-borrow.cjs");
+  const cashBefore = Number((await getAccount(accountId)).cash);
+  const res1 = await jobAccrueBorrowCost(pool, { targetDate: "2026-04-08" });
+  const cashAfter1 = Number((await getAccount(accountId)).cash);
+  const res2 = await jobAccrueBorrowCost(pool, { targetDate: "2026-04-08" });
+  const cashAfter2 = Number((await getAccount(accountId)).cash);
+  assert(res1.debited === 1, `run 1 debits (got debited=${res1.debited})`);
+  assert(res2.debited === 0 && res2.skipped === 1,
+    `run 2 no-ops (debited=${res2.debited} skipped=${res2.skipped})`);
+  assert(Math.abs(cashAfter1 - cashAfter2) < EPS, `cash unchanged between run 1 and run 2`);
+  const expected7Days = 7 * (10 * 100 * 0.025 / 365);
+  assert(Math.abs((cashBefore - cashAfter1) - expected7Days) < 1e-4,
+    `run 1 debited 7 days (got ${(cashBefore - cashAfter1).toFixed(6)})`);
+}
+
+// ── Test 14 (round-2 #5): multi-day span includes weekend ────────────────
+async function test14_weekendAccrualIncluded(accountId) {
+  console.log("\nTest 14 (round-2 #5): Friday→Monday accrual = 3 calendar days (weekend included)");
+  await resetAcctState(accountId);
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 0, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
+    allowFractionalShares: true, defaultBorrowRatePct: 2.5,
+  });
+  const openId = await insertOrder(accountId, "ZTEST_SHORT", "SELL", "SHORT", "LIMIT", { investment_usd: 1000 });
+  const open = await paperFill.fillOrder(pool, openId, 100);
+  assert(open.filled === true, `short open ok`);
+  // Seed last_borrow_accrued_date = Friday 2026-04-03, target = Monday 2026-04-06.
+  await pool.execute(
+    "UPDATE paper_trades SET borrow_daily_rate_pct = 2.5, buy_date = '2026-03-15', last_borrow_accrued_date = '2026-04-03' WHERE id = ?",
+    [open.tradeId]
+  );
+  const cashBefore = Number((await getAccount(accountId)).cash);
+  const { jobAccrueBorrowCost } = require("./surveillance-cron-borrow.cjs");
+  const res = await jobAccrueBorrowCost(pool, { targetDate: "2026-04-06" });
+  const cashAfter = Number((await getAccount(accountId)).cash);
+  // Fri→Mon = 3 calendar days (Sat, Sun, Mon).
+  const expected3Days = 3 * (10 * 100 * 0.025 / 365);
+  assert(res.debited === 1, `cron debited once`);
+  assert(Math.abs((cashBefore - cashAfter) - expected3Days) < 1e-4,
+    `3-day weekend-span debit = ${expected3Days.toFixed(6)} (got ${(cashBefore - cashAfter).toFixed(6)})`);
+  // Verify last_borrow_accrued_date advanced to target.
+  const [[t]] = await pool.execute(
+    "SELECT last_borrow_accrued_date FROM paper_trades WHERE id = ?",
+    [open.tradeId]
+  );
+  const lastIso = new Date(t.last_borrow_accrued_date).toISOString().slice(0, 10);
+  assert(lastIso === "2026-04-06", `last_borrow_accrued_date = 2026-04-06 (got ${lastIso})`);
+}
+
+// ── Test 15 (round-2 #6): cover-path intraday accrual = documented limitation ──
+async function test15_coverIntradayAccrualSkipped(accountId) {
+  console.log("\nTest 15 (round-2 #6): cover path does NOT catch-up intraday borrow (documented MVP limitation)");
+  await resetAcctState(accountId);
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 0, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
+    allowFractionalShares: true, defaultBorrowRatePct: 2.5,
+  });
+  // Open short, seed borrow.
+  const openId = await insertOrder(accountId, "ZTEST_SHORT", "SELL", "SHORT", "LIMIT", { investment_usd: 1000 });
+  const open = await paperFill.fillOrder(pool, openId, 100);
+  assert(open.filled === true, `short open`);
+  // Seed last_borrow_accrued_date a few days ago; cover today at same price.
+  await pool.execute(
+    "UPDATE paper_trades SET borrow_daily_rate_pct = 2.5, buy_date = '2026-04-01', last_borrow_accrued_date = '2026-04-05' WHERE id = ?",
+    [open.tradeId]
+  );
+  const cashBeforeCover = Number((await getAccount(accountId)).cash);
+  // Cover LIMIT at exact adj open price (0 pnl, commission only).
+  const coverId = await insertOrder(accountId, "ZTEST_SHORT", "BUY", "SHORT", "LIMIT", { trade_id: open.tradeId });
+  const cover = await paperFill.fillOrder(pool, coverId, 100);
+  assert(cover.filled === true, `cover ok`);
+  const cashAfterCover = Number((await getAccount(accountId)).cash);
+  // Under MVP limitation: cover does NOT catch up borrow between
+  // last_borrow_accrued_date and today. Cash delta = -commission only.
+  const coverCashDelta = cashAfterCover - cashBeforeCover;
+  // SHORT cover at no-slippage LIMIT $100 = closeValue 1000; margin release
+  // = adj_open * qty = 100 * 10 = 1000. cashCredit = 2*1000 - 1000 - 1 = 999.
+  assert(Math.abs(coverCashDelta - 999) < EPS,
+    `cover cash credit = 999 (no borrow catch-up, got ${coverCashDelta.toFixed(6)})`);
+  // Trade is CLOSED; last_borrow_accrued_date unchanged.
+  const [[t]] = await pool.execute(
+    "SELECT status, last_borrow_accrued_date FROM paper_trades WHERE id = ?",
+    [open.tradeId]
+  );
+  assert(t.status === "CLOSED", `trade closed`);
+  const lastIso = new Date(t.last_borrow_accrued_date).toISOString().slice(0, 10);
+  assert(lastIso === "2026-04-05", `last_borrow_accrued_date unchanged = 2026-04-05 (got ${lastIso}) — confirms MVP limitation`);
 }
 
 // ── Run ─────────────────────────────────────────────────────────────────
@@ -422,6 +674,12 @@ async function test9_shortOpenLedger(accountId) {
     await test7_fractionalOn(accountId);
     await test8_borrowAccrual(accountId);
     await test9_shortOpenLedger(accountId);
+    await test10_shortRoundTripSamePriceNoPhantomRecoup(accountId);
+    await test11_cashUnderflowOnLongClose(accountId);
+    await test12_borrowCronSkipsClosedShort(accountId);
+    await test13_cronIdempotencySameDay(accountId);
+    await test14_weekendAccrualIncluded(accountId);
+    await test15_coverIntradayAccrualSkipped(accountId);
 
     console.log(`\n== SUMMARY: ${passed} passed, ${failed} failed ==`);
     if (failed > 0) {
