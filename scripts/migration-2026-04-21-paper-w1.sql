@@ -10,13 +10,17 @@
 --
 -- Non-destructive: both columns default to 0, existing rows unaffected.
 --
--- Post-apply reconciliation for finding #4 (cash/realized-P&L inconsistency
--- on Railway production — `paper_accounts` was never re-loaded during the
--- 2026-04-21 VPS→Railway restore, so Railway's Default account kept
--- cash=100000 even though the restored paper_trades rows summed to
--- +$30.71 realized P&L). After applying this migration, run the
--- reconciliation block at the bottom of this file to bring Railway's
--- `paper_accounts.cash` back in line with paper_trades history.
+-- ── M1 codex finding — reconciliation is NOT run automatically ────────────
+-- This migration DOES NOT perform any reconciliation UPDATE. An earlier draft
+-- included an unconditional `SET cash = initial_cash + SUM(pnl) ...` which
+-- would have corrupted live state on any re-run once real reservations or
+-- open positions exist. All reconciliation SQL in this file is COMMENTED OUT
+-- and documented as a manual one-shot procedure. Operators should execute
+-- the inspection SELECT first, confirm the drift is purely a data-restore
+-- artefact (no OPEN positions, no PENDING reservations), and only then copy
+-- the UPDATE into a MySQL shell by hand. The long-term home for any
+-- repeatable reconcile logic is `scripts/reconcile-paper-accounts.sql`
+-- (to be created when we need it) — never this forward-schema migration.
 
 -- ── Column additions ──────────────────────────────────────────────────────
 

@@ -9,18 +9,32 @@
  * Invariants maintained:
  *   1. `paper_accounts.cash` can never go negative — atomic
  *      `UPDATE ... WHERE cash >= ?` enforces this at the DB layer.
- *   2. An order can fill at most once — `UPDATE ... WHERE status='PENDING'`
+ *   2. `paper_accounts.reserved_cash` can never go negative — atomic
+ *      `UPDATE ... WHERE reserved_cash >= ?` enforces this, and every
+ *      release asserts affectedRows === 1 so a missing account cannot
+ *      silently consume the reservation marker.
+ *   3. An order can fill at most once — `UPDATE ... WHERE status='PENDING'`
  *      on the FILLED transition enforces this; affectedRows === 0 means a
  *      concurrent caller already filled it.
- *   3. A trade can close at most once — `UPDATE ... WHERE status='OPEN'`
+ *   4. A trade can close at most once — `UPDATE ... WHERE status='OPEN'`
  *      on SELL enforces this.
- *   4. SELLs can only target a trade owned by the same account AND with the
+ *   5. SELLs can only target a trade owned by the same account AND with the
  *      same symbol as the order — prevents cross-position / cross-account
  *      leaks.
- *   5. Reserved cash for a PENDING BUY is released back on fill/cancel/reject
+ *   6. Reserved cash for a PENDING BUY is released back on fill/cancel/reject
  *      so that an unfilled reservation never permanently "eats" cash.
- *   6. fillPrice is validated finite & > 0 at the entry of fillOrder so that
- *      quantity = investment / fillPrice cannot produce Infinity / NaN.
+ *   7. fillPrice is validated finite & > 0 at the entry of fillOrder, AND
+ *      quantity = investment / fillPrice is validated BEFORE any cash moves,
+ *      so an invalid quantity can never soft-commit after funds were debited.
+ *
+ * GLOBAL LOCK ORDER (invariant — do not violate):
+ *     paper_accounts  →  paper_orders  →  paper_trades
+ *
+ * Every `FOR UPDATE` / mutating write in this file acquires row locks in that
+ * order. Mixing it (e.g. locking orders before accounts) creates a deadlock
+ * cycle when two concurrent fills touch the same (account, order) pair from
+ * opposite entry points. If you add a new code path, audit it against this
+ * invariant before committing.
  */
 
 import type mysqlTypes from "mysql2/promise";
@@ -32,11 +46,31 @@ export type FillOrderResult =
 const MAX_REJECTION_LEN = 255;
 
 /**
+ * Rejections that describe a state decision (order is invalid / account
+ * missing / trade mismatch) — no cash was moved, so committing the REJECTED
+ * row is the correct outcome.
+ *
+ * Rejections NOT in this set are "race lost" variants where another writer
+ * transitioned a row mid-flight; the caller MUST roll back to undo any
+ * intermediate writes.
+ */
+const SOFT_REJECT = new Set([
+  "INVALID_PRICE",
+  "ORDER_NOT_FOUND",
+  "ORDER_NOT_PENDING_FILLED",
+  "ORDER_NOT_PENDING_CANCELLED",
+  "ORDER_NOT_PENDING_REJECTED",
+  "INVALID_INVESTMENT",
+  "INVALID_QUANTITY",
+  "ACCOUNT_NOT_FOUND",
+  "INSUFFICIENT_CASH",
+  "TRADE_MISMATCH",
+  "NO_OPEN_POSITION",
+]);
+
+/**
  * Internal helper — runs the fill against the supplied connection. Caller
  * is responsible for wrapping in `beginTransaction` / `commit` / `rollback`.
- * This split lets both `fillOrder` (which manages its own txn) and future
- * batch-fill orchestrators (which want to fill N orders under one txn) share
- * the same core logic.
  */
 async function fillOrderCore(
   conn: mysqlTypes.PoolConnection,
@@ -48,7 +82,32 @@ async function fillOrderCore(
     return { filled: false, rejection: "INVALID_PRICE" };
   }
 
-  // Lock the order row — prevents a second tick from racing us.
+  // Preliminary non-locking read purely to discover account_id / side so we
+  // can lock in canonical order (accounts first). We re-read the order
+  // under FOR UPDATE below to get authoritative state + status guard.
+  const [preRows] = await conn.execute(
+    "SELECT account_id, side FROM paper_orders WHERE id = ?",
+    [orderId]
+  ) as [mysqlTypes.RowDataPacket[], unknown];
+  if (preRows.length === 0) return { filled: false, rejection: "ORDER_NOT_FOUND" };
+  const accountId = Number(preRows[0].account_id);
+  const preSide = preRows[0].side as "BUY" | "SELL";
+
+  // LOCK STEP 1 — paper_accounts. For BUY we need it to move cash; for SELL
+  // we need it to credit proceeds. Always lock first per global invariant.
+  const [acctRows] = await conn.execute(
+    "SELECT id, cash, reserved_cash FROM paper_accounts WHERE id = ? FOR UPDATE",
+    [accountId]
+  ) as [mysqlTypes.RowDataPacket[], unknown];
+  if (acctRows.length === 0) {
+    // Even for a missing account we still need to transition the order to
+    // REJECTED so it doesn't sit forever. rejectOrder locks the order row
+    // internally in canonical order.
+    await rejectOrder(conn, orderId, "ACCOUNT_NOT_FOUND");
+    return { filled: false, rejection: "ACCOUNT_NOT_FOUND" };
+  }
+
+  // LOCK STEP 2 — paper_orders. Authoritative read with status guard.
   const [orderRows] = await conn.execute(
     "SELECT * FROM paper_orders WHERE id = ? FOR UPDATE",
     [orderId]
@@ -58,8 +117,13 @@ async function fillOrderCore(
   if (order.status !== "PENDING") {
     return { filled: false, rejection: `ORDER_NOT_PENDING_${order.status}` };
   }
+  // Side must not change between preliminary read and authoritative read
+  // (orders never swap side). If it did, treat as corruption → reject.
+  if (order.side !== preSide) {
+    await rejectOrder(conn, orderId, "ORDER_SIDE_MISMATCH");
+    return { filled: false, rejection: "ORDER_SIDE_MISMATCH" };
+  }
   const side = order.side as "BUY" | "SELL";
-  const accountId = Number(order.account_id);
   const symbol = String(order.symbol);
 
   if (side === "BUY") {
@@ -69,27 +133,22 @@ async function fillOrderCore(
       return { filled: false, rejection: "INVALID_INVESTMENT" };
     }
 
-    // Lock the account row so reservation math is consistent with the cash move.
-    const [acctRows] = await conn.execute(
-      "SELECT cash, reserved_cash FROM paper_accounts WHERE id = ? FOR UPDATE",
-      [accountId]
-    ) as [mysqlTypes.RowDataPacket[], unknown];
-    if (acctRows.length === 0) {
-      await rejectOrder(conn, orderId, "ACCOUNT_NOT_FOUND");
-      return { filled: false, rejection: "ACCOUNT_NOT_FOUND" };
+    // P1 — Validate quantity BEFORE any cash movement. If fillPrice is
+    // tiny (e.g. 1e-30) the resulting quantity is Infinity; if we let that
+    // through we'd debit cash and THEN reject, leaving funds stranded.
+    // Reject early so the soft-commit path writes only the REJECTED row
+    // without ever touching cash or reserved_cash.
+    const quantity = investment / fillPrice;
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      await rejectOrder(conn, orderId, "INVALID_QUANTITY");
+      return { filled: false, rejection: "INVALID_QUANTITY" };
     }
 
     // Was cash reserved at submit time (LIMIT/STOP) or not (MARKET)?
-    // The submit handler writes `reserved_amount` via the order row. We track
-    // reservation via a dedicated column on the order. If no reservation
-    // happened, we do a fresh atomic debit from `cash`. If a reservation
-    // happened, we debit from `reserved_cash` instead.
     const reservedAmount = Number(order.reserved_amount ?? 0);
 
     if (reservedAmount > 0) {
       // Reservation path — atomic transfer from reserved_cash to the position.
-      // No need to re-check cash here because cash was already moved to
-      // reserved_cash when the order was submitted.
       const [resResult] = await conn.execute(
         "UPDATE paper_accounts SET reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
         [reservedAmount, accountId, reservedAmount]
@@ -98,9 +157,7 @@ async function fillOrderCore(
         await rejectOrder(conn, orderId, "RESERVATION_MISSING");
         return { filled: false, rejection: "RESERVATION_MISSING" };
       }
-      // If the actual fill cost differs from the reservation (limit orders
-      // can fill at any price ≤ limit for BUY), refund the surplus — or if
-      // somehow worse, pull from cash atomically.
+      // Reconcile delta between reserved amount and actual fill cost.
       const delta = reservedAmount - investment;
       if (delta !== 0) {
         if (delta > 0) {
@@ -114,12 +171,8 @@ async function fillOrderCore(
             [-delta, accountId, -delta]
           ) as [mysqlTypes.ResultSetHeader, unknown];
           if (topUp.affectedRows !== 1) {
-            // Can't cover the extra cost — refund reservation + reject.
-            await conn.execute(
-              "UPDATE paper_accounts SET cash = cash + ? WHERE id = ?",
-              [reservedAmount, accountId]
-            );
-            await rejectOrder(conn, orderId, "INSUFFICIENT_CASH_ON_FILL");
+            // Can't cover the extra cost — force rollback by returning a
+            // non-soft rejection.
             return { filled: false, rejection: "INSUFFICIENT_CASH_ON_FILL" };
           }
         }
@@ -136,15 +189,7 @@ async function fillOrderCore(
       }
     }
 
-    const quantity = investment / fillPrice;
-    if (!Number.isFinite(quantity) || quantity <= 0) {
-      // This shouldn't happen after the fillPrice guard above, but
-      // defence-in-depth: if it does, rollback via rejection.
-      // The caller's transaction wrapper will see the non-filled result and
-      // issue rollback(), which undoes the cash debit.
-      return { filled: false, rejection: "INVALID_QUANTITY" };
-    }
-
+    // LOCK STEP 3 — paper_trades (via INSERT; no row pre-exists to FOR UPDATE).
     const [tradeResult] = await conn.execute(
       `INSERT INTO paper_trades
          (account_id, symbol, quantity, buy_price, buy_date, investment_usd, strategy, status, notes)
@@ -177,10 +222,8 @@ async function fillOrderCore(
   }
 
   // SELL path.
-  // Resolve trade_id: if the order carries one, trust it — but still bind it
-  // to (account_id, symbol) to close the cross-account / cross-symbol gap
-  // (codex-d). If no trade_id, pick the oldest OPEN position for this
-  // (account, symbol).
+  // LOCK STEP 3 — paper_trades. Resolve trade_id with account/symbol binding
+  // to close the cross-account / cross-symbol gap.
   let tradeId: number | null = order.trade_id != null ? Number(order.trade_id) : null;
 
   let tradeRows: mysqlTypes.RowDataPacket[];
@@ -227,11 +270,16 @@ async function fillOrderCore(
     return { filled: false, rejection: "TRADE_RACE_LOST" };
   }
 
-  // Credit proceeds atomically.
-  await conn.execute(
+  // Credit proceeds atomically. Account row is already locked (LOCK STEP 1).
+  // Assert affectedRows === 1 — the row existed at lock time, so losing it
+  // now means DB corruption; force rollback.
+  const [creditResult] = await conn.execute(
     "UPDATE paper_accounts SET cash = cash + ? WHERE id = ?",
     [proceeds, accountId]
-  );
+  ) as [mysqlTypes.ResultSetHeader, unknown];
+  if (creditResult.affectedRows !== 1) {
+    return { filled: false, rejection: "ACCOUNT_VANISHED" };
+  }
 
   // Status-guarded order fill.
   const [orderUpdate] = await conn.execute(
@@ -250,32 +298,64 @@ async function fillOrderCore(
   return { filled: true, tradeId, quantity, fillPrice, side: "SELL", pnlUsd };
 }
 
+/**
+ * Write the REJECTED state for an order and release any associated
+ * reservation. Called from inside an in-flight transaction — throws if the
+ * account-side refund cannot complete (e.g. account row vanished or
+ * reserved_cash insufficient), forcing the caller's transaction to roll back
+ * rather than silently committing a reservation leak.
+ *
+ * Lock order: this function assumes LOCK STEP 1 (accounts) is already held
+ * by the caller when a reservation needs to be released. If the caller did
+ * not hold the account lock, the caller must not pass through this path
+ * with a positive `reserved_amount` — in practice every entry point to this
+ * function either (a) has no reservation to release (MARKET orders), or
+ * (b) has already locked the account in `fillOrderCore`.
+ */
 async function rejectOrder(
   conn: mysqlTypes.PoolConnection,
   orderId: number,
   reason: string
 ): Promise<void> {
   const trimmed = reason.slice(0, MAX_REJECTION_LEN);
-  // Status-guarded: only reject if still PENDING. If another writer already
-  // transitioned the row, don't stomp their state.
+  // Status-guarded: only reject if still PENDING.
   await conn.execute(
     "UPDATE paper_orders SET status='REJECTED', rejection_reason=? WHERE id=? AND status='PENDING'",
     [trimmed, orderId]
   );
-  // Release any reservation so cash doesn't get stuck.
+  // Release any reservation so cash doesn't get stuck. The SELECT runs
+  // without FOR UPDATE here because the caller holds the order lock already
+  // (every call site is inside fillOrderCore after LOCK STEP 2).
   const [orderRows] = await conn.execute(
     "SELECT account_id, reserved_amount FROM paper_orders WHERE id = ?",
     [orderId]
   ) as [mysqlTypes.RowDataPacket[], unknown];
-  if (orderRows.length > 0) {
-    const reserved = Number(orderRows[0].reserved_amount ?? 0);
-    if (reserved > 0) {
-      await conn.execute(
-        "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
-        [reserved, reserved, orderRows[0].account_id, reserved]
-      );
-      await conn.execute("UPDATE paper_orders SET reserved_amount = 0 WHERE id = ?", [orderId]);
-    }
+  if (orderRows.length === 0) return;
+  const reserved = Number(orderRows[0].reserved_amount ?? 0);
+  if (reserved <= 0) return;
+
+  // P3 — assert both (a) the account exists and (b) reserved_cash >= reserved.
+  // The `WHERE reserved_cash >= ?` guard means the UPDATE only matches when
+  // the reservation is actually backed. If affectedRows !== 1, the refund
+  // cannot be honoured atomically — throw so the caller's transaction rolls
+  // back instead of wiping `reserved_amount` while cash stays put.
+  const [refund] = await conn.execute(
+    "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
+    [reserved, reserved, orderRows[0].account_id, reserved]
+  ) as [mysqlTypes.ResultSetHeader, unknown];
+  if (refund.affectedRows !== 1) {
+    throw new Error(
+      `rejectOrder: refund failed for order=${orderId} account=${orderRows[0].account_id} reserved=${reserved} — rolling back`
+    );
+  }
+  const [clear] = await conn.execute(
+    "UPDATE paper_orders SET reserved_amount = 0 WHERE id = ?",
+    [orderId]
+  ) as [mysqlTypes.ResultSetHeader, unknown];
+  if (clear.affectedRows !== 1) {
+    throw new Error(
+      `rejectOrder: clearing reserved_amount failed for order=${orderId} — rolling back`
+    );
   }
 }
 
@@ -295,36 +375,27 @@ export async function fillOrder(
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    const result = await fillOrderCore(conn, orderId, fillPrice, () => new Date().toISOString());
+    let result: FillOrderResult;
+    try {
+      result = await fillOrderCore(conn, orderId, fillPrice, () => new Date().toISOString());
+    } catch (err) {
+      // rejectOrder (or any core step) may throw to force rollback when
+      // a refund / state update could not complete atomically. Treat as a
+      // hard rejection; the outer finally-rollback runs below.
+      await conn.rollback();
+      throw err;
+    }
+
     if (result.filled) {
       await conn.commit();
+    } else if (SOFT_REJECT.has(result.rejection)) {
+      await conn.commit();
     } else {
-      // For "soft" rejections that already wrote a REJECTED row (no cash
-      // movement happened), we COMMIT so the REJECTED state persists.
-      // For "race lost" rejections after cash movement, we ROLLBACK so the
-      // cash debit / trade insert is undone.
-      const softReject = new Set([
-        "INVALID_PRICE",
-        "ORDER_NOT_FOUND",
-        "ORDER_NOT_PENDING_FILLED",
-        "ORDER_NOT_PENDING_CANCELLED",
-        "ORDER_NOT_PENDING_REJECTED",
-        "INVALID_INVESTMENT",
-        "ACCOUNT_NOT_FOUND",
-        "INSUFFICIENT_CASH",
-        "TRADE_MISMATCH",
-        "NO_OPEN_POSITION",
-        "INVALID_QUANTITY",
-      ]);
-      if (softReject.has(result.rejection)) {
-        await conn.commit();
-      } else {
-        await conn.rollback();
-      }
+      await conn.rollback();
     }
     return result;
   } catch (err) {
-    try { await conn.rollback(); } catch { /* ignore */ }
+    try { await conn.rollback(); } catch { /* ignore — already rolled back or conn dead */ }
     throw err;
   } finally {
     conn.release();
@@ -334,8 +405,11 @@ export async function fillOrder(
 /**
  * Atomically place the reservation hold on cash when a PENDING BUY
  * (LIMIT/STOP) is submitted. Returns true if the reservation succeeded,
- * false if the account lacked the cash. Caller should reject the order
- * if this returns false.
+ * false if the account lacked the cash OR the order is not PENDING
+ * (already cancelled / filled / rejected / missing). Caller should reject
+ * the order if this returns false.
+ *
+ * Lock order: accounts → orders (matches the global invariant).
  */
 export async function reserveCashForOrder(
   pool: mysqlTypes.Pool,
@@ -347,6 +421,8 @@ export async function reserveCashForOrder(
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+
+    // LOCK STEP 1 — accounts. Atomic cash → reserved_cash transfer.
     const [cashResult] = await conn.execute(
       "UPDATE paper_accounts SET cash = cash - ?, reserved_cash = reserved_cash + ? WHERE id = ? AND cash >= ?",
       [amount, amount, accountId, amount]
@@ -355,10 +431,21 @@ export async function reserveCashForOrder(
       await conn.rollback();
       return false;
     }
-    await conn.execute(
-      "UPDATE paper_orders SET reserved_amount = ? WHERE id = ?",
+
+    // LOCK STEP 2 — orders. P2 fix: guard with status='PENDING' and assert
+    // affectedRows === 1. If the order is missing, CANCELLED, FILLED, or
+    // REJECTED, we rolled back the cash move above — the reservation never
+    // persisted.
+    const [orderResult] = await conn.execute(
+      "UPDATE paper_orders SET reserved_amount = ? WHERE id = ? AND status = 'PENDING'",
       [amount, orderId]
-    );
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (orderResult.affectedRows !== 1) {
+      // Order is gone / not PENDING — undo the cash move.
+      await conn.rollback();
+      return false;
+    }
+
     await conn.commit();
     return true;
   } catch (err) {
@@ -371,8 +458,11 @@ export async function reserveCashForOrder(
 
 /**
  * Release a reservation back to cash — used when an order is cancelled
- * before fill, or rejected by the fill engine. Idempotent (checks
- * reserved_amount on the order row).
+ * before fill. Idempotent (checks reserved_amount on the order row).
+ *
+ * Lock order: accounts → orders. Both UPDATEs assert affectedRows === 1
+ * and will throw if the refund cannot be honoured atomically; caller's
+ * transaction rolls back via the catch-and-rethrow.
  */
 export async function releaseReservationForOrder(
   pool: mysqlTypes.Pool,
@@ -381,22 +471,70 @@ export async function releaseReservationForOrder(
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+
+    // Non-locking read to discover the account_id so we can lock in canonical
+    // order. If the order is gone, nothing to release.
+    const [preRows] = await conn.execute(
+      "SELECT account_id, reserved_amount FROM paper_orders WHERE id = ?",
+      [orderId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (preRows.length === 0) {
+      await conn.commit();
+      return;
+    }
+    const accountId = Number(preRows[0].account_id);
+    const preReserved = Number(preRows[0].reserved_amount ?? 0);
+    if (preReserved <= 0) {
+      await conn.commit();
+      return;
+    }
+
+    // LOCK STEP 1 — accounts (canonical order).
+    const [acctRows] = await conn.execute(
+      "SELECT id FROM paper_accounts WHERE id = ? FOR UPDATE",
+      [accountId]
+    ) as [mysqlTypes.RowDataPacket[], unknown];
+    if (acctRows.length === 0) {
+      throw new Error(
+        `releaseReservationForOrder: account=${accountId} not found for order=${orderId}`
+      );
+    }
+
+    // LOCK STEP 2 — order. Re-read authoritative reserved_amount under lock.
     const [orderRows] = await conn.execute(
       "SELECT account_id, reserved_amount FROM paper_orders WHERE id = ? FOR UPDATE",
       [orderId]
     ) as [mysqlTypes.RowDataPacket[], unknown];
     if (orderRows.length === 0) {
-      await conn.rollback();
+      await conn.commit();
       return;
     }
     const reserved = Number(orderRows[0].reserved_amount ?? 0);
-    if (reserved > 0) {
-      await conn.execute(
-        "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
-        [reserved, reserved, orderRows[0].account_id, reserved]
-      );
-      await conn.execute("UPDATE paper_orders SET reserved_amount = 0 WHERE id = ?", [orderId]);
+    if (reserved <= 0) {
+      await conn.commit();
+      return;
     }
+
+    // P3 — assert both refund arms succeed atomically.
+    const [refund] = await conn.execute(
+      "UPDATE paper_accounts SET cash = cash + ?, reserved_cash = reserved_cash - ? WHERE id = ? AND reserved_cash >= ?",
+      [reserved, reserved, accountId, reserved]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (refund.affectedRows !== 1) {
+      throw new Error(
+        `releaseReservationForOrder: refund failed for order=${orderId} account=${accountId} reserved=${reserved}`
+      );
+    }
+    const [clear] = await conn.execute(
+      "UPDATE paper_orders SET reserved_amount = 0 WHERE id = ?",
+      [orderId]
+    ) as [mysqlTypes.ResultSetHeader, unknown];
+    if (clear.affectedRows !== 1) {
+      throw new Error(
+        `releaseReservationForOrder: clear reserved_amount failed for order=${orderId}`
+      );
+    }
+
     await conn.commit();
   } catch (err) {
     try { await conn.rollback(); } catch { /* ignore */ }
