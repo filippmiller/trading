@@ -457,15 +457,16 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
   });
 
   // --- F1: cohort-date filter state --------------------------------------
-  // List of cohort dates present in the data (derived further down); selection
-  // persists across scenario/side-filter changes. When everything is checked
-  // (default) behaviour is identical to v1.
-  const [selectedCohortDates, setSelectedCohortDates] = useState<Set<string> | null>(null);
+  // List of cohort dates present in the data (derived further down). Starts
+  // empty — user must explicitly opt in to which cohorts they want scoped in.
+  // Pre-selecting everything on a 500+ ticker matrix is noise masquerading as
+  // a starting point.
+  const [selectedCohortDates, setSelectedCohortDates] = useState<Set<string>>(() => new Set());
 
   // --- F2: individual-ticker filter state ---------------------------------
   // A selection of enrollment row ids (matrix row = one (symbol, cohort_date)
-  // enrollment). null = "no explicit selection" = all rows on.
-  const [selectedRowIds, setSelectedRowIds] = useState<Set<number> | null>(null);
+  // enrollment). Starts empty for the same reason as F1 — explicit opt-in.
+  const [selectedRowIds, setSelectedRowIds] = useState<Set<number>>(() => new Set());
 
   // --- Scenario overlay state ---------------------------------------------
   // Collapsed by default so existing UX is unchanged until the user opts in.
@@ -509,31 +510,27 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
   }, [entries, sideFilter]);
 
   // All cohort dates present in the currently-displayed matrix (side-filter aware).
-  // When F1 state is null we treat "all dates checked" as the default.
   const allCohortDates = useMemo(() => grouped.map(([d]) => d), [grouped]);
 
-  // Seed the F1 selection with ALL cohort dates on first data arrival. Using null
-  // as "all-checked" sentinel proved brittle across SSR→client hydration and
-  // memo boundaries — chips rendered as unchecked on fresh load. An explicit Set
-  // is unambiguous: every checkbox's `checked` reads directly from Set.has(d).
-  useEffect(() => {
-    if (allCohortDates.length > 0 && selectedCohortDates === null) {
-      setSelectedCohortDates(new Set(allCohortDates));
-    }
-  }, [allCohortDates, selectedCohortDates]);
+  // Map cohort_date → row ids in that cohort, for cascade-uncheck on chip toggle.
+  const rowIdsByCohort = useMemo(() => {
+    const m = new Map<string, number[]>();
+    for (const [d, arr] of grouped) m.set(d, arr.map(e => e.id));
+    return m;
+  }, [grouped]);
 
   // Use the first cohort date for header dates (they shift per cohort, but header is generic)
   const refDate = grouped[0]?.[0] || new Date().toISOString().slice(0, 10);
 
   // F1+F2: compute the "effective sample" — entries that pass both the cohort-date
-  // check (F1) AND the per-row check (F2). Single source of truth for both the
-  // scenario evaluator AND the report, so the counts never diverge.
+  // check (F1) AND the per-row check (F2). Both Sets start empty → effective=0
+  // on fresh load, which is deliberate.
   const effectiveEntries = useMemo(() => {
     const allVisible = grouped.flatMap(([, arr]) => arr);
     return allVisible.filter(e => {
       const d = typeof e.cohort_date === 'string' ? e.cohort_date.slice(0, 10) : new Date(e.cohort_date).toISOString().slice(0, 10);
-      if (selectedCohortDates && !selectedCohortDates.has(d)) return false;
-      if (selectedRowIds && !selectedRowIds.has(e.id)) return false;
+      if (!selectedCohortDates.has(d)) return false;
+      if (!selectedRowIds.has(e.id)) return false;
       return true;
     });
   }, [grouped, selectedCohortDates, selectedRowIds]);
@@ -545,39 +542,59 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
   // Row-selection helpers for F2 — expose full visible ID list so Select Visible / Clear work.
   const allVisibleRowIds = useMemo(() => grouped.flatMap(([, arr]) => arr.map(e => e.id)), [grouped]);
 
-  // Flag: is any filter narrowing the default sample? Used to switch between
-  // "all" / "narrowed" language in the panel + to prevent rendering the report
-  // when zero rows are selected.
-  const hasNarrowingFilter =
-    (selectedCohortDates !== null && selectedCohortDates.size < allCohortDates.length) ||
-    (selectedRowIds !== null && selectedRowIds.size < allVisibleRowIds.length);
+  // Flag: is the user's selection non-empty? Drives the "narrowed (filtered)"
+  // badge + disables Apply when nothing is picked.
+  const hasNarrowingFilter = selectedCohortDates.size > 0 || selectedRowIds.size > 0;
 
-  // F1/F2 selection helpers — these mutate Sets so callers can pass a single handler.
+  // F1/F2 selection helpers.
+  //
+  // Cohort-date toggle cascades to row selection: unchecking a cohort also
+  // removes every row id belonging to that cohort from `selectedRowIds`.
+  // Without this, orphan checked rows under an unchecked cohort would fail F1
+  // silently and the report would render empty — exactly the bug that led to
+  // the 2026-04-22 empty-state work.
   const toggleCohortDate = (d: string) => {
     setSelectedCohortDates(prev => {
-      const base = prev ?? new Set(allCohortDates);
-      const next = new Set(base);
-      if (next.has(d)) next.delete(d); else next.add(d);
+      const next = new Set(prev);
+      const becomingUnchecked = next.has(d);
+      if (becomingUnchecked) next.delete(d); else next.add(d);
       return next;
     });
+    const wasChecked = selectedCohortDates.has(d);
+    if (wasChecked) {
+      const cohortRowIds = rowIdsByCohort.get(d) ?? [];
+      if (cohortRowIds.length > 0) {
+        setSelectedRowIds(prev => {
+          const next = new Set(prev);
+          for (const id of cohortRowIds) next.delete(id);
+          return next;
+        });
+      }
+    }
   };
-  const selectAllCohortDates = () => setSelectedCohortDates(null); // null = all
-  const selectNoCohortDates = () => setSelectedCohortDates(new Set());
-  const isCohortDateChecked = (d: string) =>
-    selectedCohortDates === null ? true : selectedCohortDates.has(d);
+  const selectAllCohortDates = () => setSelectedCohortDates(new Set(allCohortDates));
+  const selectNoCohortDates = () => {
+    setSelectedCohortDates(new Set());
+    setSelectedRowIds(new Set());
+  };
+  const isCohortDateChecked = (d: string) => selectedCohortDates.has(d);
 
   const toggleRowId = (id: number) => {
     setSelectedRowIds(prev => {
-      const base = prev ?? new Set(allVisibleRowIds);
-      const next = new Set(base);
+      const next = new Set(prev);
       if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
   };
-  const selectVisibleRows = () => setSelectedRowIds(null); // null = all
+  const selectVisibleRows = () => setSelectedRowIds(new Set(allVisibleRowIds));
   const clearRowSelection = () => setSelectedRowIds(new Set());
-  const isRowChecked = (id: number) =>
-    selectedRowIds === null ? true : selectedRowIds.has(id);
+  const isRowChecked = (id: number) => selectedRowIds.has(id);
+
+  // Single "Clear all" escape hatch — wipes both F1 and F2 in one click.
+  const clearAllSelections = () => {
+    setSelectedCohortDates(new Set());
+    setSelectedRowIds(new Set());
+  };
 
   const scenarioResults = useMemo(() => {
     if (!applied) return null;
@@ -655,6 +672,7 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
         totalCount={allVisibleRowIds.length}
         onSelectVisibleRows={selectVisibleRows}
         onClearRowSelection={clearRowSelection}
+        onClearAll={clearAllSelections}
         hasNarrowingFilter={hasNarrowingFilter}
       />
       <div className="px-3 py-2 bg-zinc-50 border-b border-zinc-100 flex items-center justify-between gap-4 flex-wrap">
@@ -993,6 +1011,7 @@ function ScenarioPanel({
   totalCount,
   onSelectVisibleRows,
   onClearRowSelection,
+  onClearAll,
   hasNarrowingFilter,
 }: {
   open: boolean;
@@ -1017,6 +1036,7 @@ function ScenarioPanel({
   totalCount: number;
   onSelectVisibleRows: () => void;
   onClearRowSelection: () => void;
+  onClearAll: () => void;
   hasNarrowingFilter: boolean;
 }) {
   const current = SCENARIOS.find((s) => s.id === scenarioId);
@@ -1126,6 +1146,14 @@ function ScenarioPanel({
             Clear overlay
           </button>
         )}
+        <button
+          onClick={onClearAll}
+          disabled={!hasNarrowingFilter}
+          title="Deselect every cohort date and every ticker in one click"
+          className={`ml-auto text-xs px-3 py-1.5 rounded-md border font-semibold ${hasNarrowingFilter ? 'border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100' : 'border-zinc-100 bg-zinc-50 text-zinc-300 cursor-not-allowed'}`}
+        >
+          Clear all selections
+        </button>
       </div>
       {current && (
         <p className="mt-2 text-[10px] text-zinc-500 italic">{current.description}</p>
