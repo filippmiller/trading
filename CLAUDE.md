@@ -4,8 +4,10 @@
 
 1. Read `.claude/deploy-instructions.md` for deployment details
 2. Read this full `CLAUDE.md` for project rules and conventions
-3. Report to user: "I've read the deployment instructions and all important notices for **trading**. Deploy target: Railway (web + worker + MySQL). Local dev still uses VPS MySQL via SSH tunnel. Last verified: 2026-04-21. Build status: OK."
-4. Run `git status` and report current branch and any uncommitted changes
+3. Read `.claude/SYSTEM.md` — system model, table relationships, API cheatsheet, gotchas from prior sessions. This is the single place to skim before touching paper-trading / matrix / surveillance code
+4. Skim top 3 entries of `.claude/agent-log.md` for recent context
+5. Report to user: "I've read the deployment instructions, system manual, and all important notices for **trading**. Deploy target: Railway (web + worker + MySQL). Local dev still uses VPS MySQL via SSH tunnel. Last verified: 2026-04-21. Build status: OK."
+6. Run `git status` and report current branch and any uncommitted changes
 
 ---
 
