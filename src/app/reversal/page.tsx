@@ -62,22 +62,60 @@ export default function ReversalDashboard() {
 
   // ... (rest of loadData and runSync)
 
-  useEffect(() => {
-    loadData();
-  }, []);
+  // Track which status-filter was last fetched so view-switching re-fetches
+  // only when we actually need a different slice. Matrix needs EVERYTHING
+  // (both ACTIVE and COMPLETED for the 10-day analysis); active/history
+  // views only need their own slice. Split halves the payload on the most
+  // common first-visit (~800KB → ~400KB for active-only on steady state).
+  const [fetchedStatus, setFetchedStatus] = useState<"ACTIVE" | "COMPLETED" | "ALL" | null>(null);
 
-  const loadData = async () => {
+  const desiredStatusForView = (v: 'active' | 'history' | 'matrix'): "ACTIVE" | "COMPLETED" | "ALL" => {
+    if (v === 'matrix') return "ALL";
+    if (v === 'history') return "COMPLETED";
+    return "ACTIVE";
+  };
+
+  useEffect(() => {
+    void loadData(desiredStatusForView(view));
+    // We intentionally re-run loadData when the view changes so each view
+    // fetches its own slice. settings fetch is cached after first load.
+  }, [view]);
+
+  const loadData = async (status: "ACTIVE" | "COMPLETED" | "ALL") => {
+    // No-op if we already have the right slice loaded. Prevents rapid
+    // view-toggling from piling up redundant network round-trips.
+    if (fetchedStatus === status || (fetchedStatus === "ALL" && status !== "ALL")) {
+      // If we already have ALL we have a superset of what active/history need.
+      // Still fine to show — cached data stays in `cohorts` state, client
+      // filters to the visible slice.
+      return;
+    }
     setLoading(true);
     try {
-      const [setRes, cohRes] = await Promise.all([
+      // `/api/reversal` accepts `?status=ACTIVE|COMPLETED` and no-param =
+      // return everything (matrix view needs the union).
+      const reversalUrl = status === "ALL"
+        ? "/api/reversal"
+        : `/api/reversal?status=${status}`;
+      // Promise.allSettled so one slow / failing side doesn't tank the
+      // other — matches the pattern we want on the Dashboard. If settings
+      // 500s we still show the matrix; if matrix 500s we still have settings.
+      const [setRes, cohRes] = await Promise.allSettled([
         fetch("/api/reversal/settings"),
-        fetch("/api/reversal")
+        fetch(reversalUrl),
       ]);
-      const setData = await setRes.json();
-      const cohData = await cohRes.json();
-      if (setData.settings) setSettings(setData.settings);
-      setCohorts(cohData.cohorts || {});
-    } catch (err) {
+      if (setRes.status === "fulfilled" && setRes.value.ok) {
+        const setData = await setRes.value.json();
+        if (setData.settings) setSettings(setData.settings);
+      }
+      if (cohRes.status === "fulfilled" && cohRes.value.ok) {
+        const cohData = await cohRes.value.json();
+        setCohorts(cohData.cohorts || {});
+        setFetchedStatus(status);
+      } else if (cohRes.status === "rejected") {
+        setError("Failed to sync with surveillance backend.");
+      }
+    } catch {
       setError("Failed to sync with surveillance backend.");
     } finally {
       setLoading(false);
@@ -88,7 +126,10 @@ export default function ReversalDashboard() {
     setLoading(true);
     try {
       await fetch("/api/surveillance/sync");
-      await loadData();
+      // After a manual sync, force-refresh the current slice — clear the
+      // cache sentinel so loadData actually re-fetches instead of no-oping.
+      setFetchedStatus(null);
+      await loadData(desiredStatusForView(view));
     } catch (err) {
       setError("Surveillance sync failed.");
     } finally {
