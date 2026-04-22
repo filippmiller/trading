@@ -9,6 +9,46 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 13:45] — Finding #3 (HIGH/MEDIUM): auto-exit slippage parity
+
+**Area:** Trading/Paper
+**Type:** fix + tests
+**Branch:** `fix/auto-exit-slippage-parity`
+**Commit:** `02034c8`
+**PR:** [#33](https://github.com/filippmiller/trading/pull/33) (merged `08c7e31`)
+
+### Why
+Internal-critic 2026-04-21 Finding #3 (and the side-effect of Finding #2 before its 2026-04-21 hotfix): `applyExitDecisionToTrade` used the raw trigger price for proceeds / pnl_usd / sell_price. The manual-close path in `paper-fill.ts` applies slippage via `applySlippage` to the same columns. Net effect: LONG positions auto-exited at hard/trailing stops kept slightly more cash than a user manually closing at the same quote; SHORT covers kept slightly less pain. Over many stop-triggered exits this systematically inflated realized cash vs a real portfolio. Also the `slippage_usd` accumulator column was not charged on auto-exit rows — the conservation invariant (commission_usd + slippage_usd subtracted from ledger) was under-counting cost.
+
+### What changed
+New pure helper `computeExitFillPrice(reason, side, triggerPrice, cfg)` in `src/lib/paper-exits.ts`:
+- HARD_STOP / TRAILING_STOP / TIME_EXIT / LIQUIDATED → MARKET fill after trigger. LONG closes via SELL (price nudged down by `slippageBps`); SHORT covers via BUY (price nudged up).
+- TAKE_PROFIT → LIMIT resting at target. Filled at trigger, no slippage.
+
+`applyExitDecisionToTrade` now uses `exitFillPrice` where it previously used `currentPrice`, accumulates `slippage_usd` in the UPDATE, and stores `sell_price = exitFillPrice`. Type-check remains clean (`slippage_usd` is existing DECIMAL column).
+
+### Tests (10 new, 68 total)
+- LONG: each of HARD_STOP / TRAILING_STOP / TIME_EXIT / LIQUIDATED yields fillPrice < trigger
+- LONG + TAKE_PROFIT: fillPrice = trigger
+- SHORT: HARD_STOP / TRAILING_STOP yields fillPrice > trigger
+- SHORT + TAKE_PROFIT: fillPrice = trigger
+- slippageBps=0 config: fillPrice = trigger on every (reason, side) combo
+- Symmetry: LONG and SHORT adjustments are equal-magnitude, opposite-sign
+
+### Verification
+- npm test: 68/68 passed (from 58 before this PR)
+- npx tsc --noEmit: clean
+- Prod healthz: 200 (pre-merge), 200 (post-merge)
+
+### Note on Finding #2 (HIGH, commission asymmetry)
+Already fixed by the 2026-04-21 "Bug #2" hotfix (paper-exits.ts:376-385). `applyCommission` runs on auto-exits and `netCredit` subtracts `closeCommissionUsd` for LONG, accumulates onto `commission_usd`. Confirmed by direct file read before starting this PR — no action needed.
+
+### Files Changed
+- `src/lib/paper-exits.ts` — +62 (new helper, import tweak, `exitFillPrice` plumbing, slippage_usd in UPDATE)
+- `src/lib/paper-exits.test.ts` — +80 (computeExitFillPrice test block)
+
+---
+
 ## [2026-04-22 13:30] — Post-PR-29 follow-ups: cleanup + component extraction + 2 MEDIUM critic fixes
 
 **Area:** Trading/Repo-hygiene, Trading/Matrix, Trading/Paper
