@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useState, useMemo, useRef } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { createPortal } from "react-dom";
 import { 
   Activity, 
@@ -663,6 +664,43 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
   // All cohort dates present in the currently-displayed matrix (side-filter aware).
   const allCohortDates = useMemo(() => grouped.map(([d]) => d), [grouped]);
 
+  // Flatten grouped into a single linear sequence of virtualizable rows.
+  // Each cohort-date inserts one "cohort" header row, followed by one
+  // "ticker" row per entry. The virtualizer iterates this flat array; only
+  // rows in the viewport + overscan actually render, cutting the matrix
+  // from ~67k DOM nodes to ~3k on typical 900-row datasets.
+  type FlatRow =
+    | { kind: 'cohort'; date: string; groupLen: number }
+    | { kind: 'ticker'; entry: ReversalEntry; date: string };
+  const flatRows = useMemo<FlatRow[]>(() => {
+    const out: FlatRow[] = [];
+    for (const [date, group] of grouped) {
+      out.push({ kind: 'cohort', date, groupLen: group.length });
+      for (const entry of group) out.push({ kind: 'ticker', entry, date });
+    }
+    return out;
+  }, [grouped]);
+
+  // Virtualizer on the outer scroll container. Rows measure ~30-36px; we
+  // let dynamic measurement adjust per-row via `measureElement`. Overscan=10
+  // keeps a comfortable buffer so fast scrolls don't flash blank rows.
+  const matrixScrollRef = useRef<HTMLDivElement | null>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: flatRows.length,
+    getScrollElement: () => matrixScrollRef.current,
+    estimateSize: () => 32,
+    overscan: 10,
+  });
+  const virtualItems = rowVirtualizer.getVirtualItems();
+  // Space before first rendered row + after last rendered row. Rendered as
+  // a single <tr> with a height style so the table's scrollable content
+  // still reflects the full flatRows.length even though only ~30 rows are
+  // in the DOM at any moment.
+  const virtPaddingTop = virtualItems.length > 0 ? virtualItems[0].start : 0;
+  const virtPaddingBottom = virtualItems.length > 0
+    ? rowVirtualizer.getTotalSize() - virtualItems[virtualItems.length - 1].end
+    : 0;
+
   // Bidirectional lookup for cascade logic:
   //   parent off → children off (down)   uses rowIdsByCohort
   //   child  on  → parent  on  (up)      uses cohortByRowId
@@ -1002,7 +1040,7 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
           </button>
         </div>
       )}
-      <div className="overflow-auto" style={{ maxHeight: 'calc(100vh - 160px)' }}>
+      <div ref={matrixScrollRef} className="overflow-auto" style={{ maxHeight: 'calc(100vh - 160px)' }}>
         <table className="border-collapse text-xs" style={{ minWidth: '2400px' }}>
           <thead className="sticky top-0 z-20">
             <tr className="bg-zinc-800 text-zinc-300">
@@ -1043,116 +1081,126 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
                 </td>
               </tr>
             )}
-            {grouped.map(([date, group]) => (
-              <React.Fragment key={date}>
-                <tr className="bg-zinc-100">
-                  <td className="sticky left-0 z-10 bg-zinc-100 px-2 py-1.5 text-center border-r border-zinc-200 w-[32px]">
-                    <input
-                      type="checkbox"
-                      checked={isCohortDateChecked(date)}
-                      onChange={() => toggleCohortDate(date)}
-                      title="F1: include this cohort date in the scenario analysis"
-                      className="h-3 w-3 accent-indigo-600 cursor-pointer"
-                    />
-                  </td>
-                  <td className="sticky left-[32px] z-10 bg-zinc-100 px-3 py-1.5 text-[10px] font-bold text-zinc-500 uppercase tracking-widest font-mono border-r border-zinc-200">
-                    {date}
-                    <span className="ml-2 text-zinc-400 font-normal">{group.length} tickers</span>
-                  </td>
-                  <td className="border-r border-zinc-200" />
-                  <td className="border-r border-zinc-200" />
-                  {Array.from({ length: 10 }).map((_, d) => (
-                    <td key={d} colSpan={3} className={`text-center text-[9px] font-mono text-zinc-400 ${d < 9 ? 'border-r border-zinc-200' : ''}`}>
-                      {addBusinessDays(date, d + 1)}
-                    </td>
-                  ))}
-                </tr>
-                {group.map((entry) => {
-                  const perTicker = scenarioResults?.byId.get(entry.id) ?? null;
-                  const snapMap = scenarioResults?.bySnapKey.get(entry.id) ?? null;
-                  // When a scenario is applied but this ticker doesn't match the filter,
-                  // dim the ticker name to convey "not traded in this scenario".
-                  const dimmed = applied !== null && perTicker !== null && !perTicker.matches;
-                  // Direction in scenario mode comes from the overlay, not entry.direction.
-                  const scnDirection = perTicker?.direction ?? 0;
-                  const recurrence = recurrences.get(entry.symbol) ?? null;
-                  // F2 visual cue: unchecked rows de-emphasize so users see
-                  // what's in scope — BUT only when the user has actively
-                  // selected at least one row. Without this guard, the
-                  // default empty-selection state made EVERY row opacity-40,
-                  // turning the whole matrix into a washed-out grey blob on
-                  // first load (no selection = nothing "in scope" = nothing
-                  // to de-emphasize against). Scenario-dim is unconditional
-                  // because it only fires after the user clicks Apply.
-                  const hasActiveRowSelection = selectedRowIds.size > 0;
-                  const rowUnchecked = !isRowChecked(entry.id);
-                  const rowOpacityCls = (hasActiveRowSelection && rowUnchecked) ? 'opacity-40'
-                    : dimmed ? 'opacity-40'
-                    : '';
-                  return (
-                  <tr key={entry.id} className={`hover:bg-amber-50/30 transition-colors border-b border-zinc-100 ${rowOpacityCls}`}>
-                    <td className="sticky left-0 z-10 bg-white px-2 py-2 text-center border-r border-zinc-100 w-[32px]">
+            {/* Virtualized rows — only rows in viewport + overscan render.
+                Padding <tr>s hold the empty space above/below so the
+                table's natural scroll height reflects the full dataset.
+                Key = cohort-date for cohort rows, entry.id for ticker rows —
+                stable across virtualizer reorderings. */}
+            {virtPaddingTop > 0 && (
+              <tr style={{ height: `${virtPaddingTop}px` }} aria-hidden="true" />
+            )}
+            {virtualItems.map((virtualItem) => {
+              const row = flatRows[virtualItem.index];
+              if (!row) return null;
+              if (row.kind === 'cohort') {
+                const { date, groupLen } = row;
+                return (
+                  <tr
+                    key={`c-${date}`}
+                    data-index={virtualItem.index}
+                    ref={rowVirtualizer.measureElement}
+                    className="bg-zinc-100"
+                  >
+                    <td className="sticky left-0 z-10 bg-zinc-100 px-2 py-1.5 text-center border-r border-zinc-200 w-[32px]">
                       <input
                         type="checkbox"
-                        checked={isRowChecked(entry.id)}
-                        onChange={() => toggleRowId(entry.id)}
-                        title={`F2: include ${entry.symbol} in the scenario analysis`}
+                        checked={isCohortDateChecked(date)}
+                        onChange={() => toggleCohortDate(date)}
+                        title="F1: include this cohort date in the scenario analysis"
                         className="h-3 w-3 accent-indigo-600 cursor-pointer"
                       />
                     </td>
-                    <td className="sticky left-[32px] z-10 bg-white px-3 py-2 font-bold border-r border-zinc-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
-                      <div className="flex items-center gap-1.5">
-                        {applied ? (
-                          <span className={`inline-block w-1.5 h-1.5 rounded-full ${scnDirection === 1 ? 'bg-emerald-500' : scnDirection === -1 ? 'bg-rose-500' : 'bg-zinc-300'}`} />
-                        ) : (
-                          <span className={`inline-block w-1.5 h-1.5 rounded-full ${entry.direction === 'LONG' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
-                        )}
-                        <button
-                          type="button"
-                          onClick={(ev) => {
-                            const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
-                            // Clamp inside viewport with a non-negative floor so narrow
-                            // viewports (mobile ≤440px wide, short screens ≤260px tall)
-                            // don't push the popover off-screen. Popover content is
-                            // horizontally scrollable; vertical overflow is handled by
-                            // the popover's own max-height.
-                            const PAD = 8;
-                            const top = Math.max(PAD, Math.min(window.innerHeight - 260, rect.bottom + 4));
-                            const left = Math.max(PAD, Math.min(window.innerWidth - 440, rect.left));
-                            setChartFor({ entry, anchor: { top, left } });
-                          }}
-                          className="font-semibold text-zinc-900 hover:text-indigo-700 hover:underline decoration-dotted underline-offset-2"
-                          title="Open price chart with pre- and post-enrollment bars"
-                        >
-                          {entry.symbol}
-                        </button>
-                        {recurrence && recurrence.count >= 2 && <RecurrenceBadge info={recurrence} />}
-                        <StreakBadge entry={entry} />
-                        <span className="text-[8px] text-zinc-400 font-normal">
-                          {applied
-                            ? (scnDirection === 1 ? 'buy' : scnDirection === -1 ? 'short' : 'n/a')
-                            : (entry.direction === 'LONG' ? 'buy' : 'short')}
-                        </span>
-                      </div>
+                    <td className="sticky left-[32px] z-10 bg-zinc-100 px-3 py-1.5 text-[10px] font-bold text-zinc-500 uppercase tracking-widest font-mono border-r border-zinc-200">
+                      {date}
+                      <span className="ml-2 text-zinc-400 font-normal">{groupLen} tickers</span>
                     </td>
-                    <td className="px-2 py-2 font-mono text-right border-r border-zinc-100">
-                      ${entry.entry_price.toFixed(2)}
-                    </td>
-                    <td className={`px-2 py-2 font-mono text-right font-bold border-r border-zinc-100 ${entry.day_change_pct > 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
-                      {entry.day_change_pct > 0 ? '+' : ''}{entry.day_change_pct.toFixed(1)}%
-                    </td>
+                    <td className="border-r border-zinc-200" />
+                    <td className="border-r border-zinc-200" />
                     {Array.from({ length: 10 }).map((_, d) => (
-                      <React.Fragment key={d}>
-                        <MatrixCell entry={entry} field={`d${d+1}_morning`} dayLabel={`Day ${d+1} Morning`} scenarioSnap={snapMap?.get(`d${d+1}_morning`) ?? null} scenarioActive={applied !== null} />
-                        <MatrixCell entry={entry} field={`d${d+1}_midday`} dayLabel={`Day ${d+1} Midday`} scenarioSnap={snapMap?.get(`d${d+1}_midday`) ?? null} scenarioActive={applied !== null} />
-                        <MatrixCell entry={entry} field={`d${d+1}_close`} dayLabel={`Day ${d+1} Close`} isLast={d < 9} scenarioSnap={snapMap?.get(`d${d+1}_close`) ?? null} scenarioActive={applied !== null} />
-                      </React.Fragment>
+                      <td key={d} colSpan={3} className={`text-center text-[9px] font-mono text-zinc-400 ${d < 9 ? 'border-r border-zinc-200' : ''}`}>
+                        {addBusinessDays(date, d + 1)}
+                      </td>
                     ))}
                   </tr>
-                  );
-                })}
-              </React.Fragment>
-            ))}
+                );
+              }
+              // ticker row
+              const { entry } = row;
+              const perTicker = scenarioResults?.byId.get(entry.id) ?? null;
+              const snapMap = scenarioResults?.bySnapKey.get(entry.id) ?? null;
+              const dimmed = applied !== null && perTicker !== null && !perTicker.matches;
+              const scnDirection = perTicker?.direction ?? 0;
+              const recurrence = recurrences.get(entry.symbol) ?? null;
+              const hasActiveRowSelection = selectedRowIds.size > 0;
+              const rowUnchecked = !isRowChecked(entry.id);
+              const rowOpacityCls = (hasActiveRowSelection && rowUnchecked) ? 'opacity-40'
+                : dimmed ? 'opacity-40'
+                : '';
+              return (
+                <tr
+                  key={`t-${entry.id}`}
+                  data-index={virtualItem.index}
+                  ref={rowVirtualizer.measureElement}
+                  className={`hover:bg-amber-50/30 transition-colors border-b border-zinc-100 ${rowOpacityCls}`}
+                >
+                  <td className="sticky left-0 z-10 bg-white px-2 py-2 text-center border-r border-zinc-100 w-[32px]">
+                    <input
+                      type="checkbox"
+                      checked={isRowChecked(entry.id)}
+                      onChange={() => toggleRowId(entry.id)}
+                      title={`F2: include ${entry.symbol} in the scenario analysis`}
+                      className="h-3 w-3 accent-indigo-600 cursor-pointer"
+                    />
+                  </td>
+                  <td className="sticky left-[32px] z-10 bg-white px-3 py-2 font-bold border-r border-zinc-100 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]">
+                    <div className="flex items-center gap-1.5">
+                      {applied ? (
+                        <span className={`inline-block w-1.5 h-1.5 rounded-full ${scnDirection === 1 ? 'bg-emerald-500' : scnDirection === -1 ? 'bg-rose-500' : 'bg-zinc-300'}`} />
+                      ) : (
+                        <span className={`inline-block w-1.5 h-1.5 rounded-full ${entry.direction === 'LONG' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                      )}
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+                          const PAD = 8;
+                          const top = Math.max(PAD, Math.min(window.innerHeight - 260, rect.bottom + 4));
+                          const left = Math.max(PAD, Math.min(window.innerWidth - 440, rect.left));
+                          setChartFor({ entry, anchor: { top, left } });
+                        }}
+                        className="font-semibold text-zinc-900 hover:text-indigo-700 hover:underline decoration-dotted underline-offset-2"
+                        title="Open price chart with pre- and post-enrollment bars"
+                      >
+                        {entry.symbol}
+                      </button>
+                      {recurrence && recurrence.count >= 2 && <RecurrenceBadge info={recurrence} />}
+                      <StreakBadge entry={entry} />
+                      <span className="text-[8px] text-zinc-400 font-normal">
+                        {applied
+                          ? (scnDirection === 1 ? 'buy' : scnDirection === -1 ? 'short' : 'n/a')
+                          : (entry.direction === 'LONG' ? 'buy' : 'short')}
+                      </span>
+                    </div>
+                  </td>
+                  <td className="px-2 py-2 font-mono text-right border-r border-zinc-100">
+                    ${entry.entry_price.toFixed(2)}
+                  </td>
+                  <td className={`px-2 py-2 font-mono text-right font-bold border-r border-zinc-100 ${entry.day_change_pct > 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                    {entry.day_change_pct > 0 ? '+' : ''}{entry.day_change_pct.toFixed(1)}%
+                  </td>
+                  {Array.from({ length: 10 }).map((_, d) => (
+                    <React.Fragment key={d}>
+                      <MatrixCell entry={entry} field={`d${d+1}_morning`} dayLabel={`Day ${d+1} Morning`} scenarioSnap={snapMap?.get(`d${d+1}_morning`) ?? null} scenarioActive={applied !== null} />
+                      <MatrixCell entry={entry} field={`d${d+1}_midday`} dayLabel={`Day ${d+1} Midday`} scenarioSnap={snapMap?.get(`d${d+1}_midday`) ?? null} scenarioActive={applied !== null} />
+                      <MatrixCell entry={entry} field={`d${d+1}_close`} dayLabel={`Day ${d+1} Close`} isLast={d < 9} scenarioSnap={snapMap?.get(`d${d+1}_close`) ?? null} scenarioActive={applied !== null} />
+                    </React.Fragment>
+                  ))}
+                </tr>
+              );
+            })}
+            {virtPaddingBottom > 0 && (
+              <tr style={{ height: `${virtPaddingBottom}px` }} aria-hidden="true" />
+            )}
           </tbody>
         </table>
       </div>
