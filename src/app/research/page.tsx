@@ -283,12 +283,18 @@ export default function ResearchPage() {
   // Apply a Grid Sweep row's exit params onto the single-run form:
   //   - force exit.kind = STOP so hardStop / TP / trail fields render
   //   - copy holdDays + hardStopPct + takeProfitPct + trailingStopPct
-  //   - map Grid's breakevenAtPct → form's trailingActivateAtPct (closest-
-  //     equivalent semantic: both gate when the trailing stop arms)
   //   - null grid-value → undefined on form (= field empty / off)
-  // Grid-only axes (entryDelayDays, entryBar, exitBar) have no form field
-  // and are silently dropped — those dimensions can only be explored in
-  // the Grid Sweep itself.
+  //   - PRESERVE the form's existing trailingActivateAtPct (do NOT overwrite
+  //     from the grid row's breakevenAtPct — they are DIFFERENT concepts).
+  //     Grid's breakevenAtPct = "after +X% favorable, tighten SL to entry"
+  //     Form's trailingActivateAtPct = "after +X% favorable, activate trail"
+  //     Writing one from the other would silently produce a DIFFERENT
+  //     strategy than the Grid row reported. The grid's breakeven value
+  //     has no corresponding form field and is silently dropped — same
+  //     handling as entryDelayDays / entryBar / exitBar above.
+  // Grid-only axes (entryDelayDays, entryBar, exitBar, breakevenAtPct) have
+  // no form field and are silently dropped — those dimensions can only be
+  // explored in the Grid Sweep itself.
   function applyGridRowToForm(row: {
     holdDays: number;
     hardStopPct: number | null;
@@ -296,15 +302,27 @@ export default function ResearchPage() {
     trailingStopPct: number | null;
     breakevenAtPct: number | null;
   }) {
+    // Consume `breakevenAtPct` without reading it — it's intentionally
+    // dropped on Apply (see comment above). Referencing it keeps the
+    // destructured parameter shape consistent with `ApplyGridRow`.
+    void row.breakevenAtPct;
+    // Only force exit.kind='STOP' if the row actually carries bracket
+    // fields. A pure hold-based grid row (all three stop fields null) was
+    // previously switching a carefully-tuned TIME configuration to STOP
+    // mode silently, which changed the regime of the simulation — both
+    // audit reviewers flagged this as a UX bug, not a preference.
+    const rowHasStops =
+      row.hardStopPct != null || row.takeProfitPct != null || row.trailingStopPct != null;
     setTrade((prev) => ({
       ...prev,
       exit: {
-        kind: "STOP",
+        kind: rowHasStops ? "STOP" : prev.exit.kind,
         holdDays: row.holdDays,
         hardStopPct: row.hardStopPct ?? undefined,
         takeProfitPct: row.takeProfitPct ?? undefined,
         trailingStopPct: row.trailingStopPct ?? undefined,
-        trailingActivateAtPct: row.breakevenAtPct ?? undefined,
+        // Preserve prior value — see block comment above.
+        trailingActivateAtPct: prev.exit.trailingActivateAtPct,
       },
     }));
     // Scroll the form into view. `behavior: "smooth"` + block: "start"

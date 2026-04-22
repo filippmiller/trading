@@ -129,8 +129,11 @@ const PRESETS: Preset[] = [
  * Subset of a Grid Sweep row that maps onto the parent /research form's
  * Trade.exit state. `entryDelayDays`, `entryBar`, `exitBar` are Grid-only
  * axes — the single-run form does not expose them, so they are not
- * transferred. `breakevenAtPct` maps to `trailingActivateAtPct` as the
- * closest-equivalent semantic (both gate when a trailing stop arms).
+ * transferred. `breakevenAtPct` is ALSO Grid-only: the form has no
+ * breakeven-arm field, and writing it to `trailingActivateAtPct` would be
+ * a semantic lie (breakeven-arm ≠ trailing-activate-at). We pass the
+ * value in the payload so the caller can decide what to do with it (the
+ * /research handler currently drops it silently — see applyGridRowToForm).
  */
 export type ApplyGridRow = {
   holdDays: number;
@@ -354,7 +357,7 @@ export function GridSweepSection(props: Props) {
                               window.setTimeout(() => setAppliedIdx((cur) => (cur === i ? null : cur)), 2500);
                             }}
                             className="rounded-md bg-violet-600 text-white text-[10px] font-bold px-2 py-1 hover:bg-violet-700"
-                            title="Copy this row's exit params (hold / SL / TP / Trail / BE→activate) onto the form above and scroll to it"
+                            title="Copy this row's exit params (Hold days / SL / TP / Trail %) onto the form above. Breakeven (BE) is Grid-only and is NOT transferred — the single-run form has no breakeven-arm field."
                           >
                             Apply
                           </button>

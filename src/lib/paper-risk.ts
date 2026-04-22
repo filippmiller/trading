@@ -291,6 +291,55 @@ export async function isSymbolTradable(symbol: string): Promise<boolean> {
 }
 
 /**
+ * Bulk whitelist lookup — returns the subset of the input symbols that are
+ * currently tradable (active EQUITY rows in `tradable_symbols`). Designed
+ * for the batch-order endpoint so N tickers cost ONE round-trip instead of
+ * N sequential SELECTs.
+ *
+ * Contract mirrors `isSymbolTradable`:
+ *   - input symbols are uppercased before the IN (...) query
+ *   - returns a Set<string> of UPPERCASE symbols that matched
+ *   - THROWS `WhitelistLookupError` on any DB error (same cold-start
+ *     semantics as the single-symbol variant so the route can surface 503
+ *     instead of falsely rejecting every symbol as SYMBOL_NOT_TRADABLE)
+ *
+ * Empty input → empty Set, no DB call. Duplicate inputs are de-duped
+ * before the query.
+ */
+export async function filterTradableSymbols(symbols: string[]): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (!Array.isArray(symbols) || symbols.length === 0) return out;
+  const unique = Array.from(
+    new Set(
+      symbols
+        .filter((s) => typeof s === "string" && s.length > 0)
+        .map((s) => s.toUpperCase()),
+    ),
+  );
+  if (unique.length === 0) return out;
+  try {
+    const pool = await getPool();
+    const placeholders = unique.map(() => "?").join(",");
+    const [rows] = await pool.execute<mysql.RowDataPacket[]>(
+      `SELECT symbol FROM tradable_symbols WHERE symbol IN (${placeholders}) AND active = 1 AND asset_class = 'EQUITY'`,
+      unique,
+    );
+    for (const r of rows) out.add(String(r.symbol).toUpperCase());
+    return out;
+  } catch (err) {
+    // Same drift-visibility pattern as isSymbolTradable: surface the failure
+    // in logs so a 503 from the route has a traceable cause.
+    console.warn(
+      "[paper-risk] filterTradableSymbols: bulk whitelist lookup failed for",
+      unique.length,
+      "symbols — returning WhitelistLookupError:",
+      err instanceof Error ? err.message : String(err),
+    );
+    throw new WhitelistLookupError(err);
+  }
+}
+
+/**
  * Lazy-insert a symbol into the whitelist if missing. Designed for the
  * surveillance enrollment paths (MOVERS + TREND) so the /reversal matrix
  * and the `tradable_symbols` whitelist stay in sync without a manual
@@ -307,15 +356,20 @@ export async function isSymbolTradable(symbol: string): Promise<boolean> {
  * the canonical side-effect; whitelist sync is advisory. `INSERT IGNORE`
  * makes re-adding the same symbol a no-op — idempotent on every call.
  *
- * Columns: `exchange` is left NULL (Yahoo doesn't reliably return the
- * listing venue), `asset_class` defaults to 'EQUITY', `active=1`.
+ * Columns: `exchange` is set to `'LAZY_SYNC'` so lazy-added rows are
+ * distinguishable from the curated-CSV seed (which carries `'NASDAQ'` or
+ * `'NYSE'`). This closes a foot-gun flagged in review: if future code
+ * ever adds a "filter by exchange" surface, the lazy rows would silently
+ * drop out under a `NULL`. The marker also lets an optional enricher
+ * script target ONLY lazy rows to backfill a real listing venue.
+ * `asset_class` defaults to 'EQUITY', `active=1`.
  */
 export async function ensureTradableSymbol(symbol: string): Promise<void> {
   if (!symbol || typeof symbol !== "string") return;
   try {
     const pool = await getPool();
     await pool.execute(
-      "INSERT IGNORE INTO tradable_symbols (symbol, exchange, asset_class, active) VALUES (?, NULL, 'EQUITY', 1)",
+      "INSERT IGNORE INTO tradable_symbols (symbol, exchange, asset_class, active) VALUES (?, 'LAZY_SYNC', 'EQUITY', 1)",
       [symbol.toUpperCase()]
     );
   } catch (err) {
