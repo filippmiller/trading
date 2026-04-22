@@ -235,12 +235,33 @@ export function normalizeQuantity(
 }
 
 /**
+ * Thrown by `isSymbolTradable` when the whitelist table can't be queried
+ * (DB cold-start, connection loss, schema skew). Distinguishes "DB failed"
+ * from "symbol genuinely not in whitelist" so the API boundary can surface
+ * a 503 instead of a misleading 400 SYMBOL_NOT_TRADABLE.
+ */
+export class WhitelistLookupError extends Error {
+  readonly cause: unknown;
+  constructor(cause: unknown) {
+    const msg = cause instanceof Error ? cause.message : String(cause);
+    super(`Whitelist lookup failed: ${msg}`);
+    this.name = "WhitelistLookupError";
+    this.cause = cause;
+  }
+}
+
+/**
  * Whitelist check — is this symbol currently tradable?
  *
  * Returns true if the symbol is present in `tradable_symbols` with
  * active=1 AND asset_class='EQUITY'. Returns false on absence (whitelist
- * enforcement) OR on DB error (fail-closed: safer than silently accepting
- * unknown symbols).
+ * enforcement).
+ *
+ * THROWS `WhitelistLookupError` on any DB error — distinguishes "symbol not
+ * whitelisted" (deterministic rejection) from "DB unavailable, unknown" so
+ * the route can surface 503 to the user instead of a misleading
+ * SYMBOL_NOT_TRADABLE 400. Closes the cold-start window where users saw
+ * their AAPL orders rejected as "invalid" during a Railway DB restart.
  *
  * In dev/CI mode where the whitelist is empty, all symbols are rejected —
  * the seed script (`scripts/sync-tradable-symbols.ts`) MUST have run, or
@@ -255,7 +276,16 @@ export async function isSymbolTradable(symbol: string): Promise<boolean> {
       [symbol.toUpperCase()]
     );
     return rows.length > 0;
-  } catch {
-    return false;
+  } catch (err) {
+    // Operational signal — surface drift in logs so the 503 is traceable.
+    // Bare `console.warn` is consistent with loadRiskConfig's drift-log
+    // pattern; no logger framework in this codebase yet.
+    console.warn(
+      "[paper-risk] isSymbolTradable: whitelist lookup failed for",
+      symbol,
+      "— returning WhitelistLookupError:",
+      err instanceof Error ? err.message : String(err)
+    );
+    throw new WhitelistLookupError(err);
   }
 }

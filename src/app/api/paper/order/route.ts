@@ -14,7 +14,7 @@ import {
   cancelOrderWithRefund,
   modifyPendingOrder,
 } from "@/lib/paper-fill";
-import { isSymbolTradable } from "@/lib/paper-risk";
+import { isSymbolTradable, WhitelistLookupError } from "@/lib/paper-risk";
 
 /**
  * W5 idempotency key validation. Accepts UUID-like tokens, base32, or
@@ -175,8 +175,23 @@ export async function POST(req: Request) {
     // make it past submit. The whitelist enforces equity-only via
     // asset_class='EQUITY'; non-equity symbols (ETFs/crypto/etc) currently
     // fail-closed. Closes a hole where "NONSENSE123" would pass SYMBOL_RE.
-    if (!(await isSymbolTradable(sym))) {
-      return NextResponse.json({ error: "SYMBOL_NOT_TRADABLE" }, { status: 400 });
+    //
+    // WhitelistLookupError (2026-04-22): distinguish DB-unavailable from
+    // genuine whitelist miss. Cold-start / connection drop → 503 with a
+    // retry-friendly message, NOT a 400 SYMBOL_NOT_TRADABLE that looks like
+    // a permanent rejection.
+    try {
+      if (!(await isSymbolTradable(sym))) {
+        return NextResponse.json({ error: "SYMBOL_NOT_TRADABLE" }, { status: 400 });
+      }
+    } catch (err) {
+      if (err instanceof WhitelistLookupError) {
+        return NextResponse.json({
+          error: "WHITELIST_UNAVAILABLE",
+          message: "Symbol whitelist temporarily unavailable (DB cold-start or connection drop). Retry in a moment.",
+        }, { status: 503 });
+      }
+      throw err;
     }
     if (side !== "BUY" && side !== "SELL") {
       return NextResponse.json({ error: "side must be BUY or SELL" }, { status: 400 });
