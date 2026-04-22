@@ -503,8 +503,8 @@ export async function applyExitDecisionToTrade(
 export async function persistWatermarks(
   pool: mysqlTypes.Pool,
   tradeId: number,
-  maxPnlPct: number,
-  minPnlPct: number,
+  maxPnlPct: number | null,
+  minPnlPct: number | null,
   trailingActive: boolean,
   trailingStopPrice: number | null
 ): Promise<void> {

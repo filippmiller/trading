@@ -20,6 +20,7 @@ import { fillOrder as sharedFillOrder, recordEquitySnapshotSafe } from "../src/l
 import {
   evaluateExitsAlways as sharedEvaluateExitsAlways,
   applyExitDecisionToTrade as sharedApplyExitToTrade,
+  persistWatermarks as sharedPersistWatermarks,
   type ExitInputs,
   type ExitReason,
 } from "../src/lib/paper-exits";
@@ -1441,23 +1442,19 @@ async function jobMonitorPaperTradesImpl() {
 
     const result = sharedEvaluateExitsAlways(input, price, now);
 
-    // Persist watermarks (same as signals path). Write even when no exit
-    // fires so trailing_active / trailing_stop_price advance between ticks.
-    await db.execute(
-      `UPDATE paper_trades
-          SET max_pnl_pct = ?, min_pnl_pct = ?,
-              trailing_active = ?, trailing_stop_price = ?
-        WHERE id = ? AND status = 'OPEN'`,
-      [
-        result.watermarks.maxPnlPct,
-        result.watermarks.minPnlPct,
-        result.watermarks.trailingActive ? 1 : 0,
-        result.watermarks.trailingStopPrice,
-        trade.id,
-      ]
-    );
-
     if (result.reason != null) {
+      // Exit firing — hand off to the transactional path. It writes the final
+      // watermarks + trailing state as part of the same atomic CLOSE UPDATE
+      // in paper-exits.ts:408-429, so do NOT run a separate watermark write
+      // here.
+      //
+      // Internal-critic finding #1 (2026-04-21): running `persistWatermarks`
+      // before `applyExitDecisionToTrade` opened a race with a concurrent
+      // fillOrder cover — the row could flip to CLOSED between the two
+      // writes, after which the apply-exit UPDATE would correctly no-op
+      // (status='OPEN' guard), but the watermark write had already
+      // committed stale columns on the now-CLOSED row. Analytics-only bug
+      // (no cash impact), fixed by skipping the write on the exit path.
       const applied = await sharedApplyExitToTrade(db, Number(trade.id), price, {
         reason: result.reason,
         closePrice: price,
@@ -1467,6 +1464,18 @@ async function jobMonitorPaperTradesImpl() {
         closed++;
         log(`    EXIT_TRADE ${side} ${trade.symbol} [${result.reason}] P&L: ${applied.pnlUsd >= 0 ? '+' : ''}$${applied.pnlUsd.toFixed(2)}`);
       }
+    } else {
+      // No exit — persist updated watermarks + trailing state so the next
+      // monitor tick can ratchet from them. Uses the dedicated helper (same
+      // SQL, centrally owned) instead of an inline UPDATE.
+      await sharedPersistWatermarks(
+        db,
+        Number(trade.id),
+        result.watermarks.maxPnlPct,
+        result.watermarks.minPnlPct,
+        result.watermarks.trailingActive,
+        result.watermarks.trailingStopPrice,
+      );
     }
   }
 

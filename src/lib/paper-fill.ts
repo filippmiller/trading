@@ -696,12 +696,21 @@ async function fillOrderCore(
     // leave status OPEN. Guarded so a concurrent partial cannot over-close.
     const existingPnl = Number(trade.pnl_usd ?? 0);
     const accumulatedPnl = existingPnl + pnlSlice;
+    // Internal-critic finding #10 (2026-04-21): the previous partial-close
+    // guard used `... <= quantity + 1e-9` to sidestep float-rounding, but
+    // `quantity` and `closed_quantity` are DECIMAL(18,6) (see migrations.ts:
+    // 328, 403). DECIMAL is fixed-point in MySQL — not IEEE-754 — so the
+    // sum `closed_quantity + ?` compares exactly to `quantity`. The epsilon
+    // was a false-safety artifact leaking a scientific-notation literal
+    // into SQL, so we drop it. JS-side `willBeFullyClosed` above (line 666)
+    // still uses 1e-9 tolerance because JS numbers ARE float — that one is
+    // correct in its domain.
     const [tradeUpdate] = await conn.execute(
       `UPDATE paper_trades
           SET pnl_usd=?, closed_quantity=closed_quantity + ?,
               commission_usd=commission_usd + ?,
               slippage_usd=slippage_usd + ?
-        WHERE id=? AND status='OPEN' AND closed_quantity + ? <= quantity + 1e-9`,
+        WHERE id=? AND status='OPEN' AND closed_quantity + ? <= quantity`,
       [accumulatedPnl, closeQty, closeCommissionUsd, closeSlippageUsd, tradeId, closeQty]
     ) as [mysqlTypes.ResultSetHeader, unknown];
     if (tradeUpdate.affectedRows !== 1) {
