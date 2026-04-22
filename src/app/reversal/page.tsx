@@ -757,6 +757,10 @@ function buildTimeline(entry: ReversalEntry): ScenarioSnapshotInput[] {
 function entryToScenarioInput(entry: ReversalEntry): ScenarioTickerInput {
   return {
     symbol: entry.symbol,
+    entryId: entry.id,
+    cohortDate: typeof entry.cohort_date === "string"
+      ? entry.cohort_date.slice(0, 10)
+      : new Date(entry.cohort_date).toISOString().slice(0, 10),
     entryPrice: Number(entry.entry_price),
     dayChangePct: Number(entry.day_change_pct),
     consecutiveDays: entry.consecutive_days ?? null,
@@ -1955,13 +1959,18 @@ function ScenarioReportModal({
                       <button
                         type="button"
                         onClick={(ev) => {
-                          const e = entries.find(x => x.symbol === report.best!.symbol);
+                          // Look up by entryId (disambiguates duplicate symbols
+                          // across cohort dates); fall back to first-by-symbol
+                          // only if the report predates the entryId plumbing.
+                          const e =
+                            (report.best!.entryId != null && entries.find(x => x.id === report.best!.entryId))
+                            || entries.find(x => x.symbol === report.best!.symbol);
                           if (!e || !onOpenChart) return;
                           const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
                           onOpenChart(e, { top: rect.bottom + 4, left: Math.max(8, rect.left - 200) });
                         }}
                         className="font-semibold text-zinc-900 hover:text-indigo-700 hover:underline decoration-dotted underline-offset-2"
-                        title="Open price chart for this symbol"
+                        title="Open price chart for this enrollment"
                       >
                         {report.best.symbol}
                       </button>
@@ -1976,13 +1985,15 @@ function ScenarioReportModal({
                       <button
                         type="button"
                         onClick={(ev) => {
-                          const e = entries.find(x => x.symbol === report.worst!.symbol);
+                          const e =
+                            (report.worst!.entryId != null && entries.find(x => x.id === report.worst!.entryId))
+                            || entries.find(x => x.symbol === report.worst!.symbol);
                           if (!e || !onOpenChart) return;
                           const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
                           onOpenChart(e, { top: rect.bottom + 4, left: Math.max(8, rect.left - 200) });
                         }}
                         className="font-semibold text-zinc-900 hover:text-indigo-700 hover:underline decoration-dotted underline-offset-2"
-                        title="Open price chart for this symbol"
+                        title="Open price chart for this enrollment"
                       >
                         {report.worst.symbol}
                       </button>
