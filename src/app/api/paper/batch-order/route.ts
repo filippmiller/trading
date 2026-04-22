@@ -9,7 +9,12 @@ import {
   SYMBOL_RE,
 } from "@/lib/paper";
 import { fillOrder } from "@/lib/paper-fill";
-import { filterTradableSymbols, WhitelistLookupError } from "@/lib/paper-risk";
+import {
+  filterTradableSymbols,
+  getLastCloseMap,
+  checkFillPriceDeviation,
+  WhitelistLookupError,
+} from "@/lib/paper-risk";
 
 /**
  * Per-item idempotency key validator. Mirrors the single-order route's
@@ -174,6 +179,28 @@ export async function POST(req: Request) {
       }
     }
 
+    // Bulk fetch last-known-close per symbol so the per-row deviation
+    // check is cheap. Missing-from-map means prices_daily has no row for
+    // that symbol — the route allows that case through (`checkFillPriceDeviation`
+    // returns ok when lastClose is null). This matches the paper-trading
+    // mental model: the user is free to fill at any price when we have no
+    // reference; the band only fires when we can prove deviation is absurd.
+    // One query instead of N sequential SELECTs (same rationale as the
+    // filterTradableSymbols batching).
+    let lastCloseMap: Map<string, number> = new Map();
+    try {
+      lastCloseMap = await getLastCloseMap(parsedBody.orders.map((o) => o.symbol));
+    } catch (err) {
+      // Best-effort — if prices_daily is unavailable, fall through with an
+      // empty map. Every row will be allowed (no reference to deviate from).
+      // Surface the drift in logs so Ops can catch the missing-backfill
+      // class of bug.
+      console.warn(
+        "[batch-order] getLastCloseMap failed — deviation band effectively disabled this call:",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+
     const results: PerRowResult[] = [];
 
     for (const item of parsedBody.orders) {
@@ -185,6 +212,17 @@ export async function POST(req: Request) {
       }
       if (!tradableSet!.has(symbol)) {
         results.push({ symbol, status: "rejected", reason: "SYMBOL_NOT_TRADABLE" });
+        continue;
+      }
+
+      // Fat-finger guard: reject fill prices absurdly far from last close.
+      // Closes the "catastrophic success" footgun — without this, `fill_price=$1`
+      // on a $300 stock would silently print +$299/share of fake equity on
+      // the paper account. `checkFillPriceDeviation` returns ok when the
+      // reference close is unknown (map miss) so we fail open on data gaps.
+      const devCheck = checkFillPriceDeviation(item.fill_price, lastCloseMap.get(symbol));
+      if (!devCheck.ok) {
+        results.push({ symbol, status: "rejected", reason: devCheck.reason });
         continue;
       }
 
@@ -285,8 +323,18 @@ export async function POST(req: Request) {
         // end-to-end (TOCTOU close — same pattern as single-order route).
         if ((err as { errno?: number }).errno === 1062 && clientRequestId) {
           try {
+            // Hotfix (Codex-3 finding, 2026-04-22): SYMMETRY with the
+            // pre-check branch. The prior version read `paper_orders.quantity`,
+            // but the batch path NEVER sets that column (it sizes by
+            // `investment_usd`), so the replay returned quantity: 0 for
+            // every FILLED idempotent replay via the 1062-race path. The
+            // real quantity lives on the linked paper_trades row; LEFT JOIN
+            // pulls it back. Must match the pre-check SELECT exactly so
+            // both replay paths return identical payloads.
             const [existing] = await pool.execute<mysql.RowDataPacket[]>(
-              "SELECT id, status, filled_price, trade_id, rejection_reason, quantity FROM paper_orders WHERE account_id = ? AND client_request_id = ? LIMIT 1",
+              `SELECT o.id, o.status, o.filled_price, o.trade_id, o.rejection_reason, t.quantity AS trade_quantity
+               FROM paper_orders o LEFT JOIN paper_trades t ON t.id = o.trade_id
+               WHERE o.account_id = ? AND o.client_request_id = ? LIMIT 1`,
               [account.id, clientRequestId],
             );
             if (existing.length > 0) {
@@ -299,7 +347,7 @@ export async function POST(req: Request) {
                   order_id: Number(e.id),
                   trade_id: Number(e.trade_id),
                   fill_price: Number(e.filled_price),
-                  quantity: Number(e.quantity ?? 0),
+                  quantity: Number(e.trade_quantity ?? 0),
                   idempotent_replay: true,
                 });
               } else {

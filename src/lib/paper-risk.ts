@@ -383,3 +383,97 @@ export async function ensureTradableSymbol(symbol: string): Promise<void> {
     );
   }
 }
+
+/**
+ * Default tolerance for caller-supplied `fill_price` vs last known close
+ * in the paper-batch-order flow. 20% is deliberately generous — penny
+ * and low-float names can open 10-15% off their prior close and we still
+ * want the user's "I pretend I bought at close" flow to work. But 200%
+ * isn't "volatile name," it's a typo (e.g. $1 instead of $10) or active
+ * abuse of the synthetic-fill privilege.
+ *
+ * The band is a fat-finger guard and a safeguard against the "catastrophic
+ * success" footgun highlighted during review: without it, a user (or
+ * automation) could submit `fill_price=$1` for a $300 stock and the paper
+ * account would silently print +$299/share of fake equity.
+ */
+export const FILL_PRICE_DEVIATION_BAND = 0.2; // 20%
+
+/**
+ * Pure helper — validates a caller-supplied fill price against the last
+ * known close for the symbol. Returns `{ ok: true }` if within the band
+ * OR if no reference close is available (caller should treat that case
+ * with its own policy — batch route rejects unknowns).
+ *
+ * `band=0.2` → reject if deviation > 20%. For symmetric treatment of
+ * LONG and SHORT we use absolute deviation — a fill 20% below close is
+ * equally "synthetic" as one 20% above.
+ */
+export function checkFillPriceDeviation(
+  fillPrice: number,
+  lastClose: number | null | undefined,
+  band: number = FILL_PRICE_DEVIATION_BAND,
+): { ok: true } | { ok: false; reason: string; deviation: number; lastClose: number } {
+  if (lastClose == null || !Number.isFinite(lastClose) || lastClose <= 0) {
+    return { ok: true };
+  }
+  if (!Number.isFinite(fillPrice) || fillPrice <= 0) {
+    return { ok: false, reason: "fill_price must be a positive finite number", deviation: NaN, lastClose };
+  }
+  const deviation = Math.abs(fillPrice - lastClose) / lastClose;
+  if (deviation > band) {
+    const pct = (deviation * 100).toFixed(1);
+    const limitPct = (band * 100).toFixed(0);
+    return {
+      ok: false,
+      reason: `SYNTHETIC_DEVIATION_TOO_LARGE: fill_price $${fillPrice.toFixed(2)} is ${pct}% off last close $${lastClose.toFixed(2)} (max ${limitPct}%)`,
+      deviation,
+      lastClose,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Bulk fetch the latest `close` from `prices_daily` per symbol. One
+ * round-trip for N symbols via IN(...) + the classic "max-date per
+ * symbol" self-join pattern. Missing symbols simply don't appear in
+ * the returned map — caller decides reject / allow policy.
+ *
+ * Empty input → empty Map, no DB call. Results are case-normalized to
+ * UPPERCASE keys.
+ */
+export async function getLastCloseMap(symbols: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (!Array.isArray(symbols) || symbols.length === 0) return out;
+  const unique = Array.from(
+    new Set(
+      symbols
+        .filter((s) => typeof s === "string" && s.length > 0)
+        .map((s) => s.toUpperCase()),
+    ),
+  );
+  if (unique.length === 0) return out;
+  const pool = await getPool();
+  const placeholders = unique.map(() => "?").join(",");
+  // INNER JOIN on the (symbol, MAX(date)) sub-select — one query, no N+1.
+  // prices_daily has a UNIQUE (symbol, date) so the join is 1:1 safe.
+  const sql = `
+    SELECT p.symbol, p.close
+      FROM prices_daily p
+      INNER JOIN (
+        SELECT symbol, MAX(date) AS max_date
+          FROM prices_daily
+         WHERE symbol IN (${placeholders})
+         GROUP BY symbol
+      ) latest
+        ON p.symbol = latest.symbol AND p.date = latest.max_date
+  `;
+  const [rows] = await pool.execute<mysql.RowDataPacket[]>(sql, unique);
+  for (const r of rows) {
+    const sym = String(r.symbol).toUpperCase();
+    const close = Number(r.close);
+    if (Number.isFinite(close) && close > 0) out.set(sym, close);
+  }
+  return out;
+}
