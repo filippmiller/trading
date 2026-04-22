@@ -512,10 +512,18 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
   // All cohort dates present in the currently-displayed matrix (side-filter aware).
   const allCohortDates = useMemo(() => grouped.map(([d]) => d), [grouped]);
 
-  // Map cohort_date → row ids in that cohort, for cascade-uncheck on chip toggle.
+  // Bidirectional lookup for cascade logic:
+  //   parent off → children off (down)   uses rowIdsByCohort
+  //   child  on  → parent  on  (up)      uses cohortByRowId
+  // Keeps the invariant: no checked row ever sits under an unchecked cohort.
   const rowIdsByCohort = useMemo(() => {
     const m = new Map<string, number[]>();
     for (const [d, arr] of grouped) m.set(d, arr.map(e => e.id));
+    return m;
+  }, [grouped]);
+  const cohortByRowId = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const [d, arr] of grouped) for (const e of arr) m.set(e.id, d);
     return m;
   }, [grouped]);
 
@@ -580,13 +588,30 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
   const isCohortDateChecked = (d: string) => selectedCohortDates.has(d);
 
   const toggleRowId = (id: number) => {
+    const wasChecked = selectedRowIds.has(id);
     setSelectedRowIds(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
+    // Cascade UP: checking a ticker auto-checks its cohort chip, so the row
+    // never becomes an orphan silently filtered out by F1.
+    if (!wasChecked) {
+      const cohort = cohortByRowId.get(id);
+      if (cohort && !selectedCohortDates.has(cohort)) {
+        setSelectedCohortDates(prev => {
+          const next = new Set(prev);
+          next.add(cohort);
+          return next;
+        });
+      }
+    }
   };
-  const selectVisibleRows = () => setSelectedRowIds(new Set(allVisibleRowIds));
+  const selectVisibleRows = () => {
+    setSelectedRowIds(new Set(allVisibleRowIds));
+    // Cascade UP for bulk too — every cohort with at least one visible row gets checked.
+    setSelectedCohortDates(new Set(allCohortDates));
+  };
   const clearRowSelection = () => setSelectedRowIds(new Set());
   const isRowChecked = (id: number) => selectedRowIds.has(id);
 
