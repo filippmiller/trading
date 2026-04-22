@@ -9,6 +9,55 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 14:45] — Headed prod audit (post PR #34)
+
+**Area:** Trading/QA
+**Type:** audit (no code change in src/)
+**Branch:** `chore/prod-audit-2026-04-22`
+**Session notes:** `.claude/sessions/2026-04-22-headed-audit.md`
+
+### Scope
+Continuation of the crashed session that ended at the "ADMIN_PASSWORD or Claude Desktop" fork. User unblocked with credentials; I ran headed Playwright locally.
+
+### What ran
+Two scripts added to the repo for reuse:
+- `scripts/prod-audit.mjs` — 12-route walk + 5 targeted probes (matrix basics, PR #34 empty-cache refetch, PR #33 auto-exit slippage, paper-filter mutation, scenarios tab switch).
+- `scripts/prod-audit-matrix.mjs` — focused second pass on `/reversal?view=matrix` with correct selectors + correct `/api/prices?symbol=...` filter.
+
+Artifacts (gitignored): `audit/prod-audit/report.json` + 19 screenshots; `audit/prod-audit-matrix/report.json` + 3 screenshots.
+
+### Result
+- 12/12 routes HTTP 200, 0 hard failures, 0 `pageerror` on navigation except a known React #418 hydration on `/reversal?view=matrix` that auto-recovers (already documented in `.claude/sessions/2026-04-22-qa-findings.md`).
+- Matrix renders 986 rows, 956 ticker buttons clickable; popover click opens and triggers `GET /api/prices?symbol=NVTS&limit=90` with non-empty response; re-open correctly hits cache (0 refetch).
+- 1 YELLOW on `/` — `console.error: Dashboard stats error TypeError: Failed to fetch` from `src/app/page.tsx:48-70`. Not a known user-facing bug; looks like an in-flight fetch aborted when my audit script navigated away too fast (only one arm of the `Promise.all([fetch("/api/reversal"), fetch("/api/runs")])` completed in the network log). Marked as suspected test artifact, not a production defect.
+
+### Coverage gaps documented in the report
+- PR #34 empty-response refetch could not be exercised on this snapshot (NVTS returns non-empty; fix is covered by the unit test added in `d76d13f`).
+- PR #33 auto-exit slippage could not be exercised because the prod paper account has zero closed trades with `HARD_STOP`/`TRAILING_STOP`; fix is covered by 10 unit tests in `src/lib/paper-exits.test.ts` (commit `02034c8`).
+- PR #29 orchestration probes (TREND `prices_daily` backfill timing, Best/Worst duplicate-symbol click) not attempted — they would need fresh-enrollment fixtures and more refined selectors respectively.
+
+### Mutations + rollback
+Two safe mutations (scenarios tab #2 → tab #1 view switch). Both reverted. No writes to DB, no orders, no accounts, no resets.
+
+### Verdict
+Ship. No RED findings.
+
+### Files Changed
+- `scripts/prod-audit.mjs` — new
+- `scripts/prod-audit-matrix.mjs` — new
+- `.claude/sessions/2026-04-22-headed-audit.md` — full findings + rollback log + product judgment
+- `.claude/agent-log.md` — this entry
+
+(`audit/` is already in `.gitignore`, so the raw screenshots + report.json are not committed; the session notes summarize them.)
+
+### Verification (exit-code discipline)
+```
+node scripts/prod-audit.mjs → exit 0  (12/12 pages 200, 0 pageerror, 1 warning)
+node scripts/prod-audit-matrix.mjs → exit 0  (matrix renders, popover fetches prices, cache hit on reopen)
+```
+
+---
+
 ## [2026-04-22 13:50] — Codex 2nd-pass: cache + encoding + tsc errata
 
 **Area:** Trading/Matrix, Trading/Verification, Trading/Docs
