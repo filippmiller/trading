@@ -653,6 +653,28 @@ async function jobEnrollMovers() {
       enrolled++;
     }
     log(`  Enrolled ${enrolled} tickers (${gainers.length}G + ${losers.length}L)`);
+
+    // Auto-backfill prices_daily for every enrolled symbol so the /reversal
+    // matrix chart popover has historical bars to draw. One-shot backfill
+    // (scripts/backfill-prices-daily-via-api.ts) was run on 2026-04-22 for
+    // the then-current 527 symbols; this step extends that guarantee to
+    // every NEW enrollment going forward. Best-effort: per-symbol failure
+    // is logged but does not block the enrollment job.
+    const { refreshSymbolData } = await import("../src/lib/data");
+    let pricesOk = 0;
+    let pricesFailed = 0;
+    for (const item of enhanced) {
+      try {
+        await refreshSymbolData(item.symbol);
+        pricesOk++;
+      } catch (err) {
+        pricesFailed++;
+        log(`  prices_daily backfill failed for ${item.symbol}: ${(err as Error).message ?? err}`);
+      }
+      // Throttle to keep upstream (Stooq/Yahoo) from rate-limiting us
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    log(`  Backfilled prices_daily for ${pricesOk} symbols (${pricesFailed} failed)`);
   } finally {
     enrollRunning = false;
   }
