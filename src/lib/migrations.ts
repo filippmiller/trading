@@ -476,6 +476,27 @@ async function runSchemaMigrations() {
     );
   }
 
+  // 2026-04-22 — backfill tradable_symbols from reversal_entries so the
+  // /reversal → /paper batch flow no longer rejects symbols that were
+  // legitimately enrolled by Yahoo Movers / TREND scan but happened to be
+  // outside the 232-row curated CSV seed. `INSERT IGNORE` on the symbol
+  // primary key means this is a one-shot data fix: first boot after the
+  // migration ships inserts the delta, subsequent boots are ~no-op.
+  // Lazy-insert in surveillance-cron.ts keeps it in sync going forward.
+  try {
+    await pool.execute(
+      `INSERT IGNORE INTO tradable_symbols (symbol, exchange, asset_class, active)
+       SELECT DISTINCT symbol, NULL, 'EQUITY', 1 FROM reversal_entries`
+    );
+  } catch (err) {
+    // Best-effort — the schema is still valid without this data fix. Log
+    // it but don't trap the migration in a reject state.
+    console.warn(
+      "[migrations] reversal_entries → tradable_symbols backfill failed:",
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+
   // W5 (2026-04-21) — UX guardrails + multi-account.
   //
   // 1. paper_orders.client_request_id: client-generated idempotency key. A

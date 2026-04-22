@@ -289,3 +289,43 @@ export async function isSymbolTradable(symbol: string): Promise<boolean> {
     throw new WhitelistLookupError(err);
   }
 }
+
+/**
+ * Lazy-insert a symbol into the whitelist if missing. Designed for the
+ * surveillance enrollment paths (MOVERS + TREND) so the /reversal matrix
+ * and the `tradable_symbols` whitelist stay in sync without a manual
+ * `sync-tradable-symbols.ts --refresh` step.
+ *
+ * Safe-by-construction: Yahoo's day_gainers / day_losers and the TREND
+ * multi-day scan only return symbols that actually trade on US exchanges,
+ * so any enrollment is a legitimate paper-trade target. The curated CSV
+ * seed remains the "base" whitelist (and the `sync-tradable-symbols.ts`
+ * source of truth for any operator-driven refresh); this function expands
+ * coverage at runtime as the enrollment surface grows.
+ *
+ * Best-effort: any failure is logged but does NOT throw. Enrollment is
+ * the canonical side-effect; whitelist sync is advisory. `INSERT IGNORE`
+ * makes re-adding the same symbol a no-op — idempotent on every call.
+ *
+ * Columns: `exchange` is left NULL (Yahoo doesn't reliably return the
+ * listing venue), `asset_class` defaults to 'EQUITY', `active=1`.
+ */
+export async function ensureTradableSymbol(symbol: string): Promise<void> {
+  if (!symbol || typeof symbol !== "string") return;
+  try {
+    const pool = await getPool();
+    await pool.execute(
+      "INSERT IGNORE INTO tradable_symbols (symbol, exchange, asset_class, active) VALUES (?, NULL, 'EQUITY', 1)",
+      [symbol.toUpperCase()]
+    );
+  } catch (err) {
+    // Best-effort. Enrollment is more important than whitelist sync; don't
+    // let a transient DB glitch break the enrollment transaction.
+    console.warn(
+      "[paper-risk] ensureTradableSymbol failed for",
+      symbol,
+      "—",
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+}

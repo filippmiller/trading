@@ -25,6 +25,7 @@ import {
   type ExitReason,
 } from "../src/lib/paper-exits";
 import { isRTH } from "../src/lib/paper";
+import { ensureTradableSymbol } from "../src/lib/paper-risk";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -651,6 +652,10 @@ async function jobEnrollMovers() {
            cumulative_change_pct = VALUES(cumulative_change_pct)`,
         [today, item.symbol, direction, item.changePct, item.price, item.consecutiveDays, item.cumulativeChangePct]
       );
+      // Keep the paper-trade whitelist in sync with the enrollment surface
+      // so the /reversal → /paper batch flow doesn't reject real US equities
+      // that happened to be outside the curated CSV seed.
+      await ensureTradableSymbol(item.symbol);
       enrolled++;
     }
     log(`  Enrolled ${enrolled} tickers (${gainers.length}G + ${losers.length}L)`);
@@ -1870,6 +1875,7 @@ async function jobScanTrends() {
              VALUES (?, ?, ?, 'TREND', ?, ?, ?, ?, 'ACTIVE')`,
             [r.cohortDate, r.symbol, r.direction, r.dayChangePct, r.entryPrice, r.consecutiveDays, r.cumulativeChangePct]
           );
+          await ensureTradableSymbol(r.symbol);
           enrolled++;
           enrolledSymbols.push(r.symbol);
           if (examples.length < 10) {
