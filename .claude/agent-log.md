@@ -9,6 +9,48 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 12:12] — Vitest coverage + Codex findings #1 & #2 fix
+
+**Area:** Trading/Tests, Trading/Matrix, Trading/Surveillance
+**Type:** test infra + bug fix
+**Branch:** `test/matrix-coverage`
+**Commit:** `ec6263a`
+**PR:** [#29](https://github.com/filippmiller/trading/pull/29)
+
+### Why this session
+Session was accidentally closed mid-work. Recovered from `.claude/sessions/2026-04-22-qa-findings.md` + reflog: user was resuming the single open debt from PR #28 critique (Should #3 — "no tests for new UI components"), had already installed vitest + RTL + happy-dom in `package.json` but not yet committed or configured. While setting up tests, user surfaced two fresh Codex findings against the merged PR #28 deploy — both real bugs, both addressed in the same PR.
+
+### Files Changed
+- `vitest.config.ts` — new (happy-dom, `@/` alias, setup file)
+- `src/test/setup.ts` — new (`jest-dom` + per-test cleanup)
+- `package.json` + `package-lock.json` — add vitest 4.1.5, happy-dom 20.9, @testing-library/{react,jest-dom,user-event}, @vitejs/plugin-react; add `test`/`test:watch`/`test:ci` scripts
+- `src/lib/matrix-scenarios.test.ts` — new, 26 tests (SCENARIOS, computeStreak, resolveDirection, evaluateScenario, summarizeScenario, computeRecurrences, compareAllScenarios; includes regression test on Codex finding #2)
+- `src/lib/reversal.test.ts` — new, 10 tests (calculateEntryPnL LONG/SHORT/leverage/costs/daysHeld/null-safety)
+- `src/lib/matrix-scenarios.ts` — add optional `entryId` + `cohortDate` on `ScenarioTickerInput`, thread through `PerTickerResult` and `ScenarioReport.best/worst` (Codex finding #2)
+- `src/app/reversal/page.tsx` — `entryToScenarioInput` populates the new fields; Best/Worst click handlers look up by `entryId` with symbol fallback
+- `scripts/surveillance-cron.ts` — `jobScanTrends` collects `enrolledSymbols[]` and runs `refreshSymbolData` best-effort backfill loop with 400ms throttle after the scan, mirroring `jobEnrollMovers` (Codex finding #1)
+
+### Functions/Symbols Modified
+- `ScenarioTickerInput`, `PerTickerResult`, `ScenarioReport.best/worst` — added optional id+cohortDate fields
+- `summarizeScenario` — `cand` now carries `entryId`/`cohortDate`
+- `entryToScenarioInput` — populates id+cohortDate
+- `jobScanTrends` — post-insert prices_daily backfill loop
+
+### Database Tables
+- Read-only access during scenario evaluation. TREND path triggers additional writes to `prices_daily` (via `refreshSymbolData`) after each TREND insert into `reversal_entries`.
+
+### Verification
+- `npm test`: **46/46 passed** in 1.84s
+- `npx tsc --noEmit`: clean
+- Prod healthz `trading-production-06fe.up.railway.app`: 200 OK (smoke check pre-merge)
+
+### Open follow-ups
+- CI check on PR #29 (GitHub API was timing out at push time — verify run status when API recovers)
+- After merge: manually verify fresh TREND enrollment gets `prices_daily` rows populated; verify Best/Worst click on duplicate-symbol scenario opens the exact enrollment
+- Eslint on `src/app/reversal/page.tsx` is still red from pre-existing issues (Codex noted same) — separate cleanup task, out of scope for this PR
+
+---
+
 ## [2026-04-21 11:40] — Railway production deploy + auth retrospective log + prod smoke
 
 **Area:** Trading/Ops, Trading/Auth, Trading/Infra, Trading/Verification
