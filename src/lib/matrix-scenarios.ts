@@ -156,6 +156,15 @@ export type ScenarioTickerInput = {
   dayChangePct: number;
   /** Consecutive streak length through enrollment day (>= 1, positive). */
   consecutiveDays?: number | null;
+  /**
+   * Stable identifier for this enrollment row (reversal_entries.id). Needed
+   * so downstream consumers can disambiguate when the same symbol appears
+   * in multiple cohort dates — without it, Best/Worst click-throughs pick
+   * the first match by symbol instead of the row that was actually computed.
+   */
+  entryId?: number | string;
+  /** YYYY-MM-DD cohort date for this enrollment row (display + tie-break). */
+  cohortDate?: string;
 };
 
 export type ScenarioSnapshotInput = {
@@ -183,6 +192,9 @@ export type PerSnapshotResult = {
 
 export type PerTickerResult = {
   symbol: string;
+  /** Echoed from input so summaries can disambiguate duplicate symbols. */
+  entryId?: number | string;
+  cohortDate?: string;
   matches: boolean;
   direction: ScenarioDirection; // 0 if doesn't match scenario
   entryPrice: number;
@@ -272,6 +284,8 @@ export function evaluateScenario(
 
   const base: PerTickerResult = {
     symbol: ticker.symbol,
+    entryId: ticker.entryId,
+    cohortDate: ticker.cohortDate,
     matches: direction !== 0,
     direction,
     entryPrice: ticker.entryPrice,
@@ -364,8 +378,11 @@ export type ScenarioReport = {
   shortSumPnl: number;
   longAvgPnlPct: number;
   shortAvgPnlPct: number;
-  best: { symbol: string; pnlUsd: number; pnlPct: number; daysHeld: number } | null;
-  worst: { symbol: string; pnlUsd: number; pnlPct: number; daysHeld: number } | null;
+  /** Best/worst carry the per-ticker input id+cohortDate so UI can open the
+   *  exact enrollment row, not just the first one matching symbol. Both are
+   *  optional because older callers may not supply entryId. */
+  best: { symbol: string; entryId?: number | string; cohortDate?: string; pnlUsd: number; pnlPct: number; daysHeld: number } | null;
+  worst: { symbol: string; entryId?: number | string; cohortDate?: string; pnlUsd: number; pnlPct: number; daysHeld: number } | null;
   /** As-of key (latest snapshot key seen across eligible tickers) */
   asOfKey: string | null;
 };
@@ -420,7 +437,14 @@ export function summarizeScenario(
       asOfKey = r.latestSnapshotKey;
     }
 
-    const cand = { symbol: r.symbol, pnlUsd: pnl, pnlPct, daysHeld: r.daysHeld };
+    const cand = {
+      symbol: r.symbol,
+      entryId: r.entryId,
+      cohortDate: r.cohortDate,
+      pnlUsd: pnl,
+      pnlPct,
+      daysHeld: r.daysHeld,
+    };
     if (best === null || cand.pnlUsd > best.pnlUsd) best = cand;
     if (worst === null || cand.pnlUsd < worst.pnlUsd) worst = cand;
   }

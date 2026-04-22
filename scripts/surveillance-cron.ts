@@ -1797,6 +1797,7 @@ async function jobScanTrends() {
 
     let enrolled = 0, scanned = 0, failed = 0;
     const examples: string[] = [];
+    const enrolledSymbols: string[] = [];
 
     for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
       const batch = candidates.slice(i, i + BATCH_SIZE);
@@ -1861,6 +1862,7 @@ async function jobScanTrends() {
             [r.cohortDate, r.symbol, r.direction, r.dayChangePct, r.entryPrice, r.consecutiveDays, r.cumulativeChangePct]
           );
           enrolled++;
+          enrolledSymbols.push(r.symbol);
           if (examples.length < 10) {
             examples.push(`    TREND ${r.direction} ${r.symbol} ${r.consecutiveDays}d ${r.streakDir} cohort=${r.cohortDate} entry=$${r.entryPrice.toFixed(2)} (cum ${r.cumulativeChangePct.toFixed(1)}%)`);
           }
@@ -1876,6 +1878,29 @@ async function jobScanTrends() {
 
     for (const e of examples) log(e);
     log(`  Trend scan done: ${enrolled} enrolled (${failed} insert errors), ${scanned} scanned`);
+
+    // Auto-backfill prices_daily for every NEW trend enrollment so the
+    // /reversal matrix chart popover has historical bars to draw — mirrors
+    // the same step already wired into jobEnrollMovers (surveillance-cron.ts:657).
+    // Before this, TREND rows landed in the matrix with an empty chart until
+    // the nightly intraday sync happened to populate prices_daily on its own.
+    // Best-effort: per-symbol failure is logged but does not block the scan job.
+    if (enrolledSymbols.length > 0) {
+      const { refreshSymbolData } = await import("../src/lib/data");
+      let pricesOk = 0;
+      let pricesFailed = 0;
+      for (const symbol of enrolledSymbols) {
+        try {
+          await refreshSymbolData(symbol);
+          pricesOk++;
+        } catch (err) {
+          pricesFailed++;
+          log(`  prices_daily backfill failed for ${symbol}: ${(err as Error).message ?? err}`);
+        }
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      log(`  Backfilled prices_daily for ${pricesOk} trend symbols (${pricesFailed} failed)`);
+    }
   } finally {
     trendScanRunning = false;
   }
