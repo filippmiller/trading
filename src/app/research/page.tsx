@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Activity, Filter, DollarSign, Zap, Play, Save, Trash2, FolderOpen, Workflow, Download, Sparkles, RotateCcw } from "lucide-react";
 
 import { GridSweepSection } from "@/components/GridSweepSection";
@@ -274,6 +274,44 @@ export default function ResearchPage() {
     URL.revokeObjectURL(url);
   }
 
+  // Ref to the "Параметры сделки" card so Grid Sweep's Apply-to-form can
+  // scroll it into view. Keeps the apply reaction visible to the user —
+  // otherwise the grid table is far below the form and the state change
+  // would look like a no-op.
+  const tradeParamsCardRef = useRef<HTMLDivElement | null>(null);
+
+  // Apply a Grid Sweep row's exit params onto the single-run form:
+  //   - force exit.kind = STOP so hardStop / TP / trail fields render
+  //   - copy holdDays + hardStopPct + takeProfitPct + trailingStopPct
+  //   - map Grid's breakevenAtPct → form's trailingActivateAtPct (closest-
+  //     equivalent semantic: both gate when the trailing stop arms)
+  //   - null grid-value → undefined on form (= field empty / off)
+  // Grid-only axes (entryDelayDays, entryBar, exitBar) have no form field
+  // and are silently dropped — those dimensions can only be explored in
+  // the Grid Sweep itself.
+  function applyGridRowToForm(row: {
+    holdDays: number;
+    hardStopPct: number | null;
+    takeProfitPct: number | null;
+    trailingStopPct: number | null;
+    breakevenAtPct: number | null;
+  }) {
+    setTrade((prev) => ({
+      ...prev,
+      exit: {
+        kind: "STOP",
+        holdDays: row.holdDays,
+        hardStopPct: row.hardStopPct ?? undefined,
+        takeProfitPct: row.takeProfitPct ?? undefined,
+        trailingStopPct: row.trailingStopPct ?? undefined,
+        trailingActivateAtPct: row.breakevenAtPct ?? undefined,
+      },
+    }));
+    // Scroll the form into view. `behavior: "smooth"` + block: "start"
+    // gives the user a natural "something happened upstairs" reaction.
+    tradeParamsCardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   // ─── Parameter sweep ──────────────────────────────────────────────────────
   type SweepDim = "exit.holdDays" | "trade.leverage" | "trade.investmentUsd" | "filters.minDayChangePct" | "filters.maxDayChangePct" | "exit.hardStopPct" | "exit.takeProfitPct" | "exit.trailingStopPct";
   type SweepStep = { value: number; summary: Summary };
@@ -428,7 +466,7 @@ export default function ResearchPage() {
         </div>
 
         {/* Trade Params */}
-        <div className="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
+        <div ref={tradeParamsCardRef} className="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm">
           <div className="flex items-center gap-2 mb-4">
             <Zap className="h-4 w-4 text-emerald-500" />
             <h3 className="font-semibold text-zinc-900">Параметры сделки</h3>
@@ -588,6 +626,7 @@ export default function ResearchPage() {
         leverage={trade.leverage}
         tradeDirection={trade.tradeDirection}
         costs={costs}
+        onApplyToForm={applyGridRowToForm}
       />
 
       {/* Parameter Sweep — 1D walk, kept for focused drill-down after grid finds a winner */}

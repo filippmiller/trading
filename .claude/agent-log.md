@@ -9,6 +9,46 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 18:40] — fix: Grid Sweep Apply-to-form + leverage max
+
+**Area:** Trading/Research, Trading/Settings
+**Type:** feature (Apply-to-form) + polish (leverage input max)
+**Branch:** `fix/research-apply-and-leverage-max`
+
+Closes two of the remaining items from the Claude Desktop headed audit:
+
+### Finding #5 — Grid Sweep Apply-to-form (MEDIUM)
+Grid Sweep in `/research` shows per-config P&L across ~10-1000 strategy variants and lets the user sort by totalPnl / winRate / sharpe / profitFactor. Previously the only way to take a promising row back to the single-run simulator was to manually retype its params into the "Параметры сделки" form above — friction that defeated the purpose of running the grid.
+
+Fix:
+- `GridSweepSection` takes a new optional prop `onApplyToForm?: (row: ApplyGridRow) => void`. When provided, each result row renders an "Apply" button in a new rightmost column.
+- Click mirrors the row's exit params onto the form: `holdDays`, `hardStopPct`, `takeProfitPct`, `trailingStopPct`, and (semantic-closest) `breakevenAtPct` → `trailingActivateAtPct`. Forces `exit.kind='STOP'` so the stop/TP/trail fields become visible.
+- Grid-only axes (`entryDelayDays`, `entryBar`, `exitBar`) are silently dropped — the single-run API doesn't expose them; those dimensions can only be explored in the Grid Sweep itself. Commented in code.
+- Parent `/research/page.tsx` wires a ref on the "Параметры сделки" card and calls `scrollIntoView({ behavior: 'smooth' })` so the user sees the form change.
+- Applied row renders an "Applied ✓" emerald badge for 2.5s before reverting to a button (so the same row can be re-applied if the user tinkers and wants to restore).
+
+### Self-noted polish — leverage client-side max
+`/settings` Defaults card: the `leverage` `<Input type="number">` had `min={1}` after PR #36 but no `max`. Server Zod already enforces `leverage: z.number().min(1).max(10)` — no validation gap, but the client input now mirrors the server bound (`max={10}`) so the browser itself constrains editing.
+
+### Verification
+```
+npx tsc --noEmit → tsc_exit=0
+npm test        → 88/88 passed (unchanged — this is pure UI wiring over existing types)
+```
+
+### Files Changed
+- `src/components/GridSweepSection.tsx` — new `onApplyToForm` prop, Apply column + button + badge + 2.5s revert timer
+- `src/app/research/page.tsx` — `tradeParamsCardRef`, `applyGridRowToForm()` handler, pass to `<GridSweepSection onApplyToForm={applyGridRowToForm}>`
+- `src/app/settings/page.tsx` — `max={10}` on leverage input
+- `.claude/agent-log.md` — this entry
+
+### Not in this PR (deliberately skipped)
+- Claude Desktop Finding #3 `/voice` no drag-drop zone — LOW, pure UX polish, native `<input type="file">` works fine as-is
+- Finding #1 React hydration #418 — LOW, auto-recovers, root cause is SSR/client state timing in the matrix; untangling it is a bigger project than its impact warrants right now
+- Phase 3 real-time minute polling — user earlier approved only Phase 1+2 for the matrix→paper feature
+
+---
+
 ## [2026-04-22 18:10] — feat: lazy whitelist sync — closes matrix↔paper gap
 
 **Area:** Trading/Paper, Trading/Surveillance
