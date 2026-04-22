@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getPool } from "@/lib/db";
+import { getPool, mysql } from "@/lib/db";
 import { ensureSchema } from "@/lib/migrations";
 import { resolveAccount, computeAccountEquity, AccountNotFoundError } from "@/lib/paper";
 
@@ -77,25 +77,59 @@ export async function POST(req: Request) {
       throw err;
     }
 
-    // Clear trades and orders SCOPED to the targeted account — W5 acceptance:
-    // resetting "Alt1" must leave Default's data untouched.
-    await pool.execute("DELETE FROM paper_orders WHERE account_id = ?", [account.id]);
-    await pool.execute("DELETE FROM paper_trades WHERE account_id = ?", [account.id]);
-    await pool.execute("DELETE FROM paper_equity_snapshots WHERE account_id = ?", [account.id]);
+    // Hotfix 2026-04-22 (Bug #4) — atomic reset. Previously the three
+    // DELETEs + UPDATE were separate autocommit statements. A mid-flight
+    // failure (DB drops, row lock contention, deadlock victim) left the
+    // account in an inconsistent state — e.g. orders deleted but trades
+    // retained, or equity snapshots deleted but cash not restored. Wrap
+    // the whole sequence in a single transaction so it's all-or-nothing.
+    //
+    // Lock order: lock paper_accounts row first (FOR UPDATE) to match the
+    // convention used by fill/reservation paths. DELETEs acquire row-level
+    // X-locks implicitly; no additional locking needed.
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
 
-    // Reset cash AND clear reserved_cash + reserved_short_margin. A stale
-    // reservation from a pre-reset PENDING order (deleted above) would
-    // otherwise leave the account showing less cash than it should after reset.
-    if (newInitial != null) {
-      await pool.execute(
-        "UPDATE paper_accounts SET initial_cash = ?, cash = ?, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?",
-        [newInitial, newInitial, account.id]
-      );
-    } else {
-      await pool.execute(
-        "UPDATE paper_accounts SET cash = initial_cash, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?",
+      // Lock the account row first to establish the intent + block concurrent
+      // fills/resets on the same account. Re-verify the row still exists
+      // (defensive — another reset-concurrent-delete could have removed it).
+      const [acctRows] = await conn.execute<mysql.RowDataPacket[]>(
+        "SELECT id, name FROM paper_accounts WHERE id = ? FOR UPDATE",
         [account.id]
       );
+      if (acctRows.length === 0) {
+        await conn.rollback();
+        return NextResponse.json({ error: "Account not found" }, { status: 404 });
+      }
+
+      // Clear trades and orders SCOPED to the targeted account — W5 acceptance:
+      // resetting "Alt1" must leave Default's data untouched.
+      await conn.execute("DELETE FROM paper_orders WHERE account_id = ?", [account.id]);
+      await conn.execute("DELETE FROM paper_trades WHERE account_id = ?", [account.id]);
+      await conn.execute("DELETE FROM paper_equity_snapshots WHERE account_id = ?", [account.id]);
+
+      // Reset cash AND clear reserved_cash + reserved_short_margin. A stale
+      // reservation from a pre-reset PENDING order (deleted above) would
+      // otherwise leave the account showing less cash than it should.
+      if (newInitial != null) {
+        await conn.execute(
+          "UPDATE paper_accounts SET initial_cash = ?, cash = ?, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?",
+          [newInitial, newInitial, account.id]
+        );
+      } else {
+        await conn.execute(
+          "UPDATE paper_accounts SET cash = initial_cash, reserved_cash = 0, reserved_short_margin = 0 WHERE id = ?",
+          [account.id]
+        );
+      }
+
+      await conn.commit();
+    } catch (err) {
+      try { await conn.rollback(); } catch { /* ignore */ }
+      throw err;
+    } finally {
+      conn.release();
     }
 
     return NextResponse.json({ success: true, message: `Account '${account.name}' reset`, account_id: account.id });

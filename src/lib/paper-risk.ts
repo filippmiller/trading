@@ -71,6 +71,14 @@ let _override: RiskConfig | null = null;
  *
  * The override slot (`_setRiskConfigForTest`) short-circuits the cache so
  * smoke tests can pin a value without racing the TTL.
+ *
+ * Hotfix 2026-04-22 (Bug #3): distinguish "table missing" (legitimate —
+ * still booting / fresh DB) from "any other DB error" (op signal — silent
+ * drift would be worse than a visible log). On any non-table-missing
+ * exception we STILL return DEFAULT (breaking the fill engine is worse
+ * than drifting to defaults), but we `console.warn` the error message so
+ * the drift shows up in Railway logs as an operational signal. Pragmatic
+ * middle ground between "always silent" and "throw and break fills".
  */
 export async function loadRiskConfig(): Promise<RiskConfig> {
   if (_override) return _override;
@@ -92,10 +100,19 @@ export async function loadRiskConfig(): Promise<RiskConfig> {
     };
     _cache = { cfg, at: now };
     return cfg;
-  } catch {
-    // If app_settings is unreachable (boot-time, torn DB, schema skew) we
-    // return DEFAULT_RISK_CONFIG rather than throwing — the fill engine's
-    // correctness is more important than precise config loading.
+  } catch (err: unknown) {
+    // MySQL errno 1146 = "Table doesn't exist" — legitimate during initial
+    // boot before ensureSchema finishes. Silent fallback is correct here.
+    // Any OTHER exception (connection lost, permission denied, malformed
+    // rows, post-migration schema skew) means the user's configured risk
+    // values are being silently ignored — log.warn so it surfaces in ops.
+    const e = err as { errno?: number; code?: string; message?: string };
+    const isTableMissing = e.errno === 1146 || e.code === "ER_NO_SUCH_TABLE";
+    if (!isTableMissing) {
+      console.warn(
+        `[paper-risk] loadRiskConfig failed, using DEFAULT_RISK_CONFIG: ${e.message ?? String(err)}`
+      );
+    }
     return DEFAULT_RISK_CONFIG;
   }
 }

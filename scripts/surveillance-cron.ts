@@ -1347,29 +1347,50 @@ async function jobMonitorPaperTradesImpl() {
     const entryPrice = Number(trade.buy_price);
     const side: "LONG" | "SHORT" = trade.side === "SHORT" ? "SHORT" : "LONG";
 
-    // Hotfix (Bug #12 — 2026-04-21): derive max/min PRICE watermarks from the
-    // persisted max_pnl_pct / min_pnl_pct percentages so the trailing-stop
-    // ratchet holds across ticks. paper_trades has no `max_price` column; the
-    // evaluator was previously reinitializing maxPrice=currentPrice every tick,
-    // causing a LONG trailing stop to DROP after a retracement instead of
-    // holding at the historical high. Direction-aware inversion of
-    // computePnlPct:
-    //   LONG:  pnl = (cur-entry)/entry * 100 → cur = entry * (1 + pnl/100)
-    //   SHORT: pnl = (entry-cur)/entry * 100 → cur = entry * (1 - pnl/100)
-    //     (SHORT profits on price fall, so best-pnl = lowest-price)
+    // Hotfix (Bug #12 — 2026-04-21, revised 2026-04-21 for SHORT): derive
+    // max/min PRICE watermarks from the persisted max_pnl_pct / min_pnl_pct
+    // percentages so the trailing-stop ratchet holds across ticks.
+    // paper_trades has no `max_price` column.
+    //
+    // The EVALUATOR (paper-exits.ts:169-189) reads LONG trailing from
+    // `maxPrice` (highest observed price) and SHORT trailing from `minPrice`
+    // (lowest observed price). So the SLOT the derived price lands in is
+    // side-aware — not just the derivation formula.
+    //
+    //   LONG:  best-pnl (max_pnl_pct)  = highest-price → maxPrice slot
+    //          worst-pnl (min_pnl_pct) = lowest-price  → minPrice slot
+    //   SHORT: best-pnl (max_pnl_pct)  = lowest-price  → minPrice slot
+    //          worst-pnl (min_pnl_pct) = highest-price → maxPrice slot
+    //
+    // Previous hotfix mapped max_pnl_pct→maxPrice for BOTH sides. The SHORT
+    // best-pnl (a LOW price) correctly landed in the maxPrice slot but the
+    // evaluator ignores maxPrice for SHORT — it uses minPrice, which got
+    // derived from min_pnl_pct (a HIGH squeeze price). Result: SHORT trailing
+    // ratcheted from the squeeze peak instead of the historical low.
     const maxPnlPctPersisted = trade.max_pnl_pct != null ? Number(trade.max_pnl_pct) : null;
     const minPnlPctPersisted = trade.min_pnl_pct != null ? Number(trade.min_pnl_pct) : null;
     let maxPriceDerived: number | null = null;
     let minPriceDerived: number | null = null;
-    if (maxPnlPctPersisted !== null && Number.isFinite(maxPnlPctPersisted) && entryPrice > 0) {
-      maxPriceDerived = side === "SHORT"
-        ? entryPrice * (1 - maxPnlPctPersisted / 100)
-        : entryPrice * (1 + maxPnlPctPersisted / 100);
-    }
-    if (minPnlPctPersisted !== null && Number.isFinite(minPnlPctPersisted) && entryPrice > 0) {
-      minPriceDerived = side === "SHORT"
-        ? entryPrice * (1 - minPnlPctPersisted / 100)
-        : entryPrice * (1 + minPnlPctPersisted / 100);
+    if (side === "SHORT") {
+      // SHORT best (max_pnl_pct) → lowest observed price → minPrice slot.
+      // cur = entry * (1 - pnl/100). pnl=+10 ⇒ cur = entry*0.90 (low).
+      if (maxPnlPctPersisted !== null && Number.isFinite(maxPnlPctPersisted) && entryPrice > 0) {
+        minPriceDerived = entryPrice * (1 - maxPnlPctPersisted / 100);
+      }
+      // SHORT worst (min_pnl_pct) → highest observed price → maxPrice slot.
+      // pnl=-3 ⇒ cur = entry*1.03 (high).
+      if (minPnlPctPersisted !== null && Number.isFinite(minPnlPctPersisted) && entryPrice > 0) {
+        maxPriceDerived = entryPrice * (1 - minPnlPctPersisted / 100);
+      }
+    } else {
+      // LONG best (max_pnl_pct) → highest observed price → maxPrice slot.
+      if (maxPnlPctPersisted !== null && Number.isFinite(maxPnlPctPersisted) && entryPrice > 0) {
+        maxPriceDerived = entryPrice * (1 + maxPnlPctPersisted / 100);
+      }
+      // LONG worst (min_pnl_pct) → lowest observed price → minPrice slot.
+      if (minPnlPctPersisted !== null && Number.isFinite(minPnlPctPersisted) && entryPrice > 0) {
+        minPriceDerived = entryPrice * (1 + minPnlPctPersisted / 100);
+      }
     }
 
     // Direction-aware PnL % for watermark tracking. Computed inside the
