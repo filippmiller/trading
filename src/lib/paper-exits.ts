@@ -24,6 +24,7 @@
 
 import type mysqlTypes from "mysql2/promise";
 import { recordEquitySnapshotInTx } from "./paper-fill";
+import { applyCommission, loadRiskConfig } from "./paper-risk";
 
 export type Side = "LONG" | "SHORT";
 
@@ -309,6 +310,12 @@ export async function applyExitDecisionToTrade(
   currentPrice: number,
   decision: ExitDecision
 ): Promise<{ closed: boolean; pnlUsd: number; remainingQty: number }> {
+  // Hotfix Bug #2 (2026-04-21): auto-exits must charge commission on the
+  // close leg to match the manual-close path in fillOrderCore. Load the risk
+  // config OUTSIDE the transaction (loadRiskConfig is cached; it's a cheap
+  // hit after the first call). paper-risk exports `applyCommission` with the
+  // same (quantity, sizeUsd, cfg) signature used by paper-fill.
+  const riskCfg = await loadRiskConfig();
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -366,6 +373,17 @@ export async function applyExitDecisionToTrade(
       ? (entryPrice - currentPrice) * remaining
       : (currentPrice - entryPrice) * remaining;
 
+    // Hotfix Bug #2 (2026-04-21): charge commission on the auto-exit close
+    // leg to match the manual-close path in fillOrderCore (paper-fill.ts).
+    // Previously the LONG credit was `cash += proceeds` with no commission,
+    // producing asymmetry between auto-exit and manual close. `sizeUsd` is
+    // unused by the default $/share schedule; pass `proceeds` (LONG) or the
+    // nominal slice (SHORT) as the second arg — mirrors paper-fill usage.
+    const closeSizeUsd = side === "SHORT"
+      ? (totalQty > 0 ? investment * (remaining / totalQty) : 0)
+      : proceeds;
+    const closeCommissionUsd = applyCommission(remaining, closeSizeUsd, riskCfg);
+
     // Mark CLOSED. Include accumulated pnl from any prior partial closes
     // (existing pnl_usd value) plus this final leg.
     const existingPnl = Number(trade.pnl_usd ?? 0);
@@ -380,6 +398,12 @@ export async function applyExitDecisionToTrade(
     // For LONG: sell_price = close. For SHORT: same — sell_price is the
     // closing (cover) price regardless of direction; the sign of pnl_usd
     // tells direction-aware profitability.
+    //
+    // Commission accumulates onto `commission_usd` additively, matching
+    // partial-close behaviour in paper-fill.ts:686. pnl_usd is kept as the
+    // pure price-delta × qty number (no net-of-commission) so the W1/W2/W3
+    // conservation invariants that measure `sum(commission_usd)` separately
+    // stay clean.
     const [tradeUpdate] = await conn.execute(
       `UPDATE paper_trades
           SET status='CLOSED', sell_price=?, sell_date=CURRENT_DATE,
@@ -387,6 +411,7 @@ export async function applyExitDecisionToTrade(
               closed_quantity = quantity,
               max_pnl_pct=?, min_pnl_pct=?,
               trailing_active=?, trailing_stop_price=?,
+              commission_usd = commission_usd + ?,
               exit_reason=?
         WHERE id=? AND status='OPEN'`,
       [
@@ -397,6 +422,7 @@ export async function applyExitDecisionToTrade(
         decision.watermarks.minPnlPct,
         decision.watermarks.trailingActive ? 1 : 0,
         decision.watermarks.trailingStopPrice,
+        closeCommissionUsd,
         decision.reason,
         tradeId,
       ]
@@ -407,12 +433,16 @@ export async function applyExitDecisionToTrade(
       return { closed: false, pnlUsd: 0, remainingQty: 0 };
     }
 
-    // Cash/margin arithmetic — differs by side.
+    // Cash/margin arithmetic — differs by side. Commission is deducted from
+    // the net cash credit so auto-exits and manual closes produce identical
+    // final cash balances at the same close price.
     if (side === "LONG") {
-      // Credit proceeds to cash. Account locked above so no contention.
+      // Credit proceeds to cash (net of commission). Account locked above so
+      // no contention. Guard cash non-negative same as manual-close path.
+      const netCredit = proceeds - closeCommissionUsd;
       const [credit] = await conn.execute(
-        "UPDATE paper_accounts SET cash = cash + ? WHERE id = ?",
-        [proceeds, accountId]
+        "UPDATE paper_accounts SET cash = cash + ? WHERE id = ? AND (cash + ?) >= 0",
+        [netCredit, accountId, netCredit]
       ) as [mysqlTypes.ResultSetHeader, unknown];
       if (credit.affectedRows !== 1) {
         await conn.rollback();
@@ -426,22 +456,20 @@ export async function applyExitDecisionToTrade(
       // margin at adj*qty; this path must release THAT amount, not the
       // nominal `investmentShare`.
       //
-      // Accounting on cover:
+      // Accounting on cover (with Bug #2 commission deduction):
       //   marginRelease = buy_price * remaining_qty
       //                 = adj_open * remaining_qty (the actual dollars held)
-      //   cashCredit    = 2 * marginRelease - proceeds
-      //                 = marginRelease + pnlSlice
+      //   cashCredit    = 2 * marginRelease - proceeds - closeCommissionUsd
       //   margin -= marginRelease
       //
-      // Auto-exits don't apply slippage (the trigger price IS the fill) and
-      // don't charge commission here (paper-exits is the legacy direct-close
-      // path; W4 slippage/commission flow through paper-fill.ts fillOrder).
-      // See paper-fill.ts:763 for the equivalent explicit-fill path.
+      // Auto-exits don't apply slippage (the trigger price IS the fill) but
+      // DO charge commission (Bug #2 fix 2026-04-21). Manual cover in
+      // paper-fill.ts:763 uses the same structure.
       const marginRelease = entryPrice * remaining;
-      const cashCredit = 2 * marginRelease - proceeds;
+      const cashCredit = 2 * marginRelease - proceeds - closeCommissionUsd;
       const [release] = await conn.execute(
-        "UPDATE paper_accounts SET reserved_short_margin = reserved_short_margin - ?, cash = cash + ? WHERE id = ? AND reserved_short_margin >= ?",
-        [marginRelease, cashCredit, accountId, marginRelease]
+        "UPDATE paper_accounts SET reserved_short_margin = reserved_short_margin - ?, cash = cash + ? WHERE id = ? AND reserved_short_margin >= ? AND (cash + ?) >= 0",
+        [marginRelease, cashCredit, accountId, marginRelease, cashCredit]
       ) as [mysqlTypes.ResultSetHeader, unknown];
       if (release.affectedRows !== 1) {
         await conn.rollback();
