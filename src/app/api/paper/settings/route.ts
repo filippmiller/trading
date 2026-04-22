@@ -30,12 +30,19 @@ export async function GET() {
   }
 }
 
-const RiskSchema = z.object({
-  slippage_bps: z.number().min(0).max(500).optional(),
-  commission_per_share: z.number().min(0).max(10).optional(),
-  commission_min_per_leg: z.number().min(0).max(100).optional(),
+// Hotfix 2026-04-22 (Claude Desktop headed audit, Finding #2): bounds were
+// laxer than any real retail-broker schedule, which let a `-5` sanitized by
+// the browser's number input land as a saved `5.00/share` (1000× the default
+// 0.005). Tighter upper bounds now reject the typo on the server even if the
+// client slips it through. Retail brokers cap commission at <$0.02/share and
+// slippage on major symbols at well under 1%; 0.5 / 10 / 200 / 100 leave
+// generous headroom for illiquid edge cases but reject clearly-wrong input.
+export const RiskSchema = z.object({
+  slippage_bps: z.number().min(0).max(200).optional(),
+  commission_per_share: z.number().min(0).max(0.5).optional(),
+  commission_min_per_leg: z.number().min(0).max(10).optional(),
   allow_fractional_shares: z.boolean().optional(),
-  default_borrow_rate_pct: z.number().min(0).max(200).optional(),
+  default_borrow_rate_pct: z.number().min(0).max(100).optional(),
 });
 
 /**

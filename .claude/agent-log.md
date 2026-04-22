@@ -9,6 +9,51 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 16:15] — RED Finding #2 fix: settings input validation
+
+**Area:** Trading/Paper, Trading/API
+**Type:** fix + tests
+**Branch:** `fix/settings-input-validation`
+**Severity of fixed bug:** RED (silent 1000× cost-model corruption)
+
+### Why
+Claude Desktop's parallel headed audit surfaced Finding #2 on `/settings`: typing `-5` into "Commission — per share ($)" caused the browser's `<input type="number">` to strip the `-`, parsing `5` into React state. Previous server Zod `commission_per_share: z.number().min(0).max(10)` accepted this as valid — silently persisting $5/share (1000× the default $0.005). Any backtest or paper fill running on that config would compute catastrophically wrong P&L until a human noticed.
+
+### Fix — multi-layer defense
+1. **Tightened server Zod bounds** (`src/app/api/paper/settings/route.ts`). New upper limits reject obviously-wrong retail values while leaving headroom for illiquid edges:
+   - `commission_per_share`: 10 → 0.5 (max $0.50/share; retail brokers cap near $0.02)
+   - `commission_min_per_leg`: 100 → 10
+   - `slippage_bps`: 500 → 200
+   - `default_borrow_rate_pct`: 200 → 100
+   - `RiskSchema` now `export`ed so unit tests can pin the bounds.
+2. **HTML-level guardrails** on the risk-model inputs (`src/app/settings/page.tsx`). Added `min` + `max` to `<Input type="number">` for every field — browsers with `min=0` refuse to let the user type `-`, closing the specific `-5 → 5` sanitization hole. Also added `min={0}` (and `min={1}` for leverage) to the legacy Defaults card for the same class of bug.
+3. **Pre-save client validation** — `validateRisk()` mirrors the server bounds and refuses to POST when a field falls outside, showing the exact label + range + actual value inline.
+4. **Server error surfacing** — on non-OK response, parse `issues[0]` from the Zod reply and show `Invalid input — <path>: <message>` instead of a generic "Failed to save."
+5. **Status coloring** — `riskMessage === "Saved."` renders emerald, anything else (i.e. any error) renders rose. Previously both were `text-zinc-500` gray and visually indistinguishable.
+
+### Tests
+New file `src/app/api/paper/settings/schema.test.ts` (6 tests) pins:
+- accepts defaults
+- accepts partial patches (each field optional)
+- REJECTS `commission_per_share = 5` (the Finding #2 value)
+- REJECTS any negative on each numeric field
+- REJECTS each field's new upper bound + 1
+- ACCEPTS each field's new upper bound exactly (boundary pinning)
+
+### Verification
+```
+npx tsc --noEmit → tsc_exit=0
+npm test        → 75/75 passed (previously 69/69; +6 new bounds tests)
+```
+
+### Files Changed
+- `src/app/api/paper/settings/route.ts` — tighten Zod bounds + `export` the schema
+- `src/app/settings/page.tsx` — client validation + `min`/`max` on all numeric inputs + status color
+- `src/app/api/paper/settings/schema.test.ts` — new, 6 tests
+- `.claude/agent-log.md` — this entry
+
+---
+
 ## [2026-04-22 15:00] — Dashboard-stats stay-put probe (closes Finding #1)
 
 **Area:** Trading/QA
