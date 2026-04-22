@@ -1347,6 +1347,31 @@ async function jobMonitorPaperTradesImpl() {
     const entryPrice = Number(trade.buy_price);
     const side: "LONG" | "SHORT" = trade.side === "SHORT" ? "SHORT" : "LONG";
 
+    // Hotfix (Bug #12 — 2026-04-21): derive max/min PRICE watermarks from the
+    // persisted max_pnl_pct / min_pnl_pct percentages so the trailing-stop
+    // ratchet holds across ticks. paper_trades has no `max_price` column; the
+    // evaluator was previously reinitializing maxPrice=currentPrice every tick,
+    // causing a LONG trailing stop to DROP after a retracement instead of
+    // holding at the historical high. Direction-aware inversion of
+    // computePnlPct:
+    //   LONG:  pnl = (cur-entry)/entry * 100 → cur = entry * (1 + pnl/100)
+    //   SHORT: pnl = (entry-cur)/entry * 100 → cur = entry * (1 - pnl/100)
+    //     (SHORT profits on price fall, so best-pnl = lowest-price)
+    const maxPnlPctPersisted = trade.max_pnl_pct != null ? Number(trade.max_pnl_pct) : null;
+    const minPnlPctPersisted = trade.min_pnl_pct != null ? Number(trade.min_pnl_pct) : null;
+    let maxPriceDerived: number | null = null;
+    let minPriceDerived: number | null = null;
+    if (maxPnlPctPersisted !== null && Number.isFinite(maxPnlPctPersisted) && entryPrice > 0) {
+      maxPriceDerived = side === "SHORT"
+        ? entryPrice * (1 - maxPnlPctPersisted / 100)
+        : entryPrice * (1 + maxPnlPctPersisted / 100);
+    }
+    if (minPnlPctPersisted !== null && Number.isFinite(minPnlPctPersisted) && entryPrice > 0) {
+      minPriceDerived = side === "SHORT"
+        ? entryPrice * (1 - minPnlPctPersisted / 100)
+        : entryPrice * (1 + minPnlPctPersisted / 100);
+    }
+
     // Direction-aware PnL % for watermark tracking. Computed inside the
     // shared module too, but we also need it to decide trailing activation.
     // The shared module handles that internally.
@@ -1365,10 +1390,10 @@ async function jobMonitorPaperTradesImpl() {
             ? trade.time_exit_date.toISOString().slice(0, 10)
             : String(trade.time_exit_date).slice(0, 10))
         : null,
-      maxPnlPct: trade.max_pnl_pct != null ? Number(trade.max_pnl_pct) : null,
-      minPnlPct: trade.min_pnl_pct != null ? Number(trade.min_pnl_pct) : null,
-      maxPrice: null,  // paper_trades doesn't track max_price separately
-      minPrice: null,
+      maxPnlPct: maxPnlPctPersisted,
+      minPnlPct: minPnlPctPersisted,
+      maxPrice: maxPriceDerived,
+      minPrice: minPriceDerived,
     };
 
     const result = sharedEvaluateExitsAlways(input, price, now);

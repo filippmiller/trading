@@ -520,11 +520,14 @@ async function test10c_shortAutoExitMarginRelease(accountId) {
   //   open:  cash -= 1000.50 (adj*qty margin + $1 comm)
   //   exit:  cashCredit = 2*999.50 - (10*110) = 1999 - 1100 = 899
   //   total = -1000.50 + 899 = -101.50 = pnl - 1*commission ✓
-  const [[closed]] = await pool.execute("SELECT status, pnl_usd, exit_reason FROM paper_trades WHERE id = ?", [open.tradeId]);
+  const [[closed]] = await pool.execute("SELECT status, pnl_usd, commission_usd, exit_reason FROM paper_trades WHERE id = ?", [open.tradeId]);
   assert(closed.status === "CLOSED", `trade CLOSED (got ${closed.status})`);
   assert(closed.exit_reason === "HARD_STOP", `exit_reason = HARD_STOP`);
   assert(Math.abs(Number(closed.pnl_usd) - (-100.50)) < EPS, `pnl_usd = -100.50 (got ${closed.pnl_usd})`);
-  const expectedCash = TEST_INITIAL_CASH + (-100.50) - 1.0; // pnl - 1 open-leg commission
+  // Hotfix Bug #2 (2026-04-21): auto-exit now charges close-leg commission.
+  // commission_usd accumulates BOTH open ($1) + close ($1 min floor) = $2.
+  assert(Math.abs(Number(closed.commission_usd) - 2.0) < EPS, `commission_usd = 2.0 (open $1 + close $1, got ${closed.commission_usd})`);
+  const expectedCash = TEST_INITIAL_CASH + (-100.50) - 2.0; // pnl - 2 legs of commission
   assert(Math.abs(Number(acct.cash) - expectedCash) < EPS, `cash = ${expectedCash} (got ${acct.cash})`);
 }
 

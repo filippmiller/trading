@@ -302,11 +302,16 @@ export async function POST(req: Request) {
           trade_id ?? null,
           close_quantity ?? null,
           notes ?? null,
-          (isOpenLong || isOpenShort) && stop_loss_pct != null && stop_loss_pct > 0 ? stop_loss_pct : null,
-          (isOpenLong || isOpenShort) && take_profit_pct != null && take_profit_pct > 0 ? take_profit_pct : null,
-          (isOpenLong || isOpenShort) && trailing_stop_pct != null && trailing_stop_pct > 0 ? trailing_stop_pct : null,
-          (isOpenLong || isOpenShort) && trailing_activates_at_profit_pct != null ? trailing_activates_at_profit_pct : null,
-          (isOpenLong || isOpenShort) && time_exit_days != null && time_exit_days >= 0 ? time_exit_days : null,
+          // Hotfix Bug #6 (2026-04-21): every bracket pct is gated on
+          // `isFinite && > 0` so bad client input (NaN, Infinity, negative,
+          // zero) falls through to NULL instead of being stored and silently
+          // activating immediately (pnlPct >= -5 is always true for any
+          // positive-profit check). `time_exit_days` allows 0 (close today).
+          (isOpenLong || isOpenShort) && typeof stop_loss_pct === "number" && Number.isFinite(stop_loss_pct) && stop_loss_pct > 0 ? stop_loss_pct : null,
+          (isOpenLong || isOpenShort) && typeof take_profit_pct === "number" && Number.isFinite(take_profit_pct) && take_profit_pct > 0 ? take_profit_pct : null,
+          (isOpenLong || isOpenShort) && typeof trailing_stop_pct === "number" && Number.isFinite(trailing_stop_pct) && trailing_stop_pct > 0 ? trailing_stop_pct : null,
+          (isOpenLong || isOpenShort) && typeof trailing_activates_at_profit_pct === "number" && Number.isFinite(trailing_activates_at_profit_pct) && trailing_activates_at_profit_pct > 0 ? trailing_activates_at_profit_pct : null,
+          (isOpenLong || isOpenShort) && typeof time_exit_days === "number" && Number.isFinite(time_exit_days) && time_exit_days >= 0 ? time_exit_days : null,
           clientRequestId,
         ]
       );
@@ -332,10 +337,30 @@ export async function POST(req: Request) {
       if (isOpenLong) {
         const reserved = await reserveCashForOrder(pool, orderId, account.id, investment_usd!);
         if (!reserved) {
-          await pool.execute(
+          // Hotfix Bug #5 (2026-04-21): atomic rejection with affectedRows
+          // check. If a concurrent cron tick transitioned the order before
+          // this UPDATE lands (filled, cancelled, or already rejected), the
+          // WHERE guard returns 0 rows and we return 409 Conflict with the
+          // actual current state rather than a misleading 400.
+          const [rejectRes] = await pool.execute<mysql.ResultSetHeader>(
             "UPDATE paper_orders SET status='REJECTED', rejection_reason='Insufficient cash to reserve' WHERE id=? AND status='PENDING'",
             [orderId]
           );
+          if (rejectRes.affectedRows !== 1) {
+            const [curRows] = await pool.execute<mysql.RowDataPacket[]>(
+              "SELECT status, rejection_reason, filled_price, trade_id FROM paper_orders WHERE id = ?",
+              [orderId]
+            );
+            const cur = curRows[0] ?? null;
+            return NextResponse.json({
+              error: "Order state changed concurrently during reservation",
+              order_id: orderId,
+              current_status: cur?.status ?? "UNKNOWN",
+              rejection_reason: cur?.rejection_reason ?? null,
+              filled_price: cur?.filled_price != null ? Number(cur.filled_price) : null,
+              trade_id: cur?.trade_id ?? null,
+            }, { status: 409 });
+          }
           return NextResponse.json({
             error: `Insufficient cash to reserve: need $${investment_usd!.toFixed(2)}`,
           }, { status: 400 });
@@ -343,10 +368,27 @@ export async function POST(req: Request) {
       } else if (isOpenShort) {
         const reserved = await reserveShortMarginForOrder(pool, orderId, account.id, investment_usd!);
         if (!reserved) {
-          await pool.execute(
+          // Hotfix Bug #5 (2026-04-21): same atomic rejection guard on SHORT
+          // open path.
+          const [rejectRes] = await pool.execute<mysql.ResultSetHeader>(
             "UPDATE paper_orders SET status='REJECTED', rejection_reason='Insufficient cash to reserve short margin' WHERE id=? AND status='PENDING'",
             [orderId]
           );
+          if (rejectRes.affectedRows !== 1) {
+            const [curRows] = await pool.execute<mysql.RowDataPacket[]>(
+              "SELECT status, rejection_reason, filled_price, trade_id FROM paper_orders WHERE id = ?",
+              [orderId]
+            );
+            const cur = curRows[0] ?? null;
+            return NextResponse.json({
+              error: "Order state changed concurrently during reservation",
+              order_id: orderId,
+              current_status: cur?.status ?? "UNKNOWN",
+              rejection_reason: cur?.rejection_reason ?? null,
+              filled_price: cur?.filled_price != null ? Number(cur.filled_price) : null,
+              trade_id: cur?.trade_id ?? null,
+            }, { status: 409 });
+          }
           return NextResponse.json({
             error: `Insufficient cash for short margin: need $${investment_usd!.toFixed(2)}`,
           }, { status: 400 });
