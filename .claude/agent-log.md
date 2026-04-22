@@ -9,6 +9,63 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 20:00] — fix: batch price-deviation band + idempotent-replay quantity bug
+
+**Area:** Trading/Paper
+**Type:** fix + feature
+**Branch:** `fix/batch-price-deviation-band`
+
+Two things in one PR — both came out of follow-up review of PR #40:
+
+### 1. Price-deviation band on batch fill (feature — closes Codex-1 "catastrophic success" interview)
+Closes the one real risk in PR #37's design that PR #40 only marked with `is_manual_fill=1` but did not prevent:
+without a sanity band, a caller could submit `fill_price=$1` for a $300 stock and the paper account
+would silently print +$299/share of fake equity. The `is_manual_fill` flag helps analytics filter
+these trades post-hoc, but doesn't stop the fantasy P&L in the first place.
+
+Implementation:
+- New pure helper `checkFillPriceDeviation(fillPrice, lastClose, band=0.2)` in `paper-risk.ts` —
+  returns `ok: false` with a human-readable reason when `|fill − close| / close > band`. Fails
+  open (ok=true) when lastClose is missing, so genuine data gaps don't break the batch flow.
+- New bulk helper `getLastCloseMap(symbols[])` — one INNER JOIN on `(symbol, MAX(date))` to fetch
+  the latest close per symbol in one round-trip (same N+1-avoidance pattern as `filterTradableSymbols`).
+- Route wires both up-front, before the per-row loop. Rejects get rich reasons like
+  `SYNTHETIC_DEVIATION_TOO_LARGE: fill_price $1.00 is 99.7% off last close $300.00 (max 20%)`.
+- `FILL_PRICE_DEVIATION_BAND = 0.2` exported as a named constant; configurable via the helper arg
+  if we later want to loosen it for specific symbol classes.
+- +10 unit tests covering: exact edge (20%), both directions, the Codex scenario ($1 on $300),
+  lastClose missing → pass-through, non-finite fillPrice → reject, custom band.
+
+### 2. Idempotent-replay quantity bug (hotfix — Codex-3 finding)
+PR #40's 1062-catch branch read `paper_orders.quantity` — but the batch path sizes by
+`investment_usd` and never sets `quantity`, so every FILLED replay via the 1062-race returned
+`quantity: 0`. The pre-check branch already did the right thing (LEFT JOIN paper_trades to pull
+the real fill quantity); this change makes the 1062-catch SELECT identical to the pre-check
+SELECT — both paths now return a `trade_quantity` value from `paper_trades.quantity`.
+
+Documented with a comment that both replay paths MUST return identical payloads.
+
+### Verification
+```
+npx tsc --noEmit → tsc_exit=0
+npm test        → 104/104 passed (was 94; +10 deviation tests)
+```
+
+### Files Changed
+- `src/lib/paper-risk.ts` — `checkFillPriceDeviation`, `getLastCloseMap`, `FILL_PRICE_DEVIATION_BAND`
+- `src/lib/paper-risk-deviation.test.ts` — new, 10 tests
+- `src/app/api/paper/batch-order/route.ts` — pre-fetch lastCloseMap, per-row deviation check,
+  1062-catch SELECT fixed to JOIN paper_trades
+- `.claude/agent-log.md` — this entry
+
+### Post-deploy smoke
+Live E2E on prod before this PR confirmed:
+- `is_manual_fill` column landed via `ensureColumn` migration
+- idempotency: same batch-id replay returned same trade_ids (10, 11) with `idempotent_replay: true`
+- account reset back to pristine
+
+---
+
 ## [2026-04-22 19:30] — hotfix: batch endpoint hardening (Codex-1 + Codex-2 review)
 
 **Area:** Trading/Paper, Trading/Research
