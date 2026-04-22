@@ -1035,9 +1035,19 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
                   // Direction in scenario mode comes from the overlay, not entry.direction.
                   const scnDirection = perTicker?.direction ?? 0;
                   const recurrence = recurrences.get(entry.symbol) ?? null;
-                  // F2 visual cue: unchecked rows de-emphasize so users see what's in scope.
+                  // F2 visual cue: unchecked rows de-emphasize so users see
+                  // what's in scope — BUT only when the user has actively
+                  // selected at least one row. Without this guard, the
+                  // default empty-selection state made EVERY row opacity-40,
+                  // turning the whole matrix into a washed-out grey blob on
+                  // first load (no selection = nothing "in scope" = nothing
+                  // to de-emphasize against). Scenario-dim is unconditional
+                  // because it only fires after the user clicks Apply.
+                  const hasActiveRowSelection = selectedRowIds.size > 0;
                   const rowUnchecked = !isRowChecked(entry.id);
-                  const rowOpacityCls = rowUnchecked ? 'opacity-40' : dimmed ? 'opacity-40' : '';
+                  const rowOpacityCls = (hasActiveRowSelection && rowUnchecked) ? 'opacity-40'
+                    : dimmed ? 'opacity-40'
+                    : '';
                   return (
                   <tr key={entry.id} className={`hover:bg-amber-50/30 transition-colors border-b border-zinc-100 ${rowOpacityCls}`}>
                     <td className="sticky left-0 z-10 bg-white px-2 py-2 text-center border-r border-zinc-100 w-[32px]">
