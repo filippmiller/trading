@@ -9,6 +9,32 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 20:48] — Session close: 10 PRs merged, 2 Codex reviews absorbed, 2 user-spotted UI bugs
+
+**Area:** Trading/Multi (Paper, Research, Matrix, Surveillance, Settings, Docs)
+**Type:** mixed (feature + bugfix + hotfix + audit + docs)
+
+### Files Changed
+Umbrella for 10 merged PRs today — per-PR entries below. PRs merged in this session: **#35** audit scripts, **#36** RED settings validation, **#37** matrix→paper batch modal, **#38** lazy whitelist sync, **#39** Grid Sweep Apply + leverage max, **#40** batch endpoint hardening (Codex-1 + Codex-2), **#41** deviation band + Codex-3 replay-quantity fix, **#42** empty-state headers + SYSTEM.md, **#43** NaN guards + defaults save surfacing, **#44** matrix default opacity.
+
+### Functions/Symbols Modified
+Summary reference — see per-PR entries below. Key new exports: `filterTradableSymbols`, `getLastCloseMap`, `checkFillPriceDeviation`, `ensureTradableSymbol`, `RiskSchema`, `BatchOrderSchema`, `ApplyGridRow`, `FILL_PRICE_DEVIATION_BAND`, `BatchTradeModal`.
+
+### Database Tables
+- `tradable_symbols` — backfilled from `reversal_entries` + ongoing lazy-insert + `LAZY_SYNC` marker (PR #38, #40)
+- `paper_orders` — new `is_manual_fill TINYINT(1)` column + new batch-endpoint INSERT path + `client_request_id` idempotency (PR #37, #40)
+- `paper_trades` — new INSERT path through `fillOrder` with arbitrary caller-price (PR #37)
+- `app_settings (risk.*)` — tightened Zod validation bounds (PR #36)
+- `paper_accounts` — verified atomic reset semantics (no schema change)
+
+### Summary
+Full-day marathon. Opened from a crashed prior session, unblocked with prod creds, ran headed audit, absorbed a parallel Claude Desktop audit (RED Finding #2 on commission input), shipped user-requested matrix→paper batch feature, discovered real matrix↔whitelist gap via live E2E, fixed at the root (lazy sync + backfill), closed out remaining Claude Desktop findings + Codex-1 + Codex-2 + Codex-3 in three tightly-scoped hotfix PRs, then two user-screenshot bug reports caught UI sloppiness (Trade History disappearing, matrix rendered washed-out grey) — both fixed same-day. Tests went 58 → 104. Railway auto-deployed each PR with healthz verified between. Added `.claude/SYSTEM.md` — 243-line manual — and updated `CLAUDE.md` session-start protocol to point future agents at it. Paper account reset to pristine ($100k) at end.
+
+### Session Notes
+→ `.claude/sessions/2026-04-22-204857.md`
+
+---
+
 ## [2026-04-22 20:00] — fix: batch price-deviation band + idempotent-replay quantity bug
 
 **Area:** Trading/Paper
