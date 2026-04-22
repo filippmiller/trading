@@ -72,9 +72,10 @@ describe("BatchOrderItemSchema", () => {
     expect(BatchOrderItemSchema.safeParse({
       symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100, stop_loss_pct: 51,
     }).success).toBe(false);
-    // trailing_stop_pct must be in [0.1, 20]
+    // trailing_stop_pct must be in [0.1, 50] — bumped from 20 after review
+    // (volatile penny/low-float names legitimately run 30-50% trails)
     expect(BatchOrderItemSchema.safeParse({
-      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100, trailing_stop_pct: 21,
+      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100, trailing_stop_pct: 51,
     }).success).toBe(false);
     // take_profit_pct must be in [0.1, 100]
     expect(BatchOrderItemSchema.safeParse({
@@ -85,7 +86,7 @@ describe("BatchOrderItemSchema", () => {
   it("accepts boundary-max bracket values", () => {
     expect(BatchOrderItemSchema.safeParse({
       symbol: "AAPL", side: "SHORT", qty: 1, fill_price: 100,
-      stop_loss_pct: 50, take_profit_pct: 100, trailing_stop_pct: 20,
+      stop_loss_pct: 50, take_profit_pct: 100, trailing_stop_pct: 50,
     }).success).toBe(true);
   });
 });
@@ -117,5 +118,60 @@ describe("BatchOrderSchema", () => {
 
   it("rejects a payload missing the `orders` key entirely", () => {
     expect(BatchOrderSchema.safeParse({}).success).toBe(false);
+  });
+});
+
+describe("BatchOrderItemSchema — client_request_id (idempotency)", () => {
+  it("accepts a well-formed client_request_id", () => {
+    const r = BatchOrderItemSchema.safeParse({
+      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100,
+      client_request_id: "batch-abc12345-0",
+    });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.client_request_id).toBe("batch-abc12345-0");
+  });
+
+  it("accepts omitted client_request_id (optional field)", () => {
+    const r = BatchOrderItemSchema.safeParse({
+      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100,
+    });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.client_request_id).toBeUndefined();
+  });
+
+  it("rejects too-short client_request_id (<8 chars)", () => {
+    expect(BatchOrderItemSchema.safeParse({
+      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100,
+      client_request_id: "abc123",
+    }).success).toBe(false);
+  });
+
+  it("rejects too-long client_request_id (>64 chars)", () => {
+    expect(BatchOrderItemSchema.safeParse({
+      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100,
+      client_request_id: "a".repeat(65),
+    }).success).toBe(false);
+  });
+
+  it("rejects client_request_id with invalid characters", () => {
+    expect(BatchOrderItemSchema.safeParse({
+      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100,
+      client_request_id: "has spaces!",
+    }).success).toBe(false);
+    expect(BatchOrderItemSchema.safeParse({
+      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100,
+      client_request_id: "has/slashes",
+    }).success).toBe(false);
+  });
+
+  it("accepts boundary lengths (8 and 64 chars)", () => {
+    expect(BatchOrderItemSchema.safeParse({
+      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100,
+      client_request_id: "a".repeat(8),
+    }).success).toBe(true);
+    expect(BatchOrderItemSchema.safeParse({
+      symbol: "AAPL", side: "LONG", qty: 1, fill_price: 100,
+      client_request_id: "a".repeat(64),
+    }).success).toBe(true);
   });
 });

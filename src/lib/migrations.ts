@@ -420,6 +420,14 @@ async function runSchemaMigrations() {
   await ensureColumn("paper_orders", "bracket_time_exit_days", "INT NULL");
   // Partial-close quantity on SELL/BUY-to-COVER orders. NULL = close remaining.
   await ensureColumn("paper_orders", "close_quantity", "DECIMAL(18,6) NULL");
+  // 2026-04-22 — provenance flag for batch paper-fills. /api/paper/batch-order
+  // deliberately bypasses RTH + live-price fetch and fills at the caller-
+  // supplied `fill_price`, which means MARKET no longer guarantees
+  // "executed against a live quote during RTH" for rows where this flag is 1.
+  // Downstream analytics that want to exclude synthetic fills from P&L
+  // attribution should filter on `is_manual_fill = 0`. Default 0 so every
+  // historical row and every single-order path stays as-is.
+  await ensureColumn("paper_orders", "is_manual_fill", "TINYINT(1) NOT NULL DEFAULT 0");
   // Index the exit scanner reads: (status, time_exit_date) — lets the W3
   // cron's monitorPaperTrades scan skip the OPEN-trades-table scan on every
   // tick by going straight to the short prefix of rows that are actually at
@@ -483,10 +491,25 @@ async function runSchemaMigrations() {
   // primary key means this is a one-shot data fix: first boot after the
   // migration ships inserts the delta, subsequent boots are ~no-op.
   // Lazy-insert in surveillance-cron.ts keeps it in sync going forward.
+  //
+  // 2026-04-22 revision — `exchange='LAZY_SYNC'` marker so lazy-added rows
+  // are distinguishable from curated-CSV seed rows (NASDAQ/NYSE). Closes
+  // the "NULL masquerades as curated completeness" foot-gun flagged in
+  // code review. Retroactive UPDATE below also flips any rows inserted by
+  // the previous NULL version of this migration to the new marker.
   try {
     await pool.execute(
       `INSERT IGNORE INTO tradable_symbols (symbol, exchange, asset_class, active)
-       SELECT DISTINCT symbol, NULL, 'EQUITY', 1 FROM reversal_entries`
+       SELECT DISTINCT symbol, 'LAZY_SYNC', 'EQUITY', 1 FROM reversal_entries`
+    );
+    // One-shot marker correction: any rows inserted by the prior NULL
+    // version of this migration (between PR #38 and this hotfix) get the
+    // marker retroactively. Idempotent — subsequent boots find no NULLs.
+    await pool.execute(
+      `UPDATE tradable_symbols
+          SET exchange = 'LAZY_SYNC'
+        WHERE exchange IS NULL
+          AND symbol IN (SELECT DISTINCT symbol FROM reversal_entries)`
     );
   } catch (err) {
     // Best-effort — the schema is still valid without this data fix. Log

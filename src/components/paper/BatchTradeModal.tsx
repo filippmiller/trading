@@ -71,6 +71,12 @@ export function BatchTradeModal({
   const [busy, setBusy] = useState(false);
   const [submitResult, setSubmitResult] = useState<{ total: number; filled: number; rejected: number; errored: number } | null>(null);
   const [topLevelError, setTopLevelError] = useState<string | null>(null);
+  // Per-modal-open batch id. Combined with each row's index, this gives
+  // every order a stable `client_request_id` so a double-click / network
+  // retry / React-double-mount doesn't produce duplicate paper trades.
+  // Regenerated on every open so re-opening the modal after a "Close"
+  // starts a fresh batch (a true intentional re-submit).
+  const [batchId, setBatchId] = useState<string>("");
 
   // Re-seed rows whenever the selection changes (modal reopens with a
   // different set). Clearing `submitResult` so prior runs aren't confusing.
@@ -79,6 +85,11 @@ export function BatchTradeModal({
       setRows(entries.map(initialRow));
       setSubmitResult(null);
       setTopLevelError(null);
+      // Fresh batch id on each open. Format: `batch-<hex>` where hex is
+      // random enough to avoid collisions even if the user spam-opens the
+      // modal in the same second. `client_request_id` regex requires
+      // 8..64 chars / [A-Za-z0-9_-]+, which this satisfies.
+      setBatchId(`batch-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`);
     }
   }, [open, entries]);
 
@@ -122,7 +133,7 @@ export function BatchTradeModal({
     setSubmitResult(null);
     try {
       const payload = {
-        orders: rows.map((r) => ({
+        orders: rows.map((r, i) => ({
           symbol: r.symbol,
           side: r.side,
           qty: r.qty,
@@ -130,6 +141,11 @@ export function BatchTradeModal({
           stop_loss_pct: r.stopLossPct ?? undefined,
           trailing_stop_pct: r.trailingStopPct ?? undefined,
           take_profit_pct: r.takeProfitPct ?? undefined,
+          // Per-row idempotency key. `${batchId}-${index}` means a retry
+          // of the same batch (network blip, double-click) hits the same
+          // slot for every row and the API replays the stored result
+          // instead of inserting duplicates.
+          client_request_id: `${batchId}-${i}`,
         })),
       };
       const url = `/api/paper/batch-order${accountId != null ? `?account_id=${accountId}` : ""}`;
@@ -283,7 +299,7 @@ export function BatchTradeModal({
                       <input
                         type="number"
                         min={0.1}
-                        max={20}
+                        max={50}
                         step={0.1}
                         value={row.trailingStopPct ?? ""}
                         placeholder="off"

@@ -9,6 +9,39 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 19:30] — hotfix: batch endpoint hardening (Codex-1 + Codex-2 review)
+
+**Area:** Trading/Paper, Trading/Research
+**Type:** hotfix (review remediation)
+**Branch:** `fix/batch-endpoint-hardening`
+
+Two independent critical reviews (Codex-1 agentic, Codex-2 manual code-read) landed after PR #39. Both flagged real issues. This hotfix closes the agreed set — 8 items across idempotency, perf, schema hygiene, and UX correctness.
+
+### Items closed
+- **I1 Idempotency** — `client_request_id` per item wired through Zod → INSERT → 1062-catch. LEFT JOIN paper_trades on replay to pull real fill quantity (paper_orders.quantity is NULL in batch path). Modal regenerates `batchId-${i}` on each open. +6 tests
+- **I2 N+1 whitelist** — new `filterTradableSymbols(symbols[])` helper runs one `IN(...)` query. Batch route pre-checks up-front, fails fast with SYMBOL_NOT_TRADABLE or WHITELIST_UNAVAILABLE without any INSERTs
+- **I4 BE→trailingActivate semantic lie** — `applyGridRowToForm` no longer writes `trailingActivateAtPct` from the grid row's `breakevenAtPct`. Preserves prior form value; tooltip updated to reflect
+- **T1 Force STOP only when row has stops** — both reviewers flagged as UX bug. If all three bracket fields are null (pure hold-based row), `exit.kind` is now preserved instead of silently switched to STOP
+- **T2 is_manual_fill provenance flag** — new `TINYINT(1) NOT NULL DEFAULT 0` column on `paper_orders` via `ensureColumn`. Batch inserts set `=1`. Closes "MARKET no longer means live-quote + RTH" blind spot; downstream analytics can filter synthetic fills out
+- **T3 exchange='LAZY_SYNC' marker** — `ensureTradableSymbol` now writes `'LAZY_SYNC'` instead of `NULL`. Backfill SQL in migrations updated; retroactive `UPDATE tradable_symbols SET exchange='LAZY_SYNC' WHERE exchange IS NULL AND symbol IN (...)` handles rows written by the previous NULL version
+- **T4 Zod trailing_stop_pct 20→50** — 20% was too tight for volatile penny/low-float names. Now 50% as typo-guard, not strategy policy. Client input `max` synced to 50 too. Boundary test updated
+- **T5 Order-dependence contract documented** — JSDoc expanded with explicit "rows processed SEQUENTIALLY, each fill mutates cash before next row, reordering produces different results at buying-power edge" section. Plus "synthetic fill provenance" paragraph
+
+### Items NOT fixed (verified false alarm or deferred)
+- **I3 notes collision** — Codex-2 read `paper-fill.ts:887/945`: order notes copied into trade notes on fill, order row itself not overwritten. **False alarm**. No action
+- All-or-nothing toggle, SRP refactor of ensureSchema, `origin_type` enum column, agent-log-format — deferred to backlog. Both reviewers agreed acceptable as-is for MVP
+
+### Verification
+```
+npx tsc --noEmit → tsc_exit=0
+npm test        → 94/94 passed (was 88 before this PR; +6 idempotency tests)
+```
+
+### Process note
+The background agent (fullstack-nextjs-specialist) that started this work stalled mid-implementation on the idempotency LEFT JOIN detail (stream watchdog fired at 600s idle). Partial work was salvageable and correct — picked it up from working-tree, added the 5 extra items from Codex-2's review, and finished.
+
+---
+
 ## [2026-04-22 18:40] — fix: Grid Sweep Apply-to-form + leverage max
 
 **Area:** Trading/Research, Trading/Settings
