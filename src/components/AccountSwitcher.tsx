@@ -63,6 +63,11 @@ export function AccountSwitcher({ accounts, selectedId, onSelect, onCreate }: Ac
     const name = newName.trim();
     const cash = parseFloat(newCash);
     if (!name) { setCreateErr("Name is required"); return; }
+    // Explicit NaN-guard — `!(NaN > 0)` happens to be truthy so the
+    // downstream `> 0` check fires the right rejection, but relying on
+    // that accident is fragile. Reject non-finite up-front with a
+    // message that tells the user what they typed was unparseable.
+    if (!Number.isFinite(cash)) { setCreateErr("Initial cash must be a number"); return; }
     if (!(cash > 0)) { setCreateErr("Initial cash must be > 0"); return; }
     setBusy(true);
     const result = await onCreate({ name, initial_cash: cash });
