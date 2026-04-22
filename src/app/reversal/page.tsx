@@ -415,7 +415,11 @@ function PriceChartPopover({ entry, onClose, anchor }: {
   useEffect(() => {
     if (bars) return;
     setLoading(true);
-    fetch(`/api/prices?symbol=${encodeURIComponent(entry.symbol)}&limit=30`)
+    // 90 bars ≈ 4 months of trading days — covers most cohorts in the matrix.
+    // If enrollment is older than that, we surface a clear "outside window"
+    // warning in the footer so the user doesn't mistake a fragmented chart
+    // for a verified streak.
+    fetch(`/api/prices?symbol=${encodeURIComponent(entry.symbol)}&limit=90`)
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
       .then(j => {
         const items = Array.isArray(j.items) ? j.items : [];
@@ -533,9 +537,9 @@ function PriceChartPopover({ entry, onClose, anchor }: {
       onClick={onClose}
     >
       <div
-        style={{ position: 'fixed', top: anchor.top, left: anchor.left, zIndex: 71 }}
+        style={{ position: 'fixed', top: anchor.top, left: anchor.left, zIndex: 71, maxWidth: 'calc(100vw - 16px)', maxHeight: 'calc(100vh - 16px)' }}
         onClick={(e) => e.stopPropagation()}
-        className="bg-white ring-1 ring-zinc-200 rounded-lg shadow-2xl p-3"
+        className="bg-white ring-1 ring-zinc-200 rounded-lg shadow-2xl p-3 overflow-auto"
       >
         <div className="flex items-center justify-between mb-1">
           <div>
@@ -554,7 +558,15 @@ function PriceChartPopover({ entry, onClose, anchor }: {
           </div>
           <button onClick={onClose} className="text-zinc-400 hover:text-zinc-700 text-lg leading-none">×</button>
         </div>
-        {loading && <div className="text-xs text-zinc-500 py-6 px-3">Loading last 30 days…</div>}
+        {loading && <div className="text-xs text-zinc-500 py-6 px-3">Loading last 90 days…</div>}
+        {bars && bars.length > 0 && enrollIdx < 0 && (
+          <div className="text-[10px] mb-2 px-2 py-1.5 rounded bg-amber-50 text-amber-800 ring-1 ring-amber-200 font-mono leading-relaxed">
+            ⚠ Enrollment day <span className="font-bold">{cohortDate}</span> is OUTSIDE the loaded window
+            (bars {bars[0].date} → {bars[bars.length - 1].date}). Streak band and enrollment marker
+            cannot be drawn, so this chart does <span className="font-bold">not</span> visually verify
+            the pre-enrollment streak. Trust <span className="font-mono text-amber-900">consecutive_days = {entry.consecutive_days ?? 0}</span> from the feed, not this render.
+          </div>
+        )}
         {error && <div className="text-xs text-rose-600 py-4 px-3">Failed to load prices: {error}</div>}
         {!loading && !error && !bars?.length && (
           <div className="text-xs text-zinc-600 py-4 px-3 max-w-[400px] leading-relaxed">
@@ -1278,9 +1290,14 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
                           type="button"
                           onClick={(ev) => {
                             const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
-                            // position popover near the symbol, but clamp inside viewport
-                            const top = Math.min(window.innerHeight - 260, rect.bottom + 4);
-                            const left = Math.min(window.innerWidth - 440, rect.left);
+                            // Clamp inside viewport with a non-negative floor so narrow
+                            // viewports (mobile ≤440px wide, short screens ≤260px tall)
+                            // don't push the popover off-screen. Popover content is
+                            // horizontally scrollable; vertical overflow is handled by
+                            // the popover's own max-height.
+                            const PAD = 8;
+                            const top = Math.max(PAD, Math.min(window.innerHeight - 260, rect.bottom + 4));
+                            const left = Math.max(PAD, Math.min(window.innerWidth - 440, rect.left));
                             setChartFor({ entry, anchor: { top, left } });
                           }}
                           className="font-semibold text-zinc-900 hover:text-indigo-700 hover:underline decoration-dotted underline-offset-2"
@@ -1327,6 +1344,12 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
           entries={visibleEntries}
           scenarioResults={scenarioResults?.byId ?? null}
           onClose={() => setReportOpen(false)}
+          onOpenChart={(entry, anchor) => {
+            // Close report so the chart popover is the top-level overlay,
+            // otherwise the chart would render behind the modal's z-50.
+            setReportOpen(false);
+            setChartFor({ entry, anchor });
+          }}
         />
       )}
       {chartFor && (
@@ -1707,6 +1730,7 @@ function ScenarioReportModal({
   entries,
   scenarioResults,
   onClose,
+  onOpenChart,
 }: {
   report: ScenarioReport;
   comparison: { scenarioId: ScenarioId; label: string; eligibleCount: number; totalCohort: number; totalPnlUsd: number }[];
@@ -1715,6 +1739,7 @@ function ScenarioReportModal({
   entries: ReversalEntry[];
   scenarioResults: Map<number, PerTickerResult> | null;
   onClose: () => void;
+  onOpenChart?: (entry: ReversalEntry, anchor: { top: number; left: number }) => void;
 }) {
   // Build CSV client-side
   const exportCsv = () => {
@@ -1925,11 +1950,45 @@ function ScenarioReportModal({
               <div className="grid grid-cols-2 gap-y-1 pt-1">
                 <span className="text-zinc-500">Best</span>
                 <span className="font-mono text-right">
-                  {report.best ? `${report.best.symbol} ${fmt$(report.best.pnlUsd)} (${fmtPct(report.best.pnlPct)}, ${report.best.daysHeld}d)` : '—'}
+                  {report.best ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          const e = entries.find(x => x.symbol === report.best!.symbol);
+                          if (!e || !onOpenChart) return;
+                          const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+                          onOpenChart(e, { top: rect.bottom + 4, left: Math.max(8, rect.left - 200) });
+                        }}
+                        className="font-semibold text-zinc-900 hover:text-indigo-700 hover:underline decoration-dotted underline-offset-2"
+                        title="Open price chart for this symbol"
+                      >
+                        {report.best.symbol}
+                      </button>
+                      {` ${fmt$(report.best.pnlUsd)} (${fmtPct(report.best.pnlPct)}, ${report.best.daysHeld}d)`}
+                    </>
+                  ) : '—'}
                 </span>
                 <span className="text-zinc-500">Worst</span>
                 <span className="font-mono text-right">
-                  {report.worst ? `${report.worst.symbol} ${fmt$(report.worst.pnlUsd)} (${fmtPct(report.worst.pnlPct)}, ${report.worst.daysHeld}d)` : '—'}
+                  {report.worst ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          const e = entries.find(x => x.symbol === report.worst!.symbol);
+                          if (!e || !onOpenChart) return;
+                          const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+                          onOpenChart(e, { top: rect.bottom + 4, left: Math.max(8, rect.left - 200) });
+                        }}
+                        className="font-semibold text-zinc-900 hover:text-indigo-700 hover:underline decoration-dotted underline-offset-2"
+                        title="Open price chart for this symbol"
+                      >
+                        {report.worst.symbol}
+                      </button>
+                      {` ${fmt$(report.worst.pnlUsd)} (${fmtPct(report.worst.pnlPct)}, ${report.worst.daysHeld}d)`}
+                    </>
+                  ) : '—'}
                 </span>
               </div>
             </div>
