@@ -556,7 +556,17 @@ function PriceChartPopover({ entry, onClose, anchor }: {
         </div>
         {loading && <div className="text-xs text-zinc-500 py-6 px-3">Loading last 30 days…</div>}
         {error && <div className="text-xs text-rose-600 py-4 px-3">Failed to load prices: {error}</div>}
-        {!loading && !error && !bars?.length && <div className="text-xs text-zinc-500 py-4 px-3">No historical bars available.</div>}
+        {!loading && !error && !bars?.length && (
+          <div className="text-xs text-zinc-600 py-4 px-3 max-w-[400px] leading-relaxed">
+            <div className="font-semibold text-zinc-800 mb-1">No historical bars in <span className="font-mono">prices_daily</span> for {entry.symbol}.</div>
+            <p className="text-zinc-500">
+              The surveillance pipeline tagged this ticker with{' '}
+              <span className="font-mono text-zinc-700">consecutive_days = {entry.consecutive_days ?? 0}</span>
+              {streakLen >= 2 ? <> ({streakLen}-day {up ? 'UP' : 'DOWN'} streak through enrollment)</> : ''},
+              but the daily-price table was only seeded for a handful of symbols (SPY, MU, …). The streak length is computed server-side from the feed, so you can trust the number — but to <em>visually</em> verify the pre-enrollment bars, a backfill of <span className="font-mono">prices_daily</span> for all enrolled tickers is needed. Open an issue / ask me to wire up a backfill script.
+            </p>
+          </div>
+        )}
         {chart}
         {bars && bars.length > 0 && (() => {
           // Compute streak-aggregate stats for the hover hint row: range, total
