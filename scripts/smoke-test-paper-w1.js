@@ -153,19 +153,18 @@ async function getTrades(accountId) {
 }
 
 async function test1_concurrentMarketBuys(accountId) {
-  console.log("\nTest 1: 20 concurrent MARKET BUYs of $10k on $100k cash — expect exactly 10 fill, 10 reject");
-  // 20 orders of $10k each against $100k cash — only 10 should succeed.
+  console.log("\nTest 1: 20 concurrent MARKET BUYs of $10k on $100k cash — W4: 9 fill after slippage+commission overhead");
+  // W4 — each MARKET BUY now costs investment + slippage + commission.
+  // At $100 fill price, $10k investment → 100 shares, slippage = 100 × $0.05 = $5,
+  // commission = max($1, 100 × $0.005 = $0.50) = $1. So each order burns $10,006.
+  // $100k / $10,006 = 9 fills max (with $9,946 left over — not enough for #10).
   const orderIds = [];
   for (let i = 0; i < 20; i++) {
     const id = await insertOrder(accountId, "AAPL", "BUY", "MARKET", 10000);
     orderIds.push(id);
   }
-  const fillPrice = 100; // fake but finite & positive
+  const fillPrice = 100;
 
-  // S1 — Barrier pattern. Without it, the pre-first-await block of each
-  // async arrow serializes when the map() body has no `await` on entry.
-  // With an explicit gate, all N workers reach their first DB call at the
-  // same moment, which is what we're actually trying to stress-test.
   let release;
   const gate = new Promise(r => { release = r; });
   const workers = orderIds.map(id => (async () => {
@@ -177,15 +176,16 @@ async function test1_concurrentMarketBuys(accountId) {
 
   const filled = results.filter(r => r.filled).length;
   const rejected = results.filter(r => !r.filled).length;
-  assert(filled === 10, `exactly 10 orders filled (got ${filled})`);
-  assert(rejected === 10, `exactly 10 orders rejected (got ${rejected})`);
+  assert(filled === 9, `exactly 9 orders filled after slippage+commission overhead (got ${filled})`);
+  assert(rejected === 11, `exactly 11 orders rejected (got ${rejected})`);
   const acct = await getAccount(accountId);
-  assert(acct.cash === 0, `cash === 0 after all fills (got ${acct.cash})`);
+  // 9 × (10000 + 5 + 1) = 90054 debited; cash = 100000 - 90054 = 9946.
+  const expectedCash = 100000 - 9 * (10000 + 5 + 1);
+  assert(Math.abs(acct.cash - expectedCash) < PRECISION_EPS, `cash === ${expectedCash} after 9 fills (got ${acct.cash})`);
   assert(acct.reserved_cash === 0, `reserved_cash === 0 (got ${acct.reserved_cash})`);
   assert(acct.cash >= 0, `cash never negative`);
   const trades = await getTrades(accountId);
-  assert(trades.length === 10, `exactly 10 trades created (got ${trades.length})`);
-  // All trades OPEN.
+  assert(trades.length === 9, `exactly 9 trades created (got ${trades.length})`);
   assert(trades.every(t => t.status === "OPEN"), `all trades OPEN`);
 }
 
@@ -284,51 +284,77 @@ async function test5_invariant(accountId) {
   // (initial_cash + SUM(pnl) for closed trades + SUM(investment) for open
   // positions already parked in positions_value), and compare.
   const [acctRows] = await pool.execute(
-    "SELECT cash, reserved_cash, initial_cash FROM paper_accounts WHERE id = ?",
+    "SELECT cash, reserved_cash, reserved_short_margin, initial_cash FROM paper_accounts WHERE id = ?",
     [accountId]
   );
   const acct = {
     cash: Number(acctRows[0].cash),
     reserved_cash: Number(acctRows[0].reserved_cash),
+    reserved_short_margin: Number(acctRows[0].reserved_short_margin ?? 0),
     initial_cash: Number(acctRows[0].initial_cash),
   };
 
-  const [openTrades] = await pool.execute(
-    "SELECT quantity, buy_price, investment_usd FROM paper_trades WHERE account_id = ? AND status = 'OPEN'",
+  // Round-3 side-aware split. LONG OPEN positions contribute
+  //   investment_usd + slippage_usd + commission_usd
+  // to the LHS (all are genuine cash outflows on the open leg). SHORT OPEN
+  // positions contribute ONLY commission_usd — their investment lives in
+  // reserved_short_margin (tracked separately on the account, = adj*qty),
+  // and their slippage is BAKED INTO that smaller margin (margin = nominal
+  // - slip), so it must not be double-counted. Closed trades contribute
+  // commission_usd only; closed slippage is already inside realized pnl.
+  const [openLong] = await pool.execute(
+    `SELECT COALESCE(SUM(investment_usd),0) AS inv,
+            COALESCE(SUM(slippage_usd),0)   AS slip,
+            COALESCE(SUM(commission_usd),0) AS comm
+       FROM paper_trades WHERE account_id = ? AND status='OPEN' AND side='LONG'`,
     [accountId]
   );
-  // At buy price the investment and (quantity * buy_price) match exactly
-  // (minus DECIMAL rounding). Use investment_usd as the authoritative
-  // value captured at fill time — avoids FP drift on quantity * buy_price.
-  const openInvestment = openTrades.reduce((s, t) => s + Number(t.investment_usd), 0);
-  const markedValue = openTrades.reduce((s, t) => s + Number(t.quantity) * Number(t.buy_price), 0);
+  const [openShort] = await pool.execute(
+    `SELECT COALESCE(SUM(commission_usd),0) AS comm
+       FROM paper_trades WHERE account_id = ? AND status='OPEN' AND side='SHORT'`,
+    [accountId]
+  );
+  const openLongInv  = Number(openLong[0].inv);
+  const openLongSlip = Number(openLong[0].slip);
+  const openLongComm = Number(openLong[0].comm);
+  const openShortComm = Number(openShort[0].comm);
 
   const [closedRows] = await pool.execute(
-    "SELECT COALESCE(SUM(pnl_usd),0) AS sum_pnl FROM paper_trades WHERE account_id = ? AND status='CLOSED'",
+    "SELECT COALESCE(SUM(pnl_usd),0) AS sum_pnl, COALESCE(SUM(commission_usd),0) AS sum_comm FROM paper_trades WHERE account_id = ? AND status='CLOSED'",
     [accountId]
   );
   const realized = Number(closedRows[0].sum_pnl);
+  const closedCommission = Number(closedRows[0].sum_comm);
 
-  // Independent expected: every dollar of initial_cash is either
-  //   (a) still sitting in cash,
-  //   (b) held in reserved_cash pending a PENDING LIMIT/STOP BUY,
-  //   (c) invested in an OPEN position (investment_usd), or
-  //   (d) realized as +pnl on a CLOSED position and credited back to cash.
+  // W4 conservation ledger (side-aware, round-3):
+  //   cash + reserved_cash + reserved_short_margin
+  //     + sum_open_LONG(investment_usd + slippage_usd + commission_usd)
+  //     + sum_open_SHORT(commission_usd)
+  //     + sum_closed(commission_usd)
+  //   ==
+  //   initial_cash + sum_closed(pnl_usd)
   //
-  // So: cash + reserved_cash + openInvestment == initial_cash + realized.
-  const lhs = acct.cash + acct.reserved_cash + openInvestment;
+  // pnl_usd is GROSS of slippage+commission; commission is an external cash
+  // debit on every leg; LONG open-leg slippage is a separate cash debit
+  // (added above); SHORT open-leg slippage is baked into reserved_short_margin
+  // (margin = adj*qty, already under-counted by slip — so the slip column is
+  // informational only and must not be added); closed-leg slippage flows
+  // through pnl via adjustedPrice fills.
+  const lhs = acct.cash + acct.reserved_cash + acct.reserved_short_margin
+    + openLongInv + openLongSlip + openLongComm
+    + openShortComm
+    + closedCommission;
   const rhs = acct.initial_cash + realized;
 
-  console.log(`    cash=${acct.cash.toFixed(6)}  reserved=${acct.reserved_cash.toFixed(6)}  open_investment=${openInvestment.toFixed(6)}  marked_value=${markedValue.toFixed(6)}`);
-  console.log(`    initial=${acct.initial_cash.toFixed(6)}  realized_pnl=${realized.toFixed(6)}`);
-  console.log(`    lhs (cash+reserved+open_invest)=${lhs.toFixed(6)}  rhs (initial+realized)=${rhs.toFixed(6)}  drift=${(lhs - rhs).toFixed(9)}`);
+  console.log(`    cash=${acct.cash.toFixed(6)}  reserved=${acct.reserved_cash.toFixed(6)}  short_margin=${acct.reserved_short_margin.toFixed(6)}`);
+  console.log(`    open_long(inv=${openLongInv.toFixed(6)} slip=${openLongSlip.toFixed(6)} comm=${openLongComm.toFixed(6)})  open_short(comm=${openShortComm.toFixed(6)})`);
+  console.log(`    closed_comm=${closedCommission.toFixed(6)}  realized=${realized.toFixed(6)}`);
+  console.log(`    lhs=${lhs.toFixed(6)}  rhs=${rhs.toFixed(6)}  drift=${(lhs - rhs).toFixed(9)}`);
 
-  // S3 — DECIMAL(18,6) precision. Tolerance 1e-6.
-  assert(Math.abs(lhs - rhs) < PRECISION_EPS, `conservation: cash+reserved+open_invest == initial+realized (drift < ${PRECISION_EPS})`);
+  assert(Math.abs(lhs - rhs) < PRECISION_EPS, `conservation (side-aware): cash+reserved+short_margin+open_long(inv+slip+comm)+open_short(comm)+closed_comm == initial+realized (drift < ${PRECISION_EPS})`);
   assert(acct.cash >= 0, `cash non-negative (got ${acct.cash})`);
   assert(acct.reserved_cash >= 0, `reserved_cash non-negative (got ${acct.reserved_cash})`);
-  // Sanity: positions marked at entry price = investment_usd.
-  assert(Math.abs(markedValue - openInvestment) < PRECISION_EPS, `positions marked@entry == investment_usd (drift < ${PRECISION_EPS})`);
+  assert(acct.reserved_short_margin >= 0, `reserved_short_margin non-negative (got ${acct.reserved_short_margin})`);
 }
 
 (async () => {

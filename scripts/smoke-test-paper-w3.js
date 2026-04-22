@@ -34,9 +34,23 @@ try {
 
 let paperFill;
 let paperExits;
+let paperRisk;
 async function loadModules() {
   paperFill = require("../src/lib/paper-fill");
   paperExits = require("../src/lib/paper-exits");
+  paperRisk = require("../src/lib/paper-risk");
+  // W4 introduced slippage + commission defaults in app_settings. W3 tests
+  // pre-date that economic model and assert exact cash / pnl numbers
+  // computed against zero-cost fills. Pin the risk config to zero so W3
+  // semantics (shorts, exits, partials, modify) test their own behavior
+  // rather than inadvertently re-testing W4 math. W4 has its own smoke.
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 0,
+    commissionPerShare: 0,
+    commissionMinPerLeg: 0,
+    allowFractionalShares: true,
+    defaultBorrowRatePct: 0,
+  });
 }
 
 const TEST_ACCOUNT_NAME = "W3_SMOKE_TEST_DO_NOT_USE";

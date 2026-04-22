@@ -357,8 +357,10 @@ export async function applyExitDecisionToTrade(
     }
     const entryPrice = Number(trade.buy_price);
     const investment = Number(trade.investment_usd);
-    // P&L on the remaining portion only. Investment share = remaining/totalQty.
-    const investmentShare = totalQty > 0 ? investment * (remaining / totalQty) : 0;
+    // (investmentShare removed round-3: SHORT cover now uses `buy_price *
+    //  remaining` for margin release, not `investment * remaining/totalQty`.
+    //  Under Option A, investment_usd stores NOMINAL for both sides; margin
+    //  holds adj*qty = buy_price*qty. Releasing nominal would over-release.)
     const proceeds = remaining * currentPrice;
     const pnlUsd = side === "SHORT"
       ? (entryPrice - currentPrice) * remaining
@@ -417,17 +419,29 @@ export async function applyExitDecisionToTrade(
         return { closed: false, pnlUsd: 0, remainingQty: 0 };
       }
     } else {
-      // SHORT cover — matches paper-fill's SHORT_COVER branch. Accounting:
-      //   OPEN:  cash -= investment, margin += investment (collateral + proceeds held)
-      //   COVER: cash += investmentShare_released + pnlSlice
-      //        = investmentShare + (entry-fill)*qty
-      //        = 2 * investmentShare - closeValue
-      //   margin -= investmentShare
-      // See paper-fill.ts for the full derivation.
-      const cashCredit = 2 * investmentShare - proceeds;
+      // SHORT cover — matches paper-fill's SHORT_COVER branch.
+      //
+      // Codex round-3: margin bucket holds `adj_open * qty = buy_price * qty`
+      // (NOT nominal investment_usd). Round-2 fixed the open-side to seat
+      // margin at adj*qty; this path must release THAT amount, not the
+      // nominal `investmentShare`.
+      //
+      // Accounting on cover:
+      //   marginRelease = buy_price * remaining_qty
+      //                 = adj_open * remaining_qty (the actual dollars held)
+      //   cashCredit    = 2 * marginRelease - proceeds
+      //                 = marginRelease + pnlSlice
+      //   margin -= marginRelease
+      //
+      // Auto-exits don't apply slippage (the trigger price IS the fill) and
+      // don't charge commission here (paper-exits is the legacy direct-close
+      // path; W4 slippage/commission flow through paper-fill.ts fillOrder).
+      // See paper-fill.ts:763 for the equivalent explicit-fill path.
+      const marginRelease = entryPrice * remaining;
+      const cashCredit = 2 * marginRelease - proceeds;
       const [release] = await conn.execute(
         "UPDATE paper_accounts SET reserved_short_margin = reserved_short_margin - ?, cash = cash + ? WHERE id = ? AND reserved_short_margin >= ?",
-        [investmentShare, cashCredit, accountId, investmentShare]
+        [marginRelease, cashCredit, accountId, marginRelease]
       ) as [mysqlTypes.ResultSetHeader, unknown];
       if (release.affectedRows !== 1) {
         await conn.rollback();
