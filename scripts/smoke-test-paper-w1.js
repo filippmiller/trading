@@ -284,22 +284,40 @@ async function test5_invariant(accountId) {
   // (initial_cash + SUM(pnl) for closed trades + SUM(investment) for open
   // positions already parked in positions_value), and compare.
   const [acctRows] = await pool.execute(
-    "SELECT cash, reserved_cash, initial_cash FROM paper_accounts WHERE id = ?",
+    "SELECT cash, reserved_cash, reserved_short_margin, initial_cash FROM paper_accounts WHERE id = ?",
     [accountId]
   );
   const acct = {
     cash: Number(acctRows[0].cash),
     reserved_cash: Number(acctRows[0].reserved_cash),
+    reserved_short_margin: Number(acctRows[0].reserved_short_margin ?? 0),
     initial_cash: Number(acctRows[0].initial_cash),
   };
 
-  const [openTrades] = await pool.execute(
-    "SELECT quantity, buy_price, investment_usd, slippage_usd, commission_usd FROM paper_trades WHERE account_id = ? AND status = 'OPEN'",
+  // Round-3 side-aware split. LONG OPEN positions contribute
+  //   investment_usd + slippage_usd + commission_usd
+  // to the LHS (all are genuine cash outflows on the open leg). SHORT OPEN
+  // positions contribute ONLY commission_usd — their investment lives in
+  // reserved_short_margin (tracked separately on the account, = adj*qty),
+  // and their slippage is BAKED INTO that smaller margin (margin = nominal
+  // - slip), so it must not be double-counted. Closed trades contribute
+  // commission_usd only; closed slippage is already inside realized pnl.
+  const [openLong] = await pool.execute(
+    `SELECT COALESCE(SUM(investment_usd),0) AS inv,
+            COALESCE(SUM(slippage_usd),0)   AS slip,
+            COALESCE(SUM(commission_usd),0) AS comm
+       FROM paper_trades WHERE account_id = ? AND status='OPEN' AND side='LONG'`,
     [accountId]
   );
-  const openInvestment = openTrades.reduce((s, t) => s + Number(t.investment_usd), 0);
-  const openSlippage = openTrades.reduce((s, t) => s + Number(t.slippage_usd ?? 0), 0);
-  const openCommission = openTrades.reduce((s, t) => s + Number(t.commission_usd ?? 0), 0);
+  const [openShort] = await pool.execute(
+    `SELECT COALESCE(SUM(commission_usd),0) AS comm
+       FROM paper_trades WHERE account_id = ? AND status='OPEN' AND side='SHORT'`,
+    [accountId]
+  );
+  const openLongInv  = Number(openLong[0].inv);
+  const openLongSlip = Number(openLong[0].slip);
+  const openLongComm = Number(openLong[0].comm);
+  const openShortComm = Number(openShort[0].comm);
 
   const [closedRows] = await pool.execute(
     "SELECT COALESCE(SUM(pnl_usd),0) AS sum_pnl, COALESCE(SUM(commission_usd),0) AS sum_comm FROM paper_trades WHERE account_id = ? AND status='CLOSED'",
@@ -308,31 +326,35 @@ async function test5_invariant(accountId) {
   const realized = Number(closedRows[0].sum_pnl);
   const closedCommission = Number(closedRows[0].sum_comm);
 
-  // W4 conservation ledger (pnl_usd is GROSS of slippage+commission;
-  // commission is an external cash debit on every leg; slippage is baked
-  // into buy_price / fill_price via adjustedPrice so it flows through
-  // realized P&L automatically for closed legs, but is a cash debit on
-  // OPEN legs where no P&L row yet exists):
-  //
-  //   cash + reserved
-  //     + sum_open(investment_usd + slippage_usd + commission_usd)
+  // W4 conservation ledger (side-aware, round-3):
+  //   cash + reserved_cash + reserved_short_margin
+  //     + sum_open_LONG(investment_usd + slippage_usd + commission_usd)
+  //     + sum_open_SHORT(commission_usd)
   //     + sum_closed(commission_usd)
   //   ==
   //   initial_cash + sum_closed(pnl_usd)
   //
-  // Rearranged to LHS = RHS for the assert below.
-  const lhs = acct.cash + acct.reserved_cash
-    + openInvestment + openSlippage + openCommission
+  // pnl_usd is GROSS of slippage+commission; commission is an external cash
+  // debit on every leg; LONG open-leg slippage is a separate cash debit
+  // (added above); SHORT open-leg slippage is baked into reserved_short_margin
+  // (margin = adj*qty, already under-counted by slip — so the slip column is
+  // informational only and must not be added); closed-leg slippage flows
+  // through pnl via adjustedPrice fills.
+  const lhs = acct.cash + acct.reserved_cash + acct.reserved_short_margin
+    + openLongInv + openLongSlip + openLongComm
+    + openShortComm
     + closedCommission;
   const rhs = acct.initial_cash + realized;
 
-  console.log(`    cash=${acct.cash.toFixed(6)}  reserved=${acct.reserved_cash.toFixed(6)}  open_invest=${openInvestment.toFixed(6)}`);
-  console.log(`    open_slip=${openSlippage.toFixed(6)}  open_comm=${openCommission.toFixed(6)}  closed_comm=${closedCommission.toFixed(6)}  realized=${realized.toFixed(6)}`);
+  console.log(`    cash=${acct.cash.toFixed(6)}  reserved=${acct.reserved_cash.toFixed(6)}  short_margin=${acct.reserved_short_margin.toFixed(6)}`);
+  console.log(`    open_long(inv=${openLongInv.toFixed(6)} slip=${openLongSlip.toFixed(6)} comm=${openLongComm.toFixed(6)})  open_short(comm=${openShortComm.toFixed(6)})`);
+  console.log(`    closed_comm=${closedCommission.toFixed(6)}  realized=${realized.toFixed(6)}`);
   console.log(`    lhs=${lhs.toFixed(6)}  rhs=${rhs.toFixed(6)}  drift=${(lhs - rhs).toFixed(9)}`);
 
-  assert(Math.abs(lhs - rhs) < PRECISION_EPS, `conservation: cash+reserved+open_invest+open_slip+open_comm+closed_comm == initial+realized (drift < ${PRECISION_EPS})`);
+  assert(Math.abs(lhs - rhs) < PRECISION_EPS, `conservation (side-aware): cash+reserved+short_margin+open_long(inv+slip+comm)+open_short(comm)+closed_comm == initial+realized (drift < ${PRECISION_EPS})`);
   assert(acct.cash >= 0, `cash non-negative (got ${acct.cash})`);
   assert(acct.reserved_cash >= 0, `reserved_cash non-negative (got ${acct.reserved_cash})`);
+  assert(acct.reserved_short_margin >= 0, `reserved_short_margin non-negative (got ${acct.reserved_short_margin})`);
 }
 
 (async () => {

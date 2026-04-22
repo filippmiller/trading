@@ -274,20 +274,29 @@ async function test3_strategyPersistence(accountId) {
 async function test4_reconciliationInvariant(accountId) {
   console.log("\nTest 4: reconciliation invariant holds across paper_trades + paper_signals");
   const [acctRows] = await pool.execute(
-    "SELECT cash, reserved_cash, initial_cash FROM paper_accounts WHERE id = ?",
+    "SELECT cash, reserved_cash, reserved_short_margin, initial_cash FROM paper_accounts WHERE id = ?",
     [accountId]
   );
   const acct = {
     cash: Number(acctRows[0].cash),
     reserved_cash: Number(acctRows[0].reserved_cash),
+    reserved_short_margin: Number(acctRows[0].reserved_short_margin ?? 0),
     initial_cash: Number(acctRows[0].initial_cash),
   };
 
-  const [openT] = await pool.execute(
-    `SELECT COALESCE(SUM(investment_usd),0) AS v,
-            COALESCE(SUM(slippage_usd),0) AS slip,
+  // Side-aware split (round-3): LONG OPEN contributes inv+slip+comm;
+  // SHORT OPEN contributes comm only (inv lives in reserved_short_margin,
+  // slip is baked into margin). See W1 test5 for full derivation.
+  const [openLongT] = await pool.execute(
+    `SELECT COALESCE(SUM(investment_usd),0) AS inv,
+            COALESCE(SUM(slippage_usd),0)   AS slip,
             COALESCE(SUM(commission_usd),0) AS comm
-       FROM paper_trades WHERE account_id = ? AND status = 'OPEN'`,
+       FROM paper_trades WHERE account_id = ? AND status='OPEN' AND side='LONG'`,
+    [accountId]
+  );
+  const [openShortT] = await pool.execute(
+    `SELECT COALESCE(SUM(commission_usd),0) AS comm
+       FROM paper_trades WHERE account_id = ? AND status='OPEN' AND side='SHORT'`,
     [accountId]
   );
   const [closedT] = await pool.execute(
@@ -296,6 +305,7 @@ async function test4_reconciliationInvariant(accountId) {
        FROM paper_trades WHERE account_id = ? AND status = 'CLOSED'`,
     [accountId]
   );
+  // paper_signals are legacy zero-cost and LONG-only (they pre-date SHORTs).
   const [openS] = await pool.execute(
     `SELECT COALESCE(SUM(sig.investment_usd),0) AS v
        FROM paper_signals sig JOIN paper_strategies s ON s.id = sig.strategy_id
@@ -308,23 +318,30 @@ async function test4_reconciliationInvariant(accountId) {
       WHERE s.account_id = ? AND sig.status = 'CLOSED'`,
     [accountId]
   );
-  const openInvestment = Number(openT[0].v) + Number(openS[0].v);
-  const openSlip = Number(openT[0].slip);
-  const openComm = Number(openT[0].comm);
-  const closedComm = Number(closedT[0].comm);
-  const realized = Number(closedT[0].v) + Number(closedS[0].v);
+  const openLongInv  = Number(openLongT[0].inv);
+  const openLongSlip = Number(openLongT[0].slip);
+  const openLongComm = Number(openLongT[0].comm);
+  const openShortComm = Number(openShortT[0].comm);
+  const openSigInv   = Number(openS[0].v); // signals treated as LONG
+  const closedComm   = Number(closedT[0].comm);
+  const realized     = Number(closedT[0].v) + Number(closedS[0].v);
 
-  // W4 conservation ledger (matches W1 test5): cash + reserved + open_invest
-  // + open_slip + open_comm + closed_comm == initial + realized. paper_signals
-  // do not have slippage/commission columns — they follow the legacy
-  // zero-cost model, so only paper_trades contribute economic costs to LHS.
-  const lhs = acct.cash + acct.reserved_cash + openInvestment + openSlip + openComm + closedComm;
+  // W4 conservation ledger (side-aware):
+  //   cash + reserved + short_margin
+  //     + long_open(inv + slip + comm) + short_open(comm)
+  //     + sig_open_inv + closed_comm
+  //   == initial + realized
+  const lhs = acct.cash + acct.reserved_cash + acct.reserved_short_margin
+    + openLongInv + openLongSlip + openLongComm
+    + openShortComm
+    + openSigInv
+    + closedComm;
   const rhs = acct.initial_cash + realized;
-  console.log(`    cash=${acct.cash.toFixed(6)} reserved=${acct.reserved_cash.toFixed(6)} open_invest=${openInvestment.toFixed(6)}`);
-  console.log(`    open_slip=${openSlip.toFixed(6)} open_comm=${openComm.toFixed(6)} closed_comm=${closedComm.toFixed(6)}`);
-  console.log(`    initial=${acct.initial_cash.toFixed(6)} realized=${realized.toFixed(6)}`);
+  console.log(`    cash=${acct.cash.toFixed(6)} reserved=${acct.reserved_cash.toFixed(6)} short_margin=${acct.reserved_short_margin.toFixed(6)}`);
+  console.log(`    long_open(inv=${openLongInv.toFixed(6)} slip=${openLongSlip.toFixed(6)} comm=${openLongComm.toFixed(6)}) short_open(comm=${openShortComm.toFixed(6)})`);
+  console.log(`    sig_open=${openSigInv.toFixed(6)} closed_comm=${closedComm.toFixed(6)} realized=${realized.toFixed(6)}`);
   console.log(`    lhs=${lhs.toFixed(6)} rhs=${rhs.toFixed(6)} drift=${(lhs - rhs).toFixed(9)}`);
-  assert(Math.abs(lhs - rhs) < PRECISION_EPS, `invariant cash+reserved+open_invest+open_slip+open_comm+closed_comm == initial+realized (drift < ${PRECISION_EPS})`);
+  assert(Math.abs(lhs - rhs) < PRECISION_EPS, `side-aware invariant holds (drift < ${PRECISION_EPS})`);
 }
 
 // ── Test 5: STOP BUY fill ─────────────────────────────────────────────────

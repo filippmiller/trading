@@ -458,11 +458,11 @@ async function fillOrderCore(
     // W4 — slippage/commission for short-open.
     //
     // Codex round-2 bug #2 fix — margin is the ADJUSTED proceeds, not nominal.
-    //   investmentAdjusted = adjustedPrice * quantity  (what we would have
-    //     actually received from selling borrowed shares at the adverse
-    //     price). Under the old model, margin = nominal investment, which
-    //     stored 0.5 bps of "phantom" money that leaked back to cash on
-    //     cover — making a same-price round trip LOOK free after slippage.
+    //   marginHeld = adjustedPrice * quantity  (what we would have actually
+    //     received from selling borrowed shares at the adverse price). Under
+    //     the pre-round-2 model, margin = nominal investment, which stored
+    //     0.5 bps of "phantom" money that leaked back to cash on cover —
+    //     making a same-price round trip LOOK free after slippage.
     //
     //   With margin = adj*qty, the slippage is captured once on
     //   `slippage_usd` and is never paid out of cash separately on open
@@ -470,11 +470,18 @@ async function fillOrderCore(
     //
     //   A same-price LIMIT cover then yields exactly `pnl = -2*commission`
     //   — no phantom slippage recoup. See smoke test 10.
+    //
+    // Codex round-3 bug — the trade row's `investment_usd` stays at NOMINAL
+    //   for both sides (see the insertOpenTrade call near the end of this
+    //   block). Only the account-level `reserved_short_margin` bucket holds
+    //   adj*qty. This avoids the round-2 double-count where `investment_usd`
+    //   and `reserved_short_margin` both stored adj*qty for shorts (same
+    //   bucket of money recorded twice).
     const slippageUsd = slippageCostUsd(fillPrice, adjustedPrice, quantity);
     const commissionUsd = applyCommission(quantity, investment, riskCfg);
-    const investmentAdjusted = adjustedPrice * quantity;
+    const marginHeld = adjustedPrice * quantity;
     // Slippage is NOT added to cash debit — it's baked into the smaller
-    // `investmentAdjusted` margin. Only commission is a separate cash cost.
+    // `marginHeld` amount. Only commission is a separate cash cost.
     const extraCashNeeded = commissionUsd;
 
     // PF2 — reject new SHORT if an OPEN SHORT already exists for this
@@ -497,7 +504,7 @@ async function fillOrderCore(
     // to the ADJUSTED margin (adj*qty) at fill time. If not pre-reserved
     // (MARKET short), debit cash into reserved_short_margin now.
     //
-    // Codex round-2 bug #2 — reconciliation target is now `investmentAdjusted`
+    // Codex round-2 bug #2 — reconciliation target is now `marginHeld`
     // (not `investment`). LIMIT shorts with zero slippage still reconcile to
     // the same nominal they reserved; MARKET shorts release 0.5 bps back to
     // cash as the "over-reserved" surplus (the reservation held at nominal
@@ -505,8 +512,8 @@ async function fillOrderCore(
     const reservedShort = Number(order.reserved_short_margin ?? 0);
     if (reservedShort > 0) {
       // Already held — adjust delta between reserved (nominal) and
-      // investmentAdjusted, then pay commission out of cash.
-      const delta = reservedShort - investmentAdjusted;
+      // marginHeld (adj*qty), then pay commission out of cash.
+      const delta = reservedShort - marginHeld;
       if (delta !== 0) {
         if (delta > 0) {
           // Over-reserved — release the surplus back to cash.
@@ -543,11 +550,11 @@ async function fillOrderCore(
       // No pre-reservation — this is a MARKET short. Atomically debit cash
       // into reserved_short_margin AT THE ADJUSTED VALUE and pay commission
       // from cash in the same statement. Slippage is NOT a separate cash
-      // debit; it's baked into the smaller `investmentAdjusted` margin.
-      const totalDebit = investmentAdjusted + extraCashNeeded;
+      // debit; it's baked into the smaller `marginHeld` amount.
+      const totalDebit = marginHeld + extraCashNeeded;
       const [move] = await conn.execute(
         "UPDATE paper_accounts SET cash = cash - ?, reserved_short_margin = reserved_short_margin + ? WHERE id = ? AND cash >= ?",
-        [totalDebit, investmentAdjusted, accountId, totalDebit]
+        [totalDebit, marginHeld, accountId, totalDebit]
       ) as [mysqlTypes.ResultSetHeader, unknown];
       if (move.affectedRows !== 1) {
         await rejectOrder(conn, orderId, "INSUFFICIENT_CASH");
@@ -555,14 +562,22 @@ async function fillOrderCore(
       }
     }
 
-    // `investment_usd` on the trade row stores the ADJUSTED proceeds for
-    // shorts (= margin held). This keeps the close path's `investmentShare`
-    // derivation consistent with margin releases without changing formulas.
-    // The tradeoff: shorts' `investment_usd` is slightly smaller than the
-    // nominal amount the user asked for; LONGS still use nominal. That
-    // asymmetry is intentional and documented in the conservation test.
+    // Codex round-3 bug #2 fix — `investment_usd` on the trade row stores
+    // NOMINAL investment for BOTH longs and shorts (the amount the user
+    // committed / allocated). The actual proceeds held are in
+    // `reserved_short_margin` (= adj*qty, captured separately). Round-2's
+    // asymmetric `investment = adj*qty` broke conservation: since margin
+    // ALSO = adj*qty, any invariant that summed `investment_usd + margin`
+    // double-counted the same bucket by one slippage leg.
+    //
+    // The cover path's cash arithmetic is independent of investment_usd —
+    // it uses `buy_price * closeQty` for the margin release (= adj_open *
+    // qty at fill time), so reverting investment_usd to nominal has ZERO
+    // impact on cash flow. Only `pnl_pct` against investment_usd shifts
+    // slightly (now pct of nominal, not of adjusted proceeds) — semantically
+    // cleaner ("return on what you allocated").
     return await insertOpenTrade(conn, {
-      accountId, symbol, quantity, fillPrice: adjustedPrice, investment: investmentAdjusted,
+      accountId, symbol, quantity, fillPrice: adjustedPrice, investment,
       positionSide: "SHORT", side: "SELL", order, orderId, opts,
       slippageUsd, commissionUsd,
     });

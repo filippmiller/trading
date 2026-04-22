@@ -381,9 +381,9 @@ async function test8_borrowAccrual(accountId) {
   assert(res.debited === 1 && res.skipped === 0, `one trade debited, none skipped (got debited=${res.debited} skipped=${res.skipped})`);
 }
 
-// ── Test 9: SHORT open ledger (round-2 bug #2 fix) ──────────────────────
+// ── Test 9: SHORT open ledger (round-3 revert — investment_usd nominal) ──
 async function test9_shortOpenLedger(accountId) {
-  console.log("\nTest 9 (round-2 #2): SHORT open — margin = adj*qty (not nominal)");
+  console.log("\nTest 9 (round-3): SHORT open — margin = adj*qty; investment_usd = NOMINAL");
   await resetAcctState(accountId);
   paperRisk._setRiskConfigForTest({
     slippageBps: 5, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
@@ -400,20 +400,30 @@ async function test9_shortOpenLedger(accountId) {
   );
   assert(Math.abs(Number(t.slippage_usd) - 0.5) < EPS, `slip = 0.50 (tracked)`);
   assert(Math.abs(Number(t.commission_usd) - 1.0) < EPS, `comm = 1.00`);
-  // Margin now = adj*qty = 99.95*10 = 999.5, NOT nominal 1000.
+  // Margin = adj*qty = 99.95*10 = 999.5 (smaller than nominal by the slippage).
   const expectedMargin = 99.95 * 10;
   const acct = await getAccount(accountId);
   assert(Math.abs(Number(acct.reserved_short_margin) - expectedMargin) < EPS,
     `short margin = ${expectedMargin} (got ${acct.reserved_short_margin})`);
-  // investment_usd on trade row = adjusted margin (for shorts).
-  assert(Math.abs(Number(t.investment_usd) - expectedMargin) < EPS,
-    `paper_trades.investment_usd = ${expectedMargin} for SHORT (got ${t.investment_usd})`);
+  // Round-3: investment_usd on trade row = NOMINAL (symmetric with LONGs).
+  // This fixes the round-2 double-count where investment_usd == margin for
+  // shorts, inflating the conservation LHS by one slippage leg.
+  assert(Math.abs(Number(t.investment_usd) - 1000) < EPS,
+    `paper_trades.investment_usd = 1000 (NOMINAL) for SHORT (got ${t.investment_usd})`);
   // Cash flow: adj*qty moved to margin, commission out of cash. Slippage is
-  // NOT a separate cash debit under round-2 fix — it's baked into the smaller
-  // margin, captured only informationally on slippage_usd.
+  // NOT a separate cash debit — it's baked into the smaller margin, captured
+  // only informationally on slippage_usd.
   const expectedCash = TEST_INITIAL_CASH - expectedMargin - 1.0;
   assert(Math.abs(Number(acct.cash) - expectedCash) < EPS,
     `cash = ${expectedCash} (got ${acct.cash})`);
+  // Round-3 side-aware conservation check at this OPEN-SHORT state:
+  //   cash + short_margin + short_open_comm == initial
+  //   cash = initial - (adj*qty + comm) = initial - 1000.50
+  //   short_margin = 999.50, short_open_comm = 1
+  //   lhs = (initial - 1000.50) + 999.50 + 1 = initial ✓
+  const lhs = Number(acct.cash) + Number(acct.reserved_short_margin) + 1.0;
+  assert(Math.abs(lhs - TEST_INITIAL_CASH) < EPS,
+    `side-aware invariant at open-short: cash+short_margin+short_comm == initial (lhs=${lhs.toFixed(6)}, initial=${TEST_INITIAL_CASH})`);
 }
 
 // ── Test 10 (round-2 #2): SHORT round-trip same adj price → PnL = -2*comm ─
@@ -441,6 +451,117 @@ async function test10_shortRoundTripSamePriceNoPhantomRecoup(accountId) {
   // Margin fully released.
   assert(Math.abs(Number(acct.reserved_short_margin)) < EPS,
     `reserved_short_margin released to 0 (got ${acct.reserved_short_margin})`);
+  // Round-3: verify investment_usd on the now-closed trade is NOMINAL.
+  // (Round-2 stored adj*qty = $999.50 here; round-3 reverts to $1000.)
+  const [[closed]] = await pool.execute(
+    "SELECT investment_usd, pnl_usd, status FROM paper_trades WHERE id = ?",
+    [open.tradeId]
+  );
+  assert(closed.status === "CLOSED", `trade CLOSED`);
+  assert(Math.abs(Number(closed.investment_usd) - 1000) < EPS,
+    `closed trade investment_usd = 1000 NOMINAL (got ${closed.investment_usd})`);
+  // Realized pnl = (buy_price - adj_cover) * qty = (99.95 - 99.95) * 10 = 0.
+  assert(Math.abs(Number(closed.pnl_usd)) < EPS, `pnl_usd = 0 (got ${closed.pnl_usd})`);
+  // Side-aware conservation after full round trip:
+  //   cash + 0 (margin) + 0 (open) + closed_comm == initial + realized_pnl
+  //   cash = initial - 2; closed_comm = 2; realized = 0 → initial ✓
+  const lhs = Number(acct.cash) + Number(acct.reserved_short_margin) + 2.0;
+  assert(Math.abs(lhs - (TEST_INITIAL_CASH + 0)) < EPS,
+    `post-cover invariant: cash+short_margin+closed_comm == initial+realized (lhs=${lhs.toFixed(6)})`);
+}
+
+// ── Test 10c (round-3): SHORT auto-exit via paper-exits (stop-loss) ────
+async function test10c_shortAutoExitMarginRelease(accountId) {
+  console.log("\nTest 10c (round-3): SHORT auto-exit via paper-exits — margin release uses buy_price*qty (not nominal)");
+  await resetAcctState(accountId);
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 5, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
+    allowFractionalShares: true, defaultBorrowRatePct: 0,
+  });
+  // Open MARKET SHORT with bracket_stop_loss_pct so paper-fill records a
+  // stop_loss_price on the trade row. adj_open = 99.95.
+  const [ins] = await pool.execute(
+    `INSERT INTO paper_orders (account_id, symbol, side, position_side, order_type, investment_usd, bracket_stop_loss_pct, status)
+     VALUES (?, ?, 'SELL', 'SHORT', 'MARKET', 1000, 5, 'PENDING')`,
+    [accountId, "ZTEST_SHORT"]
+  );
+  const oid = ins.insertId;
+  const open = await paperFill.fillOrder(pool, oid, 100);
+  assert(open.filled === true, `SHORT open ok (got ${JSON.stringify(open)})`);
+  // Verify setup: investment_usd = 1000 nominal, margin = 999.50 (adj*qty),
+  // stop_loss_price set 5% above adj_open = 99.95 * 1.05 ≈ $104.9475.
+  const [[t0]] = await pool.execute("SELECT investment_usd, buy_price, stop_loss_price, side FROM paper_trades WHERE id = ?", [open.tradeId]);
+  assert(Math.abs(Number(t0.investment_usd) - 1000) < EPS, `investment_usd = 1000 nominal (got ${t0.investment_usd})`);
+  assert(t0.stop_loss_price != null, `stop_loss_price set for SHORT auto-exit (got ${t0.stop_loss_price})`);
+
+  // Drive auto-exit: for SHORT, price rising to the stop triggers HARD_STOP.
+  // At $110 (above ~$104.95 stop), paper-exits must release margin at
+  // buyPrice*remaining = 99.95*10 = 999.50 — matching what the account
+  // actually holds. Using nominal investment_usd ($1000) would over-release
+  // and rollback the close.
+  const paperExits = require("../src/lib/paper-exits");
+  const [[trade]] = await pool.execute("SELECT * FROM paper_trades WHERE id = ?", [open.tradeId]);
+  const input = paperExits.inputsFromTradeRow(trade, null, null);
+  const decision = paperExits.evaluateExits(input, 110, new Date());
+  assert(decision != null, `decision returned (got ${JSON.stringify(decision)})`);
+  assert(decision.reason === "HARD_STOP", `reason = HARD_STOP (got ${decision?.reason})`);
+  const applied = await paperExits.applyExitDecisionToTrade(pool, open.tradeId, 110, decision);
+  assert(applied.closed === true, `exit applied (got ${JSON.stringify(applied)})`);
+
+  const acct = await getAccount(accountId);
+  // Margin must have been fully released (reserved_short_margin = 0). If
+  // paper-exits tried to release the nominal $1000 from a $999.50 bucket,
+  // the UPDATE guard would have failed and margin would still be stuck at
+  // 999.50 with status=OPEN.
+  assert(Math.abs(Number(acct.reserved_short_margin)) < EPS,
+    `margin released to 0 (got ${acct.reserved_short_margin}) — confirms buy_price*qty path`);
+  // Realized pnl = (99.95 - 110)*10 = -100.50 (short loss, price rose).
+  // Round-trip cash:
+  //   open:  cash -= 1000.50 (adj*qty margin + $1 comm)
+  //   exit:  cashCredit = 2*999.50 - (10*110) = 1999 - 1100 = 899
+  //   total = -1000.50 + 899 = -101.50 = pnl - 1*commission ✓
+  const [[closed]] = await pool.execute("SELECT status, pnl_usd, exit_reason FROM paper_trades WHERE id = ?", [open.tradeId]);
+  assert(closed.status === "CLOSED", `trade CLOSED (got ${closed.status})`);
+  assert(closed.exit_reason === "HARD_STOP", `exit_reason = HARD_STOP`);
+  assert(Math.abs(Number(closed.pnl_usd) - (-100.50)) < EPS, `pnl_usd = -100.50 (got ${closed.pnl_usd})`);
+  const expectedCash = TEST_INITIAL_CASH + (-100.50) - 1.0; // pnl - 1 open-leg commission
+  assert(Math.abs(Number(acct.cash) - expectedCash) < EPS, `cash = ${expectedCash} (got ${acct.cash})`);
+}
+
+// ── Test 10b (round-3): SHORT round-trip with adverse move — full conservation check ──
+async function test10b_shortRoundTripPriceMoveConservation(accountId) {
+  console.log("\nTest 10b (round-3): SHORT open $1000@$100, cover at $90 → full conservation invariant holds");
+  await resetAcctState(accountId);
+  paperRisk._setRiskConfigForTest({
+    slippageBps: 5, commissionPerShare: 0.005, commissionMinPerLeg: 1.0,
+    allowFractionalShares: true, defaultBorrowRatePct: 0,
+  });
+  // Open MARKET short: adj_open = 99.95, qty = 10, margin = 999.50, cash = initial - 1000.50.
+  const openId = await insertOrder(accountId, "ZTEST_SHORT", "SELL", "SHORT", "MARKET", { investment_usd: 1000 });
+  const open = await paperFill.fillOrder(pool, openId, 100);
+  assert(open.filled === true, `open ok`);
+  // Cover LIMIT at $90 → adj_cover = $90 (LIMIT no slippage), closeValue = 900.
+  // marginRelease = 99.95*10 = 999.50. cashCredit = 2*999.50 - 900 - 1 = 1098.00.
+  // pnl = (99.95 - 90)*10 = 99.50.
+  const coverId = await insertOrder(accountId, "ZTEST_SHORT", "BUY", "SHORT", "LIMIT", { trade_id: open.tradeId });
+  const cover = await paperFill.fillOrder(pool, coverId, 90);
+  assert(cover.filled === true, `cover ok`);
+  const acct = await getAccount(accountId);
+  const [[t]] = await pool.execute(
+    "SELECT investment_usd, pnl_usd, slippage_usd, commission_usd FROM paper_trades WHERE id = ?",
+    [open.tradeId]
+  );
+  // Expected: pnl = 99.50; round-trip cash delta = pnl - 2*comm = 97.50.
+  assert(Math.abs(Number(t.pnl_usd) - 99.50) < EPS, `pnl_usd = 99.50 (got ${t.pnl_usd})`);
+  assert(Math.abs(Number(t.investment_usd) - 1000) < EPS, `investment_usd = 1000 NOMINAL (got ${t.investment_usd})`);
+  assert(Math.abs(Number(t.commission_usd) - 2.0) < EPS, `commission_usd accumulated to 2 (got ${t.commission_usd})`);
+  // Cash = initial + pnl - 2*comm = initial + 97.50.
+  const expectedCash = TEST_INITIAL_CASH + 99.50 - 2.0;
+  assert(Math.abs(Number(acct.cash) - expectedCash) < EPS, `cash = ${expectedCash} (got ${acct.cash})`);
+  // Side-aware conservation: cash + 0 margin + 0 open + closed_comm == initial + realized
+  const lhs = Number(acct.cash) + Number(acct.reserved_short_margin) + Number(t.commission_usd);
+  const rhs = TEST_INITIAL_CASH + Number(t.pnl_usd);
+  assert(Math.abs(lhs - rhs) < EPS, `round-trip conservation (lhs=${lhs.toFixed(6)} rhs=${rhs.toFixed(6)})`);
 }
 
 // ── Test 11 (round-2 #1): LONG close — commission > proceeds → underflow HARD REJECT ──
@@ -675,6 +796,8 @@ async function test15_coverIntradayAccrualSkipped(accountId) {
     await test8_borrowAccrual(accountId);
     await test9_shortOpenLedger(accountId);
     await test10_shortRoundTripSamePriceNoPhantomRecoup(accountId);
+    await test10b_shortRoundTripPriceMoveConservation(accountId);
+    await test10c_shortAutoExitMarginRelease(accountId);
     await test11_cashUnderflowOnLongClose(accountId);
     await test12_borrowCronSkipsClosedShort(accountId);
     await test13_cronIdempotencySameDay(accountId);
