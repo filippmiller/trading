@@ -137,16 +137,32 @@ export default function SettingsPage() {
     if (!defaults) return;
     setSaving(true);
     setMessage(null);
-    const response = await fetch("/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(defaults),
-    });
-    setSaving(false);
-    if (response.ok) {
-      setMessage("Saved.");
-    } else {
-      setMessage("Failed to save.");
+    try {
+      const response = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(defaults),
+      });
+      if (response.ok) {
+        setMessage("Saved.");
+        return;
+      }
+      // Mirror the `saveRisk` pattern (PR #36) — surface the specific Zod
+      // issue from the server so the user learns which field is wrong
+      // instead of staring at a generic "Failed to save."
+      let detail = "Failed to save defaults.";
+      try {
+        const body = await response.json();
+        if (body?.issues?.length) {
+          const first = body.issues[0];
+          detail = `Invalid input — ${Array.isArray(first.path) ? first.path.join(".") : "(field)"}: ${first.message}`;
+        } else if (typeof body?.error === "string") {
+          detail = body.error;
+        }
+      } catch { /* non-JSON body */ }
+      setMessage(detail);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -226,7 +242,11 @@ export default function SettingsPage() {
         <Button onClick={save} disabled={saving}>
           Save defaults
         </Button>
-        {message && <div className="text-sm text-zinc-500">{message}</div>}
+        {message && (
+          <div className={`text-sm ${message === "Saved." ? "text-emerald-600" : "text-rose-600"}`}>
+            {message}
+          </div>
+        )}
       </CardContent>
     </Card>
 

@@ -343,6 +343,11 @@ function PaperTradingPageInner() {
     const symbol = buySymbol.trim().toUpperCase();
     const amountField = parseFloat(buyAmount);
     if (!symbol) { setBuyError("Enter a ticker."); return; }
+    // Explicit NaN-guard — parseFloat("abc") returns NaN, and `!(NaN > 0)`
+    // happens to be truthy so the subsequent `> 0` check does the right
+    // thing by accident. Being explicit makes the intent readable and
+    // avoids surprises if the pattern gets copy-pasted elsewhere.
+    if (!Number.isFinite(amountField)) { setBuyError("Amount must be a number."); return; }
     if (!(amountField > 0)) { setBuyError("Amount must be greater than zero."); return; }
     const investment = computeInvestmentUsd(amountField);
     if (investment == null) return;
@@ -382,7 +387,14 @@ function PaperTradingPageInner() {
       if (bracketStopLossPct && parseFloat(bracketStopLossPct) > 0) body.stop_loss_pct = parseFloat(bracketStopLossPct);
       if (bracketTakeProfitPct && parseFloat(bracketTakeProfitPct) > 0) body.take_profit_pct = parseFloat(bracketTakeProfitPct);
       if (bracketTrailingPct && parseFloat(bracketTrailingPct) > 0) body.trailing_stop_pct = parseFloat(bracketTrailingPct);
-      if (bracketTrailingActivatesPct) body.trailing_activates_at_profit_pct = parseFloat(bracketTrailingActivatesPct);
+      // Explicit NaN-guard — the other bracket fields use `parseFloat(...) > 0`
+      // which filters out NaN naturally. This one accepts 0 (= activate
+      // immediately), so a truthy-string check isn't enough — must
+      // reject non-finite explicitly so `NaN` doesn't get sent to server.
+      if (bracketTrailingActivatesPct) {
+        const v = parseFloat(bracketTrailingActivatesPct);
+        if (Number.isFinite(v) && v >= 0) body.trailing_activates_at_profit_pct = v;
+      }
       if (bracketTimeExitDays && parseInt(bracketTimeExitDays, 10) >= 0) body.time_exit_days = parseInt(bracketTimeExitDays, 10);
 
       const accountQuery = selectedAccountId != null ? `?account_id=${selectedAccountId}` : "";
