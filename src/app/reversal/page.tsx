@@ -19,6 +19,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { BatchTradeModal } from "@/components/paper/BatchTradeModal";
 import {
   ReversalEntry,
   ReversalSettings,
@@ -552,6 +553,11 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
   // enrollment). Starts empty for the same reason as F1 — explicit opt-in.
   const [selectedRowIds, setSelectedRowIds] = useState<Set<number>>(() => new Set());
 
+  // --- Batch paper-trade modal state --------------------------------------
+  // Opens via the inline toolbar when >=1 rows are checked. See
+  // BatchTradeModal for submit semantics (POST /api/paper/batch-order).
+  const [batchTradeOpen, setBatchTradeOpen] = useState(false);
+
   // --- Scenario overlay state ---------------------------------------------
   // Collapsed by default so existing UX is unchanged until the user opts in.
   const [scenarioPanelOpen, setScenarioPanelOpen] = useState(false);
@@ -650,6 +656,16 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
   // Kept for back-compat with existing modal/comparison code; now points at
   // the effective (post-F1/F2) sample so scenario results reflect the filters.
   const visibleEntries = effectiveEntries;
+
+  // Full selection by row id — regardless of current side/recurrence filters.
+  // `selectedRowIds` may contain ids that are temporarily hidden by the
+  // side-filter, so we resolve against the ENTIRE `entries` list (not just
+  // grouped/visible) so the Batch modal submits exactly what the user
+  // checked, not what happens to be visible right now.
+  const selectedEntries = useMemo(
+    () => entries.filter((e) => selectedRowIds.has(e.id)),
+    [entries, selectedRowIds],
+  );
 
   // Row-selection helpers for F2 — expose full visible ID list so Select Visible / Clear work.
   const allVisibleRowIds = useMemo(() => grouped.flatMap(([, arr]) => arr.map(e => e.id)), [grouped]);
@@ -931,6 +947,20 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
           )}
         </div>
       </div>
+      {selectedRowIds.size > 0 && (
+        <div className="bg-indigo-50 border-b border-indigo-200 px-3 py-2 flex items-center justify-between gap-3 flex-wrap">
+          <span className="text-xs text-indigo-900">
+            <b className="font-bold">{selectedRowIds.size}</b> {selectedRowIds.size === 1 ? 'ticker' : 'tickers'} checked · ready to paper-trade at enrolment close price
+          </span>
+          <button
+            onClick={() => setBatchTradeOpen(true)}
+            className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-indigo-700 shadow-sm"
+            title="Open batch paper-trade modal for the selected tickers"
+          >
+            Paper-trade {selectedRowIds.size} selected →
+          </button>
+        </div>
+      )}
       <div className="overflow-auto" style={{ maxHeight: 'calc(100vh - 160px)' }}>
         <table className="border-collapse text-xs" style={{ minWidth: '2400px' }}>
           <thead className="sticky top-0 z-20">
@@ -1075,6 +1105,22 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
           </tbody>
         </table>
       </div>
+      <BatchTradeModal
+        open={batchTradeOpen}
+        entries={selectedEntries}
+        accountId={null}
+        onClose={() => setBatchTradeOpen(false)}
+        onSubmitted={(filled) => {
+          // Uncheck the rows that were filled so re-opening the modal
+          // doesn't re-submit them. We approximate by clearing the full
+          // selection after a successful partial — simplest behaviour,
+          // user can re-select what they want for a second batch.
+          if (filled > 0) {
+            setSelectedRowIds(new Set());
+            setSelectedCohortDates(new Set());
+          }
+        }}
+      />
       {reportOpen && applied && report && comparison && (
         <ScenarioReportModal
           report={report}

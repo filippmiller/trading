@@ -9,6 +9,57 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 17:10] — feat: matrix → paper-trade batch modal
+
+**Area:** Trading/Matrix, Trading/Paper
+**Type:** feature + tests
+**Branch:** `feat/matrix-to-paper-batch`
+
+### Why
+User asked to close the research-execution gap: from the `/reversal` matrix, check N tickers, hit a CTA, open a modal with per-ticker side/qty/fill-price/stop%/trail%/TP%, submit → trades land in /paper with brackets already set. Previously the flow required retyping each symbol into /paper's single-order form — friction enough that it wasn't happening.
+
+### Design choice log
+- **Phase 1 scope**: Matrix CTA + modal + batch endpoint. Phase 2 (EOD stop-eval cron) turned out to already be covered by `jobMonitorPaperTrades` in `scripts/surveillance-cron.ts:2152` (15-minute RTH cadence, reuses `paper-exits.ts` + slippage parity from PR #33). No new cron written.
+- **"Fill at yesterday's close" semantics**: /api/paper/order (single) gates MARKET orders by RTH + fetches live price, which breaks the "pretend I bought at matrix entry_price" mental model. The new batch endpoint DELIBERATELY bypasses both — it calls `fillOrder(pool, orderId, user_supplied_price)` directly. This is pure paper, so allowing an arbitrary fill price is the right move (noted in the route comment).
+- **Partial-success semantics**: the batch does NOT abort on a single failed row. Each ticker's result is returned individually (filled / rejected / error). UI surfaces per-row status instead of "all or nothing" — matches how real retail order platforms handle multi-leg entries.
+- **Default qty = floor($1000 / price)**: keeps user from accidentally submitting 1000× their intended exposure. Upper-bound caps on qty/price/pct mirror the PR #36 settings hardening.
+
+### What shipped
+1. **`POST /api/paper/batch-order?account_id=N`** (`src/app/api/paper/batch-order/route.ts`)
+   - Accepts `{orders: [{symbol, side:LONG|SHORT, qty, fill_price, stop_loss_pct?, trailing_stop_pct?, take_profit_pct?}]}` (1..50 orders).
+   - Per-order: whitelist check → INSERT paper_order as PENDING MARKET with bracket_*_pct fields → `fillOrder` at user-supplied price (no RTH gate, no live-price fetch).
+   - Returns `{summary, results}` with per-row {status, reason?, order_id?, trade_id?}.
+   - Zod schema exported so bounds are unit-tested.
+2. **`BatchTradeModal`** (`src/components/paper/BatchTradeModal.tsx`)
+   - Pre-fills `side` from `entry.direction`, `fillPrice` from `entry.entry_price`, `qty = floor($1000/price)`, stop=3%, trail=off, TP=off.
+   - Live totals footer: notional, at-risk, estimated commission.
+   - Per-row result column populated after submit; filled rows are read-only afterward (submit-remaining semantics).
+3. **`/reversal` CTA wiring** (`src/app/reversal/page.tsx`)
+   - Sticky indigo bar appears between the toolbar and the matrix when `selectedRowIds.size > 0`.
+   - Click → opens `BatchTradeModal` with the selected entries resolved from the full `entries` list (so off-filter-but-still-checked rows are included).
+   - On successful submit: clears selection (both F1 and F2) so a re-open doesn't resubmit.
+
+### Tests
+`src/app/api/paper/batch-order/schema.test.ts` — 13 tests pin bounds: symbol format, side enum, qty/fill_price positivity, upper-bound rejections, bracket percent ranges, batch size 1..50.
+
+### Verification
+```
+npx tsc --noEmit → tsc_exit=0
+npm test        → 88/88 passed (was 75 before this PR; +13 new batch schema tests)
+```
+
+### Files Changed
+- `src/app/api/paper/batch-order/route.ts` — new endpoint + Zod schema
+- `src/app/api/paper/batch-order/schema.test.ts` — new, 13 tests
+- `src/components/paper/BatchTradeModal.tsx` — new modal
+- `src/app/reversal/page.tsx` — import modal, add selection state, sticky CTA bar, modal render
+- `.claude/agent-log.md` — this entry
+
+### Not in this PR (phase 3 — optional)
+Per-minute real-time polling outside the existing 15-min RTH cron. If the user later wants sub-15-minute stop triggering, options are: (A) tighten the existing cron to `*/1` during RTH (more Yahoo load), (B) move to Alpaca free IEX feed (free after signup, IEX-only ≈3% volume), (C) Polygon.io basic ($29/mo consolidated tape). User approved Phase 1+2 only for now.
+
+---
+
 ## [2026-04-22 16:15] — RED Finding #2 fix: settings input validation
 
 **Area:** Trading/Paper, Trading/API
