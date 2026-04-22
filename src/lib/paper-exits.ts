@@ -24,7 +24,13 @@
 
 import type mysqlTypes from "mysql2/promise";
 import { recordEquitySnapshotInTx } from "./paper-fill";
-import { applyCommission, loadRiskConfig } from "./paper-risk";
+import {
+  applyCommission,
+  applySlippage,
+  loadRiskConfig,
+  slippageCostUsd,
+  type RiskConfig,
+} from "./paper-risk";
 
 export type Side = "LONG" | "SHORT";
 
@@ -295,6 +301,38 @@ export function inputsFromTradeRow(row: PaperTradeRow, maxPrice: number | null, 
 }
 
 /**
+ * Resolve the effective fill price for an auto-exit.
+ *
+ * Semantics — matches how the exit would fill on a real brokerage:
+ *   HARD_STOP, TRAILING_STOP, TIME_EXIT, LIQUIDATED → MARKET fill after trigger.
+ *     Apply slippage against the trigger price. Closing a LONG is a SELL
+ *     (price drops a hair); covering a SHORT is a BUY (price rises a hair).
+ *     Either way, the filled P&L is a hair worse than the trigger quote —
+ *     which matches what a user sees when they manually close at the same
+ *     visible price.
+ *   TAKE_PROFIT → LIMIT order already resting at the target price. Filled
+ *     AT the limit, no slippage. Leaving this path as-is keeps take-profit
+ *     exits behaving like the happy-path outcome the user planned for.
+ *
+ * Finding #3 (internal-critic 2026-04-21): before this, auto-exits always
+ * used the raw trigger price, producing a systematic P&L inflation vs the
+ * manual-close path (which always applies slippage). Over many trades this
+ * drifted realized cash higher than a real portfolio would accumulate.
+ */
+export function computeExitFillPrice(
+  reason: ExitReason,
+  side: "LONG" | "SHORT",
+  triggerPrice: number,
+  cfg: RiskConfig,
+): { fillPrice: number; isLimit: boolean } {
+  const isLimit = reason === "TAKE_PROFIT";
+  const effectiveOrderType: "MARKET" | "LIMIT" = isLimit ? "LIMIT" : "MARKET";
+  const exitSide: "BUY" | "SELL" = side === "LONG" ? "SELL" : "BUY";
+  const fillPrice = applySlippage(triggerPrice, exitSide, effectiveOrderType, cfg);
+  return { fillPrice, isLimit };
+}
+
+/**
  * Persist an exit decision AND watermarks to paper_trades + paper_accounts.
  * Wraps its own transaction (acquires a fresh connection). The caller is
  * responsible for passing a pool (not a connection) — the function locks in
@@ -368,10 +406,24 @@ export async function applyExitDecisionToTrade(
     //  remaining` for margin release, not `investment * remaining/totalQty`.
     //  Under Option A, investment_usd stores NOMINAL for both sides; margin
     //  holds adj*qty = buy_price*qty. Releasing nominal would over-release.)
-    const proceeds = remaining * currentPrice;
+
+    // Finding #3 (2026-04-21): auto-exits now apply slippage on
+    // market-triggered reasons (hard-stop/trailing/time/liquidated). The
+    // trigger price is what the strategy observed; the fill price is what
+    // the book actually absorbed — always a hair worse. TAKE_PROFIT is a
+    // limit, so it fills at the trigger unchanged.
+    const { fillPrice: exitFillPrice } = computeExitFillPrice(
+      decision.reason,
+      side,
+      currentPrice,
+      riskCfg,
+    );
+    const closeSlippageUsd = slippageCostUsd(currentPrice, exitFillPrice, remaining);
+
+    const proceeds = remaining * exitFillPrice;
     const pnlUsd = side === "SHORT"
-      ? (entryPrice - currentPrice) * remaining
-      : (currentPrice - entryPrice) * remaining;
+      ? (entryPrice - exitFillPrice) * remaining
+      : (exitFillPrice - entryPrice) * remaining;
 
     // Hotfix Bug #2 (2026-04-21): charge commission on the auto-exit close
     // leg to match the manual-close path in fillOrderCore (paper-fill.ts).
@@ -412,10 +464,11 @@ export async function applyExitDecisionToTrade(
               max_pnl_pct=?, min_pnl_pct=?,
               trailing_active=?, trailing_stop_price=?,
               commission_usd = commission_usd + ?,
+              slippage_usd = slippage_usd + ?,
               exit_reason=?
         WHERE id=? AND status='OPEN'`,
       [
-        currentPrice,
+        exitFillPrice,
         finalPnl,
         finalPnlPct,
         decision.watermarks.maxPnlPct,
@@ -423,6 +476,7 @@ export async function applyExitDecisionToTrade(
         decision.watermarks.trailingActive ? 1 : 0,
         decision.watermarks.trailingStopPrice,
         closeCommissionUsd,
+        closeSlippageUsd,
         decision.reason,
         tradeId,
       ]
