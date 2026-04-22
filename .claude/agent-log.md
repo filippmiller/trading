@@ -9,6 +9,44 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 18:10] — feat: lazy whitelist sync — closes matrix↔paper gap
+
+**Area:** Trading/Paper, Trading/Surveillance
+**Type:** feature + data fix
+**Branch:** `feat/whitelist-lazy-sync`
+
+### Why
+Live E2E after PR #37 (matrix→paper batch modal) uncovered a real-but-known UX bug: `/reversal` matrix had 956 rows but the `tradable_symbols` whitelist only had 232 (the curated CSV seed). The first-row tickers I sampled for the E2E (NVTS, CAR, XNDU) were all legitimate NASDAQ/NYSE equities but absent from the seed — batch submit rejected all three with `SYMBOL_NOT_TRADABLE`. Root cause is an explicit MVP shortcut documented in `scripts/sync-tradable-symbols.ts` (live NASDAQ fetch "skipped for the MVP").
+
+User ask: fix the root cause, not the UX.
+
+### Fix (A + lazy)
+1. **`ensureTradableSymbol(symbol)` helper** in `src/lib/paper-risk.ts`. `INSERT IGNORE` with `active=1, asset_class='EQUITY', exchange=NULL`. Best-effort (doesn't throw on DB glitch — enrollment is the canonical write).
+2. **Lazy insert on enrollment** in both `surveillance-cron.ts` paths: after each `INSERT INTO reversal_entries` for MOVERS (line 644) and TREND (line 1868). Safe-by-construction: Yahoo's day_gainers / day_losers and the TREND scan only surface real US-listed equities.
+3. **One-shot backfill in `ensureSchema`** — `INSERT IGNORE INTO tradable_symbols SELECT DISTINCT symbol, NULL, 'EQUITY', 1 FROM reversal_entries`. Runs once per server boot but is a ~no-op on subsequent boots thanks to the symbol-PK `INSERT IGNORE`. Closes the backlog of 956-232 = ~724 previously-enrolled symbols in one pass.
+
+### Non-impact
+- Curated CSV seed remains the "base" whitelist. `sync-tradable-symbols.ts` is unchanged.
+- `isSymbolTradable` query is unchanged — still `active=1 AND asset_class='EQUITY'`. Lazy-added rows satisfy both.
+- Other accounts / tables untouched.
+- `exchange=NULL` on lazy-added rows distinguishes them from the curated seed (which has NASDAQ/NYSE). No query currently filters by exchange, but the provenance is there if we later want to distinguish.
+
+### Verification
+```
+npx tsc --noEmit → tsc_exit=0
+npm test        → 88/88 passed (unchanged test count; this PR adds no new tests — lazy-insert is INSERT IGNORE data-layer logic, exercised by the live E2E retest post-deploy)
+```
+
+Post-deploy plan: re-run the same direct batch POST that failed for NVTS/CAR/XNDU — expect 3/3 FILLED once Railway picks up the migration and backfills existing enrollments on first `ensureSchema` call.
+
+### Files Changed
+- `src/lib/paper-risk.ts` — new `ensureTradableSymbol` helper
+- `src/lib/migrations.ts` — one-shot backfill from reversal_entries
+- `scripts/surveillance-cron.ts` — call `ensureTradableSymbol` after each enrollment INSERT (MOVERS + TREND)
+- `.claude/agent-log.md` — this entry
+
+---
+
 ## [2026-04-22 17:10] — feat: matrix → paper-trade batch modal
 
 **Area:** Trading/Matrix, Trading/Paper
