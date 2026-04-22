@@ -9,6 +9,46 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 13:30] — Post-PR-29 follow-ups: cleanup + component extraction + 2 MEDIUM critic fixes
+
+**Area:** Trading/Repo-hygiene, Trading/Matrix, Trading/Paper
+**Type:** chore + refactor + fix
+**Branches / PRs:**
+- `chore/root-cleanup` → [#30](https://github.com/filippmiller/trading/pull/30) (merged `0f7aee1`)
+- `refactor/extract-price-chart-popover` → [#31](https://github.com/filippmiller/trading/pull/31) (merged `1087e37`)
+- `fix/paper-watermark-txn-and-float-literal` → [#32](https://github.com/filippmiller/trading/pull/32) (merged `568b7d3`)
+
+### PR #30 — repo hygiene
+Root had ~108 PNG screenshots (only 3 tracked: `debug-reversal.png`, `reversal-page-production.png`, `reversal-v2-demo.png`), 2 zero-byte typo files (`0`, `=`), a stale backfill-summary JSON, a yahoo probe dump, and `.tmp/` / `test-results/` / orphan `.claude/worktrees/` artifact dirs. `git status` was unusable. `.gitignore` hardened with catch-alls: `/*.png`, `/*.jpeg`, `/*.jpg`, `/backfill-*.json`, `/yahoo-*.json`, `/.tmp/`, `/test-results/`, `/.claude/worktrees/`. 8 `.claude/sessions/*.md` notes (2026-04-17 → 2026-04-22) committed so future sessions can recover context. Orphan worktree `.claude/worktrees/agent-aa7c4ebe` pruned — its branch `feat/paper-w4-risk-model` (@ `d0f2fb7`) remains intact.
+
+### PR #31 — PriceChartPopover extraction + RTL coverage
+`src/app/reversal/page.tsx` was 2052 lines with `PriceChartPopover` and its module-level `priceCache` inlined at line 391. Untestable without extract. Moved to `src/components/charts/PriceChartPopover.tsx` (~270 lines). Kept module cache + exposed `_resetPriceCacheForTests()` for vitest. Added `data-testid` + `aria-label` hooks. Page shrinks 2052 → 1798 lines (−254). 9 new RTL tests: loading placeholder, empty state, HTTP 500 error, out-of-window amber warning, happy-path candle rendering, backdrop-click close, inner-click no-close (stopPropagation), × button close, cache-reuse on remount, URL encoding.
+
+### PR #32 — 2 MEDIUM paper-trading correctness fixes
+**Finding #1 (internal-critic 2026-04-21)**: watermark UPDATE in `jobMonitorPaperTradesImpl` ran outside a transaction, racing with fillOrder cover. Fix: gate watermark persistence on `result.reason == null` (exit path writes watermarks atomically inside `applyExitDecisionToTrade`). Replaced inline UPDATE with `persistWatermarks` helper from `paper-exits.ts`; extended that helper's signature to accept `null` for max/min PnL (early-tick state).
+
+**Finding #10**: `WHERE ... closed_quantity + ? <= quantity + 1e-9` partial-close guard in `paper-fill.ts` used a scientific-notation float epsilon against DECIMAL(18,6) columns — fixed-point in MySQL, not IEEE-754, so tolerance was false safety. Dropped `+ 1e-9` from SQL. JS-side tolerance on line 666 (`willBeFullyClosed`) kept — JS numbers ARE float.
+
+3 new unit tests on `persistWatermarks` (SQL shape, null-tolerance, boolean→TINYINT mapping).
+
+### Test suite growth across the day
+- Start of day: 0 tests (repo had no test infra)
+- After PR #29: 46 tests (vitest infra + scenario math + PnL)
+- After PR #31: 55 tests (+ PriceChartPopover RTL)
+- After PR #32: 58 tests (+ persistWatermarks contract)
+
+### Verification
+- `npm test` after each PR: green (46 → 55 → 58 passing)
+- `npx tsc --noEmit`: clean after every change
+- Prod `https://trading-production-06fe.up.railway.app/api/healthz`: 200 (pre- and post-merge smoke)
+
+### Open follow-ups (deliberately deferred)
+- Codex finding #1 (TREND enrollment auto-backfill) was shipped in PR #29 but verification in prod requires a fresh TREND scan — after next `jobScanTrends` tick, confirm TREND enrollments show `prices_daily` rows.
+- Internal-critic Finding #2 (HIGH) — LONG auto-exit commission asymmetry, Finding #3 (MEDIUM) — SHORT auto-exit slippage. Out of scope for this batch; worth a dedicated PR with smoke-test around `applyExitDecisionToTrade` cash accounting.
+- Finding #11 (isSymbolTradable silent DB errors) — already partially handled by PR #20 (`whitelist-503`). Verify no other silent-catch sites remain.
+
+---
+
 ## [2026-04-22 12:12] — Vitest coverage + Codex findings #1 & #2 fix
 
 **Area:** Trading/Tests, Trading/Matrix, Trading/Surveillance
