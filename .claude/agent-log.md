@@ -9,6 +9,33 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 15:00] — Dashboard-stats stay-put probe (closes Finding #1)
+
+**Area:** Trading/QA
+**Type:** audit follow-up (no code change in src/)
+**Branch:** `chore/prod-audit-2026-04-22` (same PR #35, new commit)
+
+Ran `scripts/prod-audit-dashboard.mjs` to disambiguate Finding #1 from the 14:45 entry. Method: log in, land on `/`, sit for 10s, record `/api/reversal` + `/api/runs` completion + any console errors.
+
+Result:
+```
+requests-fired=2
+reversal-done=200
+runs-done=200
+network-failed=0
+dashboard-stats-errors=0
+total-console-errors=0
+```
+
+Verdict: Finding #1 closed as a test-walker artifact. No production code change needed. Session notes updated in place.
+
+### Files Changed
+- `scripts/prod-audit-dashboard.mjs` — new, stay-put dashboard probe
+- `.claude/sessions/2026-04-22-headed-audit.md` — Finding #1 marked RESOLVED with the 10s-stay-put verification block
+- `.claude/agent-log.md` — this entry
+
+---
+
 ## [2026-04-22 14:45] — Headed prod audit (post PR #34)
 
 **Area:** Trading/QA

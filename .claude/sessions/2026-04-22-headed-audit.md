@@ -37,14 +37,23 @@ Positive signals in second-pass matrix probe:
 
 ## 2. ⚠️ Findings
 
-### Finding 1 — YELLOW (suspected test artifact)
+### Finding 1 — RESOLVED (test artifact confirmed)
 **Page:** `/` (Overview)
-**Steps:** Full-page nav `/` → networkidle → wait 1.5s → screenshot → navigate away.
-**Expected:** No console errors.
-**Got:** `console.error: "Dashboard stats error TypeError: Failed to fetch"` fires on `/` during the Promise.all in `src/app/page.tsx:48-51` (fetches `/api/reversal` + `/api/runs`).
-**Screenshot:** `audit/prod-audit/root.png`
-**Diagnosis:** In the second-pass run, the `/api/reversal` call completed successfully (visible in networkCalls), but the `/api/runs` arm of the same Promise.all produced the "Failed to fetch" TypeError with no corresponding network completion event. This is the classic browser behavior for a fetch aborted mid-flight when the page navigates away. My audit script moves to `/markets` as soon as the 1.5s screenshot wait elapses, which can race with slower useEffect fetches.
-**Severity:** YELLOW. Not known to fire for real users who stay on the page. Worth a ~5s follow-up probe that stays on `/` to confirm — not done in this pass to keep audit time bounded.
+**Steps (original observation):** Full-page nav `/` → networkidle → wait 1.5s → screenshot → navigate away.
+**Got (original):** `console.error: "Dashboard stats error TypeError: Failed to fetch"` fires on `/` during the Promise.all in `src/app/page.tsx:48-51` (fetches `/api/reversal` + `/api/runs`).
+**Diagnosis:** Fetch aborted mid-flight when the audit script navigated away from `/` before both Promise.all arms could settle.
+**Verification (stay-put probe — `scripts/prod-audit-dashboard.mjs`):** Log in → land on `/` → sit for 10s → watch network + console.
+```
+requests-fired=2
+reversal-done=200
+runs-done=200
+network-failed=0
+dashboard-stats-errors=0
+total-console-errors=0
+```
+Both fetches complete cleanly, zero console errors, zero network failures. Confirms this was a test artifact of the walker, not a user-facing defect.
+**Status:** Closed. No production code change required.
+**Screenshot:** `audit/prod-audit-dashboard/dashboard-after-stay.png`
 
 ### Finding 2 — YELLOW (known, previously documented)
 **Page:** `/reversal?view=matrix`
@@ -82,4 +91,4 @@ No writes to DB. No orders placed. No accounts created. No reset triggered. Netw
 
 **Ship.** 12/12 routes 200 and render; matrix + popover work on live data; 2 YELLOW findings are a known hydration warning and a suspected test-timing artifact — neither is a user-facing defect under normal navigation. The two fixes whose regression guard could not be exercised on this particular prod snapshot (PR #33 slippage, PR #34 empty-cache refetch) are both covered by unit tests in the same commits that shipped them. No RED findings, no 5xx, no missing pages.
 
-**Single concrete follow-up I'd prioritize next:** a dedicated probe that stays on `/` for 5+ seconds, watches for `/api/runs` completion, and fails only if the Dashboard fetch produces an uncaught error when NOT racing with navigation. That converts Finding #1 from "suspected artifact" to "definitively resolved or real bug."
+**Follow-up executed:** The stay-put probe ran with `STAY_MS=10000`; both `/api/reversal` and `/api/runs` returned 200 with zero console errors and zero network failures. Finding #1 is definitively closed as a test-walker artifact.
