@@ -1,6 +1,7 @@
 "use client";
 
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState, useMemo, useRef } from "react";
+import { createPortal } from "react-dom";
 import { 
   Activity, 
   ArrowUpCircle, 
@@ -298,6 +299,7 @@ function SurveillanceCard({ entry, settings, recurrence }: { entry: ReversalEntr
             <div className="flex items-center gap-2">
               <h3 className="text-lg font-bold text-zinc-900">{entry.symbol}</h3>
               {recurrence && recurrence.count >= 2 && <RecurrenceBadge info={recurrence} />}
+              <StreakBadge entry={entry} />
               <Badge className="text-[10px] font-mono border-zinc-200 bg-white">
                 {entry.consecutive_days}D Trend
               </Badge>
@@ -361,13 +363,224 @@ function SurveillanceCard({ entry, settings, recurrence }: { entry: ReversalEntr
  *
  * Only rendered when count >= 2 (decided by the caller).
  */
-function RecurrenceBadge({ info }: { info: RecurrenceInfo }) {
-  const [open, setOpen] = useState(false);
+/**
+ * StreakBadge — ↑5 / ↓3 pill next to a ticker symbol indicating the length
+ * and direction of the consecutive-day move through enrollment day. Answers
+ * "did this ticker land here on a one-day spike or on a multi-day streak?"
+ * at a glance. consecutive_days is already populated by the surveillance
+ * pipeline, so this is a pure visual surfacing — no new computation.
+ */
+function StreakBadge({ entry }: { entry: ReversalEntry }) {
+  const len = Math.abs(entry.consecutive_days ?? 0);
+  if (len < 2) return null; // 0/1-day is not a streak worth flagging
+  const up = entry.day_change_pct > 0;
+  const arrow = up ? '↑' : '↓';
+  const cls = up
+    ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+    : 'bg-rose-50 text-rose-700 ring-rose-200';
   return (
     <span
+      className={`inline-flex items-center px-1 py-0.5 rounded text-[9px] font-bold ring-1 ${cls}`}
+      title={`${len}-day ${up ? 'UP' : 'DOWN'} streak through enrollment day`}
+    >
+      {arrow}{len}d
+    </span>
+  );
+}
+
+/**
+ * PriceChartPopover — on-click candlestick chart for a single ticker.
+ * Fetches last 30 daily bars from /api/prices and renders OHLC bars with:
+ *  - Vertical band highlighting the pre-enrollment streak days
+ *  - Vertical marker line on the enrollment day
+ *  - Green/red body per candle (close vs open)
+ * Uses a portal so the popover escapes the table's stacking context and
+ * positions via viewport coordinates.
+ *
+ * Answers the "how do I verify this ticker was really rising 5 days in a row
+ * before we picked it up?" domain question from 2026-04-22.
+ */
+const priceCache = new Map<string, Array<{ date: string; open: number; high: number; low: number; close: number }>>();
+
+function PriceChartPopover({ entry, onClose, anchor }: {
+  entry: ReversalEntry;
+  onClose: () => void;
+  anchor: { top: number; left: number };
+}) {
+  const [bars, setBars] = useState(priceCache.get(entry.symbol) ?? null);
+  const [loading, setLoading] = useState(!priceCache.has(entry.symbol));
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (bars) return;
+    setLoading(true);
+    fetch(`/api/prices?symbol=${encodeURIComponent(entry.symbol)}&limit=30`)
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+      .then(j => {
+        const items = Array.isArray(j.items) ? j.items : [];
+        priceCache.set(entry.symbol, items);
+        setBars(items);
+      })
+      .catch(e => setError(String(e.message ?? e)))
+      .finally(() => setLoading(false));
+  }, [entry.symbol, bars]);
+
+  const cohortDate = typeof entry.cohort_date === 'string'
+    ? entry.cohort_date.slice(0, 10)
+    : new Date(entry.cohort_date).toISOString().slice(0, 10);
+  const streakLen = Math.abs(entry.consecutive_days ?? 0);
+  const up = entry.day_change_pct > 0;
+
+  // Chart geometry
+  const WIDTH = 420;
+  const HEIGHT = 180;
+  const PAD_L = 36, PAD_R = 8, PAD_T = 10, PAD_B = 20;
+  const plotW = WIDTH - PAD_L - PAD_R;
+  const plotH = HEIGHT - PAD_T - PAD_B;
+
+  // Index enrollment day inside bars
+  let enrollIdx = -1;
+  if (bars) {
+    for (let i = 0; i < bars.length; i++) if (bars[i].date === cohortDate) { enrollIdx = i; break; }
+  }
+
+  let chart: React.ReactNode = null;
+  if (bars && bars.length > 0) {
+    const lows = bars.map(b => b.low);
+    const highs = bars.map(b => b.high);
+    const yMin = Math.min(...lows);
+    const yMax = Math.max(...highs);
+    const yRange = (yMax - yMin) || 1;
+    const barW = plotW / bars.length;
+    const y = (v: number) => PAD_T + plotH - ((v - yMin) / yRange) * plotH;
+    const x = (i: number) => PAD_L + i * barW + barW / 2;
+
+    // streak band: from (enrollIdx - streakLen + 1) through enrollIdx, inclusive
+    const streakStart = enrollIdx >= 0 ? Math.max(0, enrollIdx - streakLen + 1) : -1;
+    const streakEnd = enrollIdx;
+
+    chart = (
+      <svg width={WIDTH} height={HEIGHT} className="bg-white">
+        {/* streak band */}
+        {streakStart >= 0 && streakLen >= 2 && (
+          <rect
+            x={PAD_L + streakStart * barW}
+            y={PAD_T}
+            width={(streakEnd - streakStart + 1) * barW}
+            height={plotH}
+            fill={up ? 'rgba(16,185,129,0.12)' : 'rgba(244,63,94,0.12)'}
+          />
+        )}
+        {/* enrollment marker line */}
+        {enrollIdx >= 0 && (
+          <line
+            x1={x(enrollIdx)}
+            x2={x(enrollIdx)}
+            y1={PAD_T}
+            y2={PAD_T + plotH}
+            stroke="#6366f1"
+            strokeWidth={1}
+            strokeDasharray="2 2"
+          />
+        )}
+        {/* y-axis price labels */}
+        <text x={4} y={PAD_T + 4} fontSize={9} fill="#71717a" fontFamily="monospace">${yMax.toFixed(2)}</text>
+        <text x={4} y={PAD_T + plotH} fontSize={9} fill="#71717a" fontFamily="monospace">${yMin.toFixed(2)}</text>
+        {/* candlesticks */}
+        {bars.map((b, i) => {
+          const isUp = b.close >= b.open;
+          const color = isUp ? '#10b981' : '#ef4444';
+          const bodyTop = y(Math.max(b.open, b.close));
+          const bodyBot = y(Math.min(b.open, b.close));
+          const bodyH = Math.max(1, bodyBot - bodyTop);
+          return (
+            <g key={b.date}>
+              <line x1={x(i)} x2={x(i)} y1={y(b.high)} y2={y(b.low)} stroke={color} strokeWidth={1} />
+              <rect x={x(i) - barW * 0.35} y={bodyTop} width={barW * 0.7} height={bodyH} fill={color} />
+            </g>
+          );
+        })}
+        {/* first/last/enrollment date labels */}
+        <text x={PAD_L} y={HEIGHT - 6} fontSize={8} fill="#71717a" fontFamily="monospace">{bars[0].date.slice(5)}</text>
+        <text x={WIDTH - PAD_R} y={HEIGHT - 6} fontSize={8} fill="#71717a" fontFamily="monospace" textAnchor="end">{bars[bars.length - 1].date.slice(5)}</text>
+        {enrollIdx >= 0 && (
+          <text x={x(enrollIdx)} y={HEIGHT - 6} fontSize={8} fill="#6366f1" fontFamily="monospace" fontWeight="bold" textAnchor="middle">
+            {cohortDate.slice(5)}
+          </text>
+        )}
+      </svg>
+    );
+  }
+
+  return createPortal(
+    <div
+      style={{ position: 'fixed', inset: 0, zIndex: 70 }}
+      onClick={onClose}
+    >
+      <div
+        style={{ position: 'fixed', top: anchor.top, left: anchor.left, zIndex: 71 }}
+        onClick={(e) => e.stopPropagation()}
+        className="bg-white ring-1 ring-zinc-200 rounded-lg shadow-2xl p-3"
+      >
+        <div className="flex items-center justify-between mb-1">
+          <div>
+            <span className="font-bold text-sm text-zinc-900">{entry.symbol}</span>
+            <span className="ml-2 text-[10px] text-zinc-500 font-mono">
+              enrolled {cohortDate} · entry ${entry.entry_price?.toFixed(2)} ·
+              <span className={up ? 'text-emerald-600 ml-1' : 'text-rose-600 ml-1'}>
+                {up ? '+' : ''}{entry.day_change_pct.toFixed(1)}%
+              </span>
+              {streakLen >= 2 && (
+                <span className={up ? ' ml-1 text-emerald-700' : ' ml-1 text-rose-700'}>
+                  · {streakLen}-day {up ? 'UP' : 'DOWN'} streak
+                </span>
+              )}
+            </span>
+          </div>
+          <button onClick={onClose} className="text-zinc-400 hover:text-zinc-700 text-lg leading-none">×</button>
+        </div>
+        {loading && <div className="text-xs text-zinc-500 py-6 px-3">Loading last 30 days…</div>}
+        {error && <div className="text-xs text-rose-600 py-4 px-3">Failed to load prices: {error}</div>}
+        {!loading && !error && !bars?.length && <div className="text-xs text-zinc-500 py-4 px-3">No historical bars available.</div>}
+        {chart}
+        {bars && bars.length > 0 && (
+          <div className="text-[9px] text-zinc-400 mt-1 flex gap-3 flex-wrap">
+            <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3" style={{ backgroundColor: up ? 'rgba(16,185,129,0.12)' : 'rgba(244,63,94,0.12)' }} /> streak band</span>
+            <span className="inline-flex items-center gap-1"><span className="inline-block w-0.5 h-3 bg-indigo-500" /> enrollment day</span>
+            <span className="inline-flex items-center gap-1"><span className="inline-block w-2 h-2 bg-emerald-500" /> close ≥ open</span>
+            <span className="inline-flex items-center gap-1"><span className="inline-block w-2 h-2 bg-rose-500" /> close &lt; open</span>
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function RecurrenceBadge({ info }: { info: RecurrenceInfo }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const triggerRef = useRef<HTMLSpanElement>(null);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  // Absolute-positioned tooltips living inside <tbody> get z-fought by later
+  // table rows that create their own stacking contexts. Fix: render the
+  // popover through a portal to document.body and position with viewport
+  // coordinates computed at hover time — fully escapes the table's stack.
+  const show = () => {
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (rect) setPos({ top: rect.bottom + 4, left: rect.left });
+    setOpen(true);
+  };
+  const hide = () => setOpen(false);
+
+  return (
+    <span
+      ref={triggerRef}
       className="relative inline-flex items-center"
-      onMouseEnter={() => setOpen(true)}
-      onMouseLeave={() => setOpen(false)}
+      onMouseEnter={show}
+      onMouseLeave={hide}
       data-testid="recurrence-badge"
     >
       <span
@@ -377,8 +590,11 @@ function RecurrenceBadge({ info }: { info: RecurrenceInfo }) {
         <span className="text-purple-500">◉</span>
         {info.count}
       </span>
-      {open && (
-        <div className="absolute z-40 top-full left-0 mt-1 p-2 bg-white ring-1 ring-zinc-200 rounded-md shadow-lg min-w-[220px]">
+      {mounted && open && pos && createPortal(
+        <div
+          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 60 }}
+          className="p-2 bg-white ring-1 ring-zinc-200 rounded-md shadow-lg min-w-[220px] pointer-events-none"
+        >
           <div className="text-[9px] font-bold uppercase tracking-wider text-zinc-500 mb-1">
             Appearances ({info.count})
           </div>
@@ -406,7 +622,8 @@ function RecurrenceBadge({ info }: { info: RecurrenceInfo }) {
               ))}
             </tbody>
           </table>
-        </div>
+        </div>,
+        document.body,
       )}
     </span>
   );
@@ -456,6 +673,36 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
     return q === 'gainers' || q === 'losers' ? q : 'all';
   });
 
+  // Ticker name filter — comma/space separated symbols (case-insensitive).
+  // Example: "xndu, mu, aapl" → only those three show in the grid.
+  // Empty string = no filter. Separate from F2 selection — this hides rows
+  // from view entirely, it does not alter `selectedRowIds`.
+  const [tickerFilter, setTickerFilter] = useState('');
+  const tickerFilterTokens = useMemo(() => {
+    const raw = tickerFilter.trim();
+    if (!raw) return null;
+    const set = new Set(raw.toUpperCase().split(/[\s,]+/).map(s => s.trim()).filter(Boolean));
+    return set.size > 0 ? set : null;
+  }, [tickerFilter]);
+
+  // Recurrence-count minimum — "only show tickers that appear ≥N times".
+  // 1 = no filter (every ticker appears at least once); 2+ reveals repeat
+  // enrollments (the aggressive-swing behavioural signal).
+  const [minRecurrence, setMinRecurrence] = useState<number>(1);
+
+  // Streak minimum — "only show tickers that moved in the same direction for
+  // ≥N days through enrollment". 1 = no filter. Surfaces momentum-style
+  // enrollments (e.g. a ticker that was already up 5 days before landing here
+  // today is a very different reversal bet than a one-day spike).
+  const [minStreak, setMinStreak] = useState<number>(1);
+
+  // Sort mode for within-cohort ordering. 'move' = biggest absolute move on
+  // trigger day first (default); 'streak' = longest pre-enrollment streak first.
+  const [sortMode, setSortMode] = useState<'move' | 'streak'>('move');
+
+  // Per-ticker price chart popover. null = closed.
+  const [chartFor, setChartFor] = useState<{ entry: ReversalEntry; anchor: { top: number; left: number } } | null>(null);
+
   // --- F1: cohort-date filter state --------------------------------------
   // List of cohort dates present in the data (derived further down). Starts
   // empty — user must explicitly opt in to which cohorts they want scoped in.
@@ -490,11 +737,20 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
     return { all: entries.length, gainers, losers };
   }, [entries]);
 
-  // Group by cohort_date, newest first — apply gainer/loser filter before grouping
+  // Group by cohort_date, newest first — apply gainer/loser + ticker-name + recurrence + streak filters before grouping
   const grouped = useMemo(() => {
     const filtered = entries.filter(e => {
-      if (sideFilter === 'gainers') return e.day_change_pct > 0;
-      if (sideFilter === 'losers') return e.day_change_pct < 0;
+      if (sideFilter === 'gainers' && !(e.day_change_pct > 0)) return false;
+      if (sideFilter === 'losers' && !(e.day_change_pct < 0)) return false;
+      if (tickerFilterTokens && !tickerFilterTokens.has(String(e.symbol).toUpperCase())) return false;
+      if (minRecurrence > 1) {
+        const rCount = recurrences.get(e.symbol)?.count ?? 1;
+        if (rCount < minRecurrence) return false;
+      }
+      if (minStreak > 1) {
+        const sLen = Math.abs(e.consecutive_days ?? 0);
+        if (sLen < minStreak) return false;
+      }
       return true;
     });
     const map: Record<string, ReversalEntry[]> = {};
@@ -502,12 +758,23 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
       const d = typeof e.cohort_date === 'string' ? e.cohort_date.slice(0, 10) : new Date(e.cohort_date).toISOString().slice(0, 10);
       (map[d] ??= []).push(e);
     }
-    // Sort entries within each cohort by absolute trigger change (biggest movers first)
+    // Sort entries within each cohort. 'move' = biggest absolute trigger
+    // change first; 'streak' = longest pre-enrollment streak first (ties
+    // broken by absolute move).
     for (const arr of Object.values(map)) {
-      arr.sort((a, b) => Math.abs(b.day_change_pct) - Math.abs(a.day_change_pct));
+      if (sortMode === 'streak') {
+        arr.sort((a, b) => {
+          const sa = Math.abs(a.consecutive_days ?? 0);
+          const sb = Math.abs(b.consecutive_days ?? 0);
+          if (sb !== sa) return sb - sa;
+          return Math.abs(b.day_change_pct) - Math.abs(a.day_change_pct);
+        });
+      } else {
+        arr.sort((a, b) => Math.abs(b.day_change_pct) - Math.abs(a.day_change_pct));
+      }
     }
     return Object.entries(map).sort(([a], [b]) => b.localeCompare(a));
-  }, [entries, sideFilter]);
+  }, [entries, sideFilter, tickerFilterTokens, minRecurrence, recurrences, minStreak, sortMode]);
 
   // All cohort dates present in the currently-displayed matrix (side-filter aware).
   const allCohortDates = useMemo(() => grouped.map(([d]) => d), [grouped]);
@@ -701,6 +968,7 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
         hasNarrowingFilter={hasNarrowingFilter}
       />
       <div className="px-3 py-2 bg-zinc-50 border-b border-zinc-100 flex items-center justify-between gap-4 flex-wrap">
+        <div className="inline-flex items-center gap-3 flex-wrap">
         <div className="inline-flex items-center gap-1 rounded-lg bg-white ring-1 ring-zinc-200 p-0.5">
           {([
             { key: 'all', label: 'All', count: totals.all, dot: 'bg-zinc-400' },
@@ -728,6 +996,81 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
               </span>
             </button>
           ))}
+        </div>
+        <div className="relative inline-flex items-center">
+          <svg className="absolute left-2 w-3 h-3 text-zinc-400 pointer-events-none" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-4.35-4.35M10.5 17a6.5 6.5 0 100-13 6.5 6.5 0 000 13z"/></svg>
+          <input
+            type="text"
+            value={tickerFilter}
+            onChange={(e) => setTickerFilter(e.target.value)}
+            placeholder="Filter tickers: XNDU, MU, AAPL"
+            className="pl-7 pr-7 py-1 rounded-md bg-white ring-1 ring-zinc-200 text-[11px] font-mono w-[220px] focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            title="Comma- or space-separated ticker symbols. Case-insensitive. Empty = show all."
+          />
+          {tickerFilter && (
+            <button
+              type="button"
+              onClick={() => setTickerFilter('')}
+              title="Clear ticker filter"
+              className="absolute right-1.5 text-zinc-400 hover:text-zinc-700 text-xs leading-none"
+            >×</button>
+          )}
+          {tickerFilterTokens && (
+            <span className="ml-2 text-[10px] font-mono text-indigo-600" title={`Matching: ${[...tickerFilterTokens].join(', ')}`}>
+              {tickerFilterTokens.size} filter{tickerFilterTokens.size === 1 ? '' : 's'}
+            </span>
+          )}
+        </div>
+        <div className="inline-flex items-center gap-1 rounded-lg bg-white ring-1 ring-zinc-200 p-0.5" title="Show only recurring tickers (appeared in the matrix across multiple cohort dates)">
+          <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 px-1.5">Recur</span>
+          {([1, 2, 3, 5] as const).map(n => (
+            <button
+              key={n}
+              onClick={() => setMinRecurrence(n)}
+              className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-semibold tracking-wide transition-all ${
+                minRecurrence === n
+                  ? 'bg-purple-600 text-white shadow-sm'
+                  : 'text-zinc-500 hover:text-purple-700'
+              }`}
+              title={n === 1 ? 'Show all tickers (no recurrence filter)' : `Show only tickers that appear at least ${n} times across cohorts`}
+            >
+              {n === 1 ? 'All' : `≥${n}×`}
+            </button>
+          ))}
+        </div>
+        <div className="inline-flex items-center gap-1 rounded-lg bg-white ring-1 ring-zinc-200 p-0.5" title="Show only tickers whose pre-enrollment streak (consecutive days in the same direction) is at least N">
+          <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 px-1.5">Streak</span>
+          {([1, 3, 4, 5] as const).map(n => (
+            <button
+              key={n}
+              onClick={() => setMinStreak(n)}
+              className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-semibold tracking-wide transition-all ${
+                minStreak === n
+                  ? 'bg-amber-600 text-white shadow-sm'
+                  : 'text-zinc-500 hover:text-amber-700'
+              }`}
+              title={n === 1 ? 'Show all tickers (no streak filter)' : `Show only tickers that moved in the same direction for at least ${n} days through enrollment`}
+            >
+              {n === 1 ? 'All' : `≥${n}d`}
+            </button>
+          ))}
+        </div>
+        <div className="inline-flex items-center gap-1 rounded-lg bg-white ring-1 ring-zinc-200 p-0.5" title="Sort within each cohort by biggest move on trigger day OR by longest pre-enrollment streak">
+          <span className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 px-1.5">Sort</span>
+          {(['move', 'streak'] as const).map(m => (
+            <button
+              key={m}
+              onClick={() => setSortMode(m)}
+              className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-semibold tracking-wide transition-all ${
+                sortMode === m
+                  ? 'bg-zinc-900 text-white shadow-sm'
+                  : 'text-zinc-500 hover:text-zinc-800'
+              }`}
+            >
+              {m === 'move' ? 'Move' : 'Streak'}
+            </button>
+          ))}
+        </div>
         </div>
         <div className="text-[9px] text-zinc-400 flex gap-4 flex-wrap">
           {applied ? (
@@ -846,8 +1189,22 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
                         ) : (
                           <span className={`inline-block w-1.5 h-1.5 rounded-full ${entry.direction === 'LONG' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
                         )}
-                        <span>{entry.symbol}</span>
+                        <button
+                          type="button"
+                          onClick={(ev) => {
+                            const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+                            // position popover near the symbol, but clamp inside viewport
+                            const top = Math.min(window.innerHeight - 260, rect.bottom + 4);
+                            const left = Math.min(window.innerWidth - 440, rect.left);
+                            setChartFor({ entry, anchor: { top, left } });
+                          }}
+                          className="font-semibold text-zinc-900 hover:text-indigo-700 hover:underline decoration-dotted underline-offset-2"
+                          title="Open price chart with pre- and post-enrollment bars"
+                        >
+                          {entry.symbol}
+                        </button>
                         {recurrence && recurrence.count >= 2 && <RecurrenceBadge info={recurrence} />}
+                        <StreakBadge entry={entry} />
                         <span className="text-[8px] text-zinc-400 font-normal">
                           {applied
                             ? (scnDirection === 1 ? 'buy' : scnDirection === -1 ? 'short' : 'n/a')
@@ -885,6 +1242,13 @@ function SurveillanceMatrix({ entries, settings, recurrences }: { entries: Rever
           entries={visibleEntries}
           scenarioResults={scenarioResults?.byId ?? null}
           onClose={() => setReportOpen(false)}
+        />
+      )}
+      {chartFor && (
+        <PriceChartPopover
+          entry={chartFor.entry}
+          anchor={chartFor.anchor}
+          onClose={() => setChartFor(null)}
         />
       )}
     </Card>
@@ -1309,6 +1673,33 @@ function ScenarioReportModal({
   // collapses — so the report degenerates to all-zeros. Detect it here and
   // render an empty-state body instead of a misleading 0/0 report.
   const isEmpty = report.totalCohort === 0;
+  const levered = leverage > 1;
+
+  // Drill-down: which tickers sit in each right-now bucket?
+  // In-profit/At-loss derive from latestPnlUsd sign; liquidated is its own
+  // flag (a liquidated position is ALSO counted in at-loss on purpose — the
+  // drill-down mirrors the counter so 4/10 at-loss includes any liquidated).
+  const [expanded, setExpanded] = useState<'inProfit' | 'atLoss' | 'liquidated' | null>(null);
+  const categorized = useMemo(() => {
+    type Row = { entry: ReversalEntry; result: PerTickerResult; latestPrice: number | null };
+    const inProfit: Row[] = [];
+    const atLoss: Row[] = [];
+    const liquidatedArr: Row[] = [];
+    for (const e of entries) {
+      const r = scenarioResults?.get(e.id);
+      if (!r || !r.matches) continue;
+      const pnl = r.latestPnlUsd ?? 0;
+      const latestPrice = r.snapshots.slice().reverse().find((s) => s.price != null)?.price ?? null;
+      const row: Row = { entry: e, result: r, latestPrice };
+      if (r.liquidated) liquidatedArr.push(row);
+      if (pnl > 0) inProfit.push(row);
+      else if (pnl < 0) atLoss.push(row);
+    }
+    inProfit.sort((a, b) => (b.result.latestPnlUsd ?? 0) - (a.result.latestPnlUsd ?? 0));
+    atLoss.sort((a, b) => (a.result.latestPnlUsd ?? 0) - (b.result.latestPnlUsd ?? 0));
+    liquidatedArr.sort((a, b) => (a.result.latestPnlUsd ?? 0) - (b.result.latestPnlUsd ?? 0));
+    return { inProfit, atLoss, liquidated: liquidatedArr };
+  }, [entries, scenarioResults]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 animate-in fade-in" onClick={onClose}>
@@ -1316,9 +1707,23 @@ function ScenarioReportModal({
         <div className="px-6 py-4 border-b border-zinc-100 flex items-center justify-between">
           <div>
             <div className="text-[10px] font-bold uppercase tracking-wider text-indigo-600">Scenario Report</div>
-            <h3 className="text-xl font-bold text-zinc-900">{report.scenarioLabel}</h3>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="text-xl font-bold text-zinc-900">{report.scenarioLabel}</h3>
+              {levered ? (
+                <span
+                  title={`Every ticker's P&L is multiplied by ${leverage}. A 1% price move = ${leverage}% P&L. Downside capped at −100% (liquidation).`}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-rose-100 text-rose-700 text-[10px] font-bold uppercase tracking-wider ring-1 ring-rose-200"
+                >
+                  {leverage}× leverage
+                </span>
+              ) : (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-zinc-100 text-zinc-500 text-[10px] font-semibold uppercase tracking-wider">
+                  no leverage
+                </span>
+              )}
+            </div>
             <p className="text-xs text-zinc-500 mt-0.5">
-              ${investment}/ticker × {leverage}x · As-of: {report.asOfKey ?? 'no data'}
+              ${investment}/ticker{levered ? <> · <span className="font-semibold text-rose-700">×{leverage} leverage applied to P&L</span></> : ''} · As-of: {report.asOfKey ?? 'no data'}
             </p>
           </div>
           <button onClick={onClose} className="text-zinc-400 hover:text-zinc-700 text-2xl leading-none">×</button>
@@ -1365,21 +1770,83 @@ function ScenarioReportModal({
 
           <section>
             <div className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 mb-2">Right-now state</div>
-            <div className="grid grid-cols-2 gap-y-1 text-sm">
-              <span className="text-zinc-500">In profit now</span>
-              <span className="font-mono text-right">{report.inProfitCount} / {report.eligibleCount}</span>
-              <span className="text-zinc-500">At loss now</span>
-              <span className="font-mono text-right">{report.atLossCount} / {report.eligibleCount}</span>
-              <span className="text-zinc-500">Liquidated</span>
-              <span className="font-mono text-right">{report.liquidatedCount} / {report.eligibleCount}</span>
-              <span className="text-zinc-500">Best</span>
-              <span className="font-mono text-right">
-                {report.best ? `${report.best.symbol} ${fmt$(report.best.pnlUsd)} (${fmtPct(report.best.pnlPct)}, ${report.best.daysHeld}d)` : '—'}
-              </span>
-              <span className="text-zinc-500">Worst</span>
-              <span className="font-mono text-right">
-                {report.worst ? `${report.worst.symbol} ${fmt$(report.worst.pnlUsd)} (${fmtPct(report.worst.pnlPct)}, ${report.worst.daysHeld}d)` : '—'}
-              </span>
+            <div className="text-sm divide-y divide-zinc-100">
+              {(['inProfit', 'atLoss', 'liquidated'] as const).map((key) => {
+                const rows = categorized[key];
+                const count = key === 'inProfit' ? report.inProfitCount : key === 'atLoss' ? report.atLossCount : report.liquidatedCount;
+                const label = key === 'inProfit' ? 'In profit now' : key === 'atLoss' ? 'At loss now' : 'Liquidated';
+                const totalTxtColor = key === 'inProfit' ? 'text-emerald-600' : key === 'atLoss' ? 'text-rose-600' : 'text-zinc-900';
+                const isOpen = expanded === key;
+                const disabled = rows.length === 0;
+                return (
+                  <div key={key}>
+                    <button
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => setExpanded(isOpen ? null : key)}
+                      className={`w-full flex items-center justify-between py-1.5 ${disabled ? 'cursor-default text-zinc-400' : 'hover:bg-zinc-50 cursor-pointer'}`}
+                    >
+                      <span className="flex items-center gap-1.5">
+                        <span className={`inline-block transition-transform text-[10px] text-zinc-400 ${isOpen ? 'rotate-90' : ''} ${disabled ? 'opacity-20' : ''}`}>▶</span>
+                        <span className={disabled ? 'text-zinc-400' : 'text-zinc-500'}>{label}</span>
+                      </span>
+                      <span className={`font-mono ${disabled ? 'text-zinc-400' : totalTxtColor}`}>{count} / {report.eligibleCount}</span>
+                    </button>
+                    {isOpen && rows.length > 0 && (
+                      <div className="pb-2 pl-4 pr-1">
+                        <table className="w-full text-[11px] font-mono">
+                          <thead>
+                            <tr className="text-[9px] uppercase tracking-wider text-zinc-400">
+                              <th className="text-left pl-1 py-1">Ticker</th>
+                              <th className="text-center py-1">Side</th>
+                              <th className="text-right py-1">Entry → Latest</th>
+                              <th className="text-right py-1">P&L ({leverage}×)</th>
+                              <th className="text-right py-1">%</th>
+                              <th className="text-right py-1 pr-1">Days</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {rows.map((r) => {
+                              const pnl = r.result.latestPnlUsd ?? 0;
+                              const pnlPct = r.result.latestPnlPct ?? 0;
+                              const color = pnl > 0 ? 'text-emerald-600' : pnl < 0 ? 'text-rose-600' : 'text-zinc-500';
+                              const sideLabel = r.result.direction === 1 ? 'LONG' : r.result.direction === -1 ? 'SHORT' : '—';
+                              const sideColor = r.result.direction === 1 ? 'bg-emerald-50 text-emerald-700' : r.result.direction === -1 ? 'bg-rose-50 text-rose-700' : 'bg-zinc-100 text-zinc-500';
+                              return (
+                                <tr key={r.entry.id} className="border-t border-zinc-100">
+                                  <td className="text-left pl-1 py-1 font-semibold text-zinc-800">
+                                    {r.entry.symbol}
+                                    {r.result.liquidated && <span className="ml-1 text-[9px] bg-zinc-900 text-white px-1 rounded font-bold">LIQ</span>}
+                                  </td>
+                                  <td className="text-center py-1">
+                                    <span className={`inline-block px-1 rounded text-[9px] font-bold ${sideColor}`}>{sideLabel}</span>
+                                  </td>
+                                  <td className="text-right py-1 text-zinc-600">
+                                    ${r.entry.entry_price?.toFixed(2) ?? '—'} → {r.latestPrice != null ? `$${r.latestPrice.toFixed(2)}` : '—'}
+                                  </td>
+                                  <td className={`text-right py-1 font-bold ${color}`}>{fmt$(pnl)}</td>
+                                  <td className={`text-right py-1 ${color}`}>{fmtPct(pnlPct)}</td>
+                                  <td className="text-right py-1 pr-1 text-zinc-500">{r.result.daysHeld}d</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              <div className="grid grid-cols-2 gap-y-1 pt-1">
+                <span className="text-zinc-500">Best</span>
+                <span className="font-mono text-right">
+                  {report.best ? `${report.best.symbol} ${fmt$(report.best.pnlUsd)} (${fmtPct(report.best.pnlPct)}, ${report.best.daysHeld}d)` : '—'}
+                </span>
+                <span className="text-zinc-500">Worst</span>
+                <span className="font-mono text-right">
+                  {report.worst ? `${report.worst.symbol} ${fmt$(report.worst.pnlUsd)} (${fmtPct(report.worst.pnlPct)}, ${report.worst.daysHeld}d)` : '—'}
+                </span>
+              </div>
             </div>
           </section>
 
