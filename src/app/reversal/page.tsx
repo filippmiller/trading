@@ -410,6 +410,7 @@ function PriceChartPopover({ entry, onClose, anchor }: {
   const [bars, setBars] = useState(priceCache.get(entry.symbol) ?? null);
   const [loading, setLoading] = useState(!priceCache.has(entry.symbol));
   const [error, setError] = useState<string | null>(null);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
   useEffect(() => {
     if (bars) return;
@@ -486,20 +487,34 @@ function PriceChartPopover({ entry, onClose, anchor }: {
         {/* y-axis price labels */}
         <text x={4} y={PAD_T + 4} fontSize={9} fill="#71717a" fontFamily="monospace">${yMax.toFixed(2)}</text>
         <text x={4} y={PAD_T + plotH} fontSize={9} fill="#71717a" fontFamily="monospace">${yMin.toFixed(2)}</text>
-        {/* candlesticks */}
+        {/* candlesticks — each bar has a full-height invisible hit-target so hover works even on flat days */}
         {bars.map((b, i) => {
           const isUp = b.close >= b.open;
           const color = isUp ? '#10b981' : '#ef4444';
           const bodyTop = y(Math.max(b.open, b.close));
           const bodyBot = y(Math.min(b.open, b.close));
           const bodyH = Math.max(1, bodyBot - bodyTop);
+          const inStreak = streakStart >= 0 && i >= streakStart && i <= streakEnd;
           return (
-            <g key={b.date}>
+            <g key={b.date} onMouseEnter={() => setHoverIdx(i)} onMouseLeave={() => setHoverIdx(null)} style={{ cursor: 'pointer' }}>
+              <rect x={PAD_L + i * barW} y={PAD_T} width={barW} height={plotH} fill="transparent" />
               <line x1={x(i)} x2={x(i)} y1={y(b.high)} y2={y(b.low)} stroke={color} strokeWidth={1} />
-              <rect x={x(i) - barW * 0.35} y={bodyTop} width={barW * 0.7} height={bodyH} fill={color} />
+              <rect
+                x={x(i) - barW * 0.35}
+                y={bodyTop}
+                width={barW * 0.7}
+                height={bodyH}
+                fill={color}
+                stroke={hoverIdx === i ? '#6366f1' : (inStreak && i === enrollIdx ? '#6366f1' : 'none')}
+                strokeWidth={hoverIdx === i ? 1.5 : 1}
+              />
             </g>
           );
         })}
+        {/* hover marker line */}
+        {hoverIdx !== null && (
+          <line x1={x(hoverIdx)} x2={x(hoverIdx)} y1={PAD_T} y2={PAD_T + plotH} stroke="#6366f1" strokeWidth={0.5} strokeOpacity={0.5} />
+        )}
         {/* first/last/enrollment date labels */}
         <text x={PAD_L} y={HEIGHT - 6} fontSize={8} fill="#71717a" fontFamily="monospace">{bars[0].date.slice(5)}</text>
         <text x={WIDTH - PAD_R} y={HEIGHT - 6} fontSize={8} fill="#71717a" fontFamily="monospace" textAnchor="end">{bars[bars.length - 1].date.slice(5)}</text>
@@ -543,14 +558,74 @@ function PriceChartPopover({ entry, onClose, anchor }: {
         {error && <div className="text-xs text-rose-600 py-4 px-3">Failed to load prices: {error}</div>}
         {!loading && !error && !bars?.length && <div className="text-xs text-zinc-500 py-4 px-3">No historical bars available.</div>}
         {chart}
-        {bars && bars.length > 0 && (
-          <div className="text-[9px] text-zinc-400 mt-1 flex gap-3 flex-wrap">
-            <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3" style={{ backgroundColor: up ? 'rgba(16,185,129,0.12)' : 'rgba(244,63,94,0.12)' }} /> streak band</span>
-            <span className="inline-flex items-center gap-1"><span className="inline-block w-0.5 h-3 bg-indigo-500" /> enrollment day</span>
-            <span className="inline-flex items-center gap-1"><span className="inline-block w-2 h-2 bg-emerald-500" /> close ≥ open</span>
-            <span className="inline-flex items-center gap-1"><span className="inline-block w-2 h-2 bg-rose-500" /> close &lt; open</span>
-          </div>
-        )}
+        {bars && bars.length > 0 && (() => {
+          // Compute streak-aggregate stats for the hover hint row: range, total
+          // move, mean daily change across the streak window. Cheap, runs once
+          // per render, scoped to the visible bars only.
+          const streakStart = enrollIdx >= 0 && streakLen >= 2 ? Math.max(0, enrollIdx - streakLen + 1) : -1;
+          const streakEnd = enrollIdx;
+          const streakBars = streakStart >= 0 ? bars.slice(streakStart, streakEnd + 1) : [];
+          const streakOpen = streakBars[0]?.open ?? null;
+          const streakClose = streakBars[streakBars.length - 1]?.close ?? null;
+          const streakTotalPct = streakOpen != null && streakClose != null && streakOpen > 0
+            ? ((streakClose - streakOpen) / streakOpen) * 100
+            : null;
+          const streakHigh = streakBars.length > 0 ? Math.max(...streakBars.map(b => b.high)) : null;
+          const streakLow = streakBars.length > 0 ? Math.min(...streakBars.map(b => b.low)) : null;
+
+          const hovered = hoverIdx != null ? bars[hoverIdx] : null;
+          const hoveredPrev = hoverIdx != null && hoverIdx > 0 ? bars[hoverIdx - 1] : null;
+          const hoveredChangePct = hovered && hoveredPrev && hoveredPrev.close > 0
+            ? ((hovered.close - hoveredPrev.close) / hoveredPrev.close) * 100
+            : null;
+          const hoveredInStreak = hoverIdx != null && streakStart >= 0 && hoverIdx >= streakStart && hoverIdx <= streakEnd;
+
+          return (
+            <>
+              {/* Hover info row — shows stats of the specific day under the cursor */}
+              <div className="mt-1 font-mono text-[10px] bg-zinc-50 border border-zinc-100 rounded px-2 py-1 min-h-[22px] flex items-center gap-3 flex-wrap">
+                {hovered ? (
+                  <>
+                    <span className="font-semibold text-zinc-800">{hovered.date}</span>
+                    {hoveredInStreak && <span className={`px-1 rounded text-[9px] ${up ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>in streak</span>}
+                    {hoverIdx === enrollIdx && <span className="px-1 rounded text-[9px] bg-indigo-100 text-indigo-700">ENROLLMENT</span>}
+                    <span>O ${hovered.open.toFixed(2)}</span>
+                    <span>H ${hovered.high.toFixed(2)}</span>
+                    <span>L ${hovered.low.toFixed(2)}</span>
+                    <span>C ${hovered.close.toFixed(2)}</span>
+                    {hoveredChangePct != null && (
+                      <span className={hoveredChangePct >= 0 ? 'text-emerald-600 font-bold' : 'text-rose-600 font-bold'}>
+                        {hoveredChangePct >= 0 ? '+' : ''}{hoveredChangePct.toFixed(2)}%
+                      </span>
+                    )}
+                  </>
+                ) : streakBars.length >= 2 ? (
+                  <>
+                    <span className="text-zinc-400">Streak window ({streakBars.length}d):</span>
+                    <span className="text-zinc-700">{streakBars[0].date} → {streakBars[streakBars.length - 1].date}</span>
+                    {streakHigh != null && streakLow != null && (
+                      <span className="text-zinc-500">range ${streakLow.toFixed(2)} – ${streakHigh.toFixed(2)}</span>
+                    )}
+                    {streakTotalPct != null && (
+                      <span className={streakTotalPct >= 0 ? 'text-emerald-600 font-bold' : 'text-rose-600 font-bold'}>
+                        total {streakTotalPct >= 0 ? '+' : ''}{streakTotalPct.toFixed(2)}%
+                      </span>
+                    )}
+                    <span className="text-zinc-400 italic ml-auto">hover a bar for that day's OHLC</span>
+                  </>
+                ) : (
+                  <span className="text-zinc-400 italic">Hover any bar to see that day's OHLC and day-over-day change.</span>
+                )}
+              </div>
+              <div className="text-[9px] text-zinc-400 mt-1 flex gap-3 flex-wrap">
+                <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3" style={{ backgroundColor: up ? 'rgba(16,185,129,0.12)' : 'rgba(244,63,94,0.12)' }} /> streak band</span>
+                <span className="inline-flex items-center gap-1"><span className="inline-block w-0.5 h-3 bg-indigo-500" /> enrollment day</span>
+                <span className="inline-flex items-center gap-1"><span className="inline-block w-2 h-2 bg-emerald-500" /> close ≥ open</span>
+                <span className="inline-flex items-center gap-1"><span className="inline-block w-2 h-2 bg-rose-500" /> close &lt; open</span>
+              </div>
+            </>
+          );
+        })()}
       </div>
     </div>,
     document.body,
