@@ -211,6 +211,7 @@ export default function SettingsPage() {
           type="number"
           step={1}
           min={1}
+          max={10}
           value={defaults.leverage}
           onChange={(event) => updateField("leverage", Number(event.target.value))}
         />

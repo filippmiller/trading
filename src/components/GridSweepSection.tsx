@@ -125,12 +125,30 @@ const PRESETS: Preset[] = [
   },
 ];
 
+/**
+ * Subset of a Grid Sweep row that maps onto the parent /research form's
+ * Trade.exit state. `entryDelayDays`, `entryBar`, `exitBar` are Grid-only
+ * axes — the single-run form does not expose them, so they are not
+ * transferred. `breakevenAtPct` maps to `trailingActivateAtPct` as the
+ * closest-equivalent semantic (both gate when a trailing stop arms).
+ */
+export type ApplyGridRow = {
+  holdDays: number;
+  hardStopPct: number | null;
+  takeProfitPct: number | null;
+  trailingStopPct: number | null;
+  breakevenAtPct: number | null;
+};
+
 type Props = {
   filters: Filters;
   investmentUsd: number;
   leverage: number;
   tradeDirection: "LONG" | "SHORT";
   costs: { commissionRoundTrip: number; marginApyPct: number };
+  /** When provided, each result row renders an "Apply" button that ports
+   *  the row's exit params onto the parent form and scrolls to it. */
+  onApplyToForm?: (row: ApplyGridRow) => void;
 };
 
 export function GridSweepSection(props: Props) {
@@ -139,6 +157,10 @@ export function GridSweepSection(props: Props) {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<GridResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Index of the last-applied row — used to show a brief "Applied" badge so
+  // the user knows the click registered (since the single-run form lives
+  // above this component and the apply scrolls up).
+  const [appliedIdx, setAppliedIdx] = useState<number | null>(null);
 
   const run = async () => {
     setLoading(true);
@@ -278,6 +300,7 @@ export function GridSweepSection(props: Props) {
                   <th className="px-2 py-2 text-right">Worst %</th>
                   <th className="px-2 py-2 text-right">PF</th>
                   <th className="px-2 py-2 text-right">Sharpe</th>
+                  {props.onApplyToForm && <th className="px-2 py-2 text-center">Apply</th>}
                 </tr>
               </thead>
               <tbody>
@@ -306,6 +329,38 @@ export function GridSweepSection(props: Props) {
                     <td className="px-2 py-1.5 text-right font-mono text-rose-600">{r.worstPct.toFixed(0)}%</td>
                     <td className="px-2 py-1.5 text-right font-mono">{isFinite(r.profitFactor) ? r.profitFactor.toFixed(2) : "∞"}</td>
                     <td className="px-2 py-1.5 text-right font-mono">{r.sharpeRatio.toFixed(2)}</td>
+                    {props.onApplyToForm && (
+                      <td className="px-2 py-1.5 text-center">
+                        {appliedIdx === i ? (
+                          <span className="inline-block rounded bg-emerald-100 text-emerald-700 text-[10px] font-bold px-2 py-0.5">
+                            Applied ✓
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              props.onApplyToForm?.({
+                                holdDays: r.holdDays,
+                                hardStopPct: r.hardStopPct,
+                                takeProfitPct: r.takeProfitPct,
+                                trailingStopPct: r.trailingStopPct,
+                                breakevenAtPct: r.breakevenAtPct,
+                              });
+                              setAppliedIdx(i);
+                              // Clear the "Applied ✓" badge after 2.5s so
+                              // it reverts to a button and the row can be
+                              // re-applied if the user edits the form and
+                              // wants to pull these params back.
+                              window.setTimeout(() => setAppliedIdx((cur) => (cur === i ? null : cur)), 2500);
+                            }}
+                            className="rounded-md bg-violet-600 text-white text-[10px] font-bold px-2 py-1 hover:bg-violet-700"
+                            title="Copy this row's exit params (hold / SL / TP / Trail / BE→activate) onto the form above and scroll to it"
+                          >
+                            Apply
+                          </button>
+                        )}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
