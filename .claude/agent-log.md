@@ -9,6 +9,40 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-22 13:50] — Codex 2nd-pass: cache + encoding + tsc errata
+
+**Area:** Trading/Matrix, Trading/Verification, Trading/Docs
+**Type:** fix + errata
+
+Codex reviewed the 2026-04-22 session output and surfaced three findings. All three are fair — addressing here.
+
+### Errata (Must) — false "tsc clean" claim in PR #32 entry
+The `## [2026-04-22 13:30]` log entry for PR #32 / commit `cab7905` claims `npx tsc --noEmit: clean`. That was wrong at that checkpoint: `src/lib/paper-exits.test.ts` used the regex `/s` (dotAll) flag, which requires ES2018+, while `tsconfig.json:2` targets ES2017. TSC emits `TS1501` on that. I missed it because my verification command was `tail -10` of tsc output, which truncated the error, and I did not check the exit code. The error actually surfaced only in PR #33 when I re-ran tsc after adding more tests — I fixed it in commit `02034c8` by replacing `.*` + `/s` with `[\s\S]*`.
+
+Per this log's immutable-entry policy I do not rewrite the old entry. This entry is the official correction. Process discipline for future sessions: always check `tsc_exit=$?`, never trust `tail -N` output.
+
+### Should fix — PriceChartPopover cached empty responses
+Codex caught that `priceCache.set(entry.symbol, items)` ran unconditionally, so an empty response (e.g. popover opened seconds before the TREND auto-backfill from PR #29 actually populated `prices_daily`) would stick as `[]` until a full page reload. Worse, the RTL test that "verified" cache reuse implicitly locked that regression in. Both fixed on branch `fix/codex-critique-tsc-cache-encoding`:
+- Component now only caches non-empty results; reads use `hasMeaningfulCache` check.
+- New test `does NOT cache empty responses — re-opens the popover triggers a fresh fetch` proves empty → refetch.
+
+### Should fix — BRK.B encoding test was a no-op
+`encodeURIComponent("BRK.B")` returns `"BRK.B"` unchanged, so the test would pass even if the encoding were removed. Replaced with `"AT&T"` (encodes to `"AT%26T"`) — the one case where missing encoding would actively break the URL (the raw `&` would terminate the `symbol` param). Assertions now check both the encoded form is present AND the raw form is absent.
+
+### Files Changed
+- `src/components/charts/PriceChartPopover.tsx` — cache guard + explanatory comments
+- `src/components/charts/PriceChartPopover.test.tsx` — new empty-cache test; rewrote encoding test
+- `.claude/agent-log.md` — this entry
+
+### Verification (done with exit-code discipline this time)
+```
+npx tsc --noEmit; echo "tsc_exit=$?"
+tsc_exit=0
+npm test → 69/69 passed
+```
+
+---
+
 ## [2026-04-22 13:45] — Finding #3 (HIGH/MEDIUM): auto-exit slippage parity
 
 **Area:** Trading/Paper

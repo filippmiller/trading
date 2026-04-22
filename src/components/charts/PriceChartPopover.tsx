@@ -35,8 +35,16 @@ export type PriceChartPopoverProps = {
 };
 
 export function PriceChartPopover({ entry, onClose, anchor }: PriceChartPopoverProps) {
-  const [bars, setBars] = useState<Bar[] | null>(priceCache.get(entry.symbol) ?? null);
-  const [loading, setLoading] = useState(!priceCache.has(entry.symbol));
+  // Cache only retains MEANINGFUL (non-empty) responses. An empty array from
+  // /api/prices usually means prices_daily has not been backfilled yet for
+  // this symbol (TREND-enrolled symbols only get their bars ~400ms after the
+  // scan inserts them — see surveillance-cron.ts). Caching `[]` would make
+  // that transient emptiness stick across re-opens until a full page reload
+  // — a pretty sharp UX pothole surfaced in Codex's second pass on PR #31.
+  const cachedBars = priceCache.get(entry.symbol);
+  const hasMeaningfulCache = cachedBars !== undefined && cachedBars.length > 0;
+  const [bars, setBars] = useState<Bar[] | null>(hasMeaningfulCache ? cachedBars : null);
+  const [loading, setLoading] = useState(!hasMeaningfulCache);
   const [error, setError] = useState<string | null>(null);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
@@ -51,7 +59,11 @@ export function PriceChartPopover({ entry, onClose, anchor }: PriceChartPopoverP
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((j) => {
         const items: Bar[] = Array.isArray(j.items) ? j.items : [];
-        priceCache.set(entry.symbol, items);
+        // Only cache non-empty results. See comment above on why an empty
+        // response is assumed transient.
+        if (items.length > 0) {
+          priceCache.set(entry.symbol, items);
+        }
         setBars(items);
       })
       .catch((e) => setError(String((e as Error).message ?? e)))

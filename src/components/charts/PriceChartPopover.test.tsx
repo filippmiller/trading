@@ -167,13 +167,46 @@ describe("PriceChartPopover", () => {
 
     render(<PriceChartPopover entry={entry({ symbol: "AAPL" })} onClose={noop} anchor={anchor} />);
     expect(screen.getByTestId("price-chart-svg")).toBeInTheDocument();
-    expect(fetchFn).toHaveBeenCalledTimes(1); // still one — cached
+    expect(fetchFn).toHaveBeenCalledTimes(1); // still one — non-empty response cached
   });
 
-  it("encodes the symbol in the API URL (guards against trailing whitespace / special chars)", () => {
+  it("does NOT cache empty responses — re-opens the popover triggers a fresh fetch", async () => {
+    // Codex 2nd-pass regression: caching `[]` made transient empty responses
+    // (e.g. TREND enrollment opened seconds before backfill landed) stick
+    // until a full page reload. The component must forget an empty result
+    // so a subsequent open re-queries /api/prices.
     const fetchFn = mockFetch({ items: [] });
-    render(<PriceChartPopover entry={entry({ symbol: "BRK.B" })} onClose={noop} anchor={anchor} />);
-    expect(fetchFn).toHaveBeenCalledWith(expect.stringContaining("symbol=BRK.B"));
-    expect(fetchFn).toHaveBeenCalledWith(expect.stringContaining("limit=90"));
+
+    const { unmount } = render(<PriceChartPopover entry={entry({ symbol: "NEWLY" })} onClose={noop} anchor={anchor} />);
+    await waitFor(() => expect(screen.getByText(/No historical bars/i)).toBeInTheDocument());
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+
+    unmount();
+
+    // Second mount: same symbol, different result this time (backfill arrived)
+    const bars = [makeBar("2026-04-15", 101)];
+    fetchFn.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ items: bars }),
+    } as Response);
+
+    render(<PriceChartPopover entry={entry({ symbol: "NEWLY" })} onClose={noop} anchor={anchor} />);
+    await waitFor(() => expect(screen.getByTestId("price-chart-svg")).toBeInTheDocument());
+    expect(fetchFn).toHaveBeenCalledTimes(2); // empty was NOT cached → refetched
+  });
+
+  it("percent-encodes special chars in the symbol (prevents URL-param injection)", () => {
+    // encodeURIComponent("AT&T") → "AT%26T". Without encoding, the raw `&`
+    // would terminate the `symbol` query param and `T&limit=90` would parse
+    // as a second param — the API would see an empty symbol. Codex 2nd-pass
+    // caught that the previous test used "BRK.B", which encodeURIComponent
+    // leaves unchanged, so the test passed even without encoding.
+    const fetchFn = mockFetch({ items: [] });
+    render(<PriceChartPopover entry={entry({ symbol: "AT&T" })} onClose={noop} anchor={anchor} />);
+    const url = fetchFn.mock.calls[0][0] as string;
+    expect(url).toContain("symbol=AT%26T");
+    expect(url).not.toContain("symbol=AT&T");
+    expect(url).toContain("limit=90");
   });
 });
