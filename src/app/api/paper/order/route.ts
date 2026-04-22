@@ -80,6 +80,13 @@ type PoolType = Awaited<ReturnType<typeof getPool>>;
  * until it commits. This flips the replay from returning stale `PENDING`
  * to returning the final post-fill state (usually `FILLED` for MARKET).
  *
+ * Hotfix 2026-04-22 (Bug #2): scoped by `accountId`. Without this, a
+ * post-1062 re-SELECT on `client_request_id` alone could fetch a row
+ * belonging to ANOTHER account (the pre-check + composite-index migration
+ * above closes the insert-time leak, but the re-SELECT's WHERE clause
+ * must also scope by account or it re-opens the gap when the caller's
+ * id collides with a different account's legacy row).
+ *
  * Residual race window (~milliseconds): if the replay's FOR UPDATE SELECT
  * runs BEFORE the original request has begun fillOrder's transaction
  * (i.e. after INSERT but before `conn.beginTransaction()` inside
@@ -90,14 +97,15 @@ type PoolType = Awaited<ReturnType<typeof getPool>>;
  */
 async function buildIdempotentResponse(
   pool: PoolType,
-  orderId: number
+  orderId: number,
+  accountId: number
 ) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
     const [rows] = await conn.execute<mysql.RowDataPacket[]>(
-      "SELECT status, filled_price, rejection_reason, trade_id FROM paper_orders WHERE id = ? FOR UPDATE",
-      [orderId]
+      "SELECT status, filled_price, rejection_reason, trade_id FROM paper_orders WHERE id = ? AND account_id = ? FOR UPDATE",
+      [orderId, accountId]
     );
     await conn.commit();
     if (rows.length === 0) {
@@ -180,10 +188,13 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "order_type must be MARKET, LIMIT, or STOP" }, { status: 400 });
     }
 
-    // W5 idempotency — if the client provided an id, validate it and check
-    // up-front for a prior row. Early return avoids any side-effects (no
-    // price fetch, no reservation, no insert) on replays. The UNIQUE index
-    // at the DB layer is the final line of defense against races.
+    // W5 idempotency — validate shape up-front so a malformed client
+    // request fails fast (before any DB work). The actual dedup lookup
+    // runs AFTER resolveAccount because the pre-check must be scoped by
+    // account — see the AND account_id = ? lookup below. Hotfix 2026-04-22
+    // (Bug #2): the previous implementation ran this SELECT before we
+    // knew which account the caller meant, so Alice's id on account #1
+    // would satisfy Bob's pre-check on account #2 → Bob saw Alice's row.
     let clientRequestId: string | null = null;
     if (client_request_id != null) {
       if (typeof client_request_id !== "string" || !CLIENT_REQUEST_ID_RE.test(client_request_id)) {
@@ -192,14 +203,6 @@ export async function POST(req: Request) {
         }, { status: 400 });
       }
       clientRequestId = client_request_id;
-      const pool = await getPool();
-      const [existing] = await pool.execute<mysql.RowDataPacket[]>(
-        "SELECT id FROM paper_orders WHERE client_request_id = ? LIMIT 1",
-        [clientRequestId]
-      );
-      if (existing.length > 0) {
-        return buildIdempotentResponse(pool, Number(existing[0].id));
-      }
     }
 
     // Classify the action via (side, position_side).
@@ -233,6 +236,22 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: "Account not found" }, { status: 404 });
       }
       throw err;
+    }
+
+    // Hotfix 2026-04-22 (Bug #2) — account-scoped idempotency pre-check.
+    // Must run AFTER resolveAccount so we have `account.id` to scope by.
+    // Returning early here avoids any side-effects (price fetch, reservation,
+    // insert) on genuine replays. The composite UNIQUE index
+    // (account_id, client_request_id) is the final line of defense against
+    // TOCTOU races between this SELECT and the INSERT below.
+    if (clientRequestId != null) {
+      const [existing] = await pool.execute<mysql.RowDataPacket[]>(
+        "SELECT id FROM paper_orders WHERE account_id = ? AND client_request_id = ? LIMIT 1",
+        [account.id, clientRequestId]
+      );
+      if (existing.length > 0) {
+        return buildIdempotentResponse(pool, Number(existing[0].id), account.id);
+      }
     }
 
     // For MARKET close: verify an open position of the correct side exists
@@ -317,14 +336,19 @@ export async function POST(req: Request) {
       );
       orderId = result.insertId;
     } catch (err: unknown) {
-      // errno 1062 = UNIQUE constraint violation on client_request_id (race
-      // between our pre-check and the INSERT). Return the winning row.
+      // errno 1062 = UNIQUE constraint violation on (account_id,
+      // client_request_id) — a TOCTOU race between our pre-check and the
+      // INSERT. Return the winning row. Hotfix 2026-04-22 (Bug #2):
+      // the re-SELECT MUST scope by account_id too; without it a 1062
+      // triggered by a composite collision with a DIFFERENT account's
+      // row (shouldn't happen under the composite index, but defense in
+      // depth) would return that foreign row.
       if ((err as { errno?: number }).errno === 1062 && clientRequestId) {
         const [existing] = await pool.execute<mysql.RowDataPacket[]>(
-          "SELECT id FROM paper_orders WHERE client_request_id = ? LIMIT 1",
-          [clientRequestId]
+          "SELECT id FROM paper_orders WHERE account_id = ? AND client_request_id = ? LIMIT 1",
+          [account.id, clientRequestId]
         );
-        if (existing.length > 0) return buildIdempotentResponse(pool, Number(existing[0].id));
+        if (existing.length > 0) return buildIdempotentResponse(pool, Number(existing[0].id), account.id);
       }
       throw err;
     }

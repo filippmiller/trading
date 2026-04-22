@@ -482,20 +482,44 @@ async function runSchemaMigrations() {
   //    POST /api/paper/order that carries the same id twice is a no-op — the
   //    second call returns the existing row instead of inserting a duplicate.
   //    Protects the engine from the "Buy button mashed twice" footgun.
-  // 2. UNIQUE INDEX on (client_request_id): enforces dedup at DB layer via
-  //    errno 1062. MySQL InnoDB allows multiple NULLs in a UNIQUE index, so
-  //    rows without an id stay unconstrained.
+  // 2. COMPOSITE UNIQUE INDEX on (account_id, client_request_id): enforces
+  //    dedup SCOPED per account. Hotfix 2026-04-22 fix — the original W5
+  //    index was on client_request_id alone, which leaked across accounts
+  //    (Bob's POST on account #2 with the same id as Alice's on account #1
+  //    returned Alice's order row). InnoDB still allows multiple NULLs in
+  //    a UNIQUE index, so rows without an id stay unconstrained.
   await ensureColumn("paper_orders", "client_request_id", "VARCHAR(64) NULL");
-  const [ridxRows] = await pool.execute<mysql.RowDataPacket[]>(
+
+  // Drop the legacy global index if a pre-hotfix DB has it. Idempotent —
+  // skip when absent so re-running ensureSchema stays a no-op.
+  const [oldIdxRows] = await pool.execute<mysql.RowDataPacket[]>(
     `SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS
       WHERE TABLE_SCHEMA = DATABASE()
         AND TABLE_NAME   = 'paper_orders'
         AND INDEX_NAME   = 'idx_paper_orders_client_request_id'`
   );
-  if ((ridxRows as IndexRow[]).length === 0) {
+  if ((oldIdxRows as IndexRow[]).length > 0) {
     try {
-      await pool.execute("ALTER TABLE paper_orders ADD UNIQUE INDEX idx_paper_orders_client_request_id (client_request_id)");
+      await pool.execute("ALTER TABLE paper_orders DROP INDEX idx_paper_orders_client_request_id");
     } catch (err: unknown) {
+      // errno 1091 = index doesn't exist (race with parallel deploy). Swallow.
+      if ((err as { errno?: number }).errno !== 1091) throw err;
+    }
+  }
+
+  // Add the composite (account_id, client_request_id) unique index. Gate
+  // on INFORMATION_SCHEMA to stay idempotent on re-run.
+  const [newIdxRows] = await pool.execute<mysql.RowDataPacket[]>(
+    `SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME   = 'paper_orders'
+        AND INDEX_NAME   = 'idx_paper_orders_acct_crid'`
+  );
+  if ((newIdxRows as IndexRow[]).length === 0) {
+    try {
+      await pool.execute("ALTER TABLE paper_orders ADD UNIQUE INDEX idx_paper_orders_acct_crid (account_id, client_request_id)");
+    } catch (err: unknown) {
+      // errno 1061 = duplicate key name (race with parallel deploy).
       if ((err as { errno?: number }).errno !== 1061) throw err;
     }
   }

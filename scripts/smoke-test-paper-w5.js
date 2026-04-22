@@ -83,12 +83,34 @@ async function ensureSchemaMinimal() {
       throw new Error(`Schema check failed: ${table}.${col} missing. Apply scripts/migration-2026-04-21-paper-w5.sql first.`);
     }
   }
-  // Verify UNIQUE index on client_request_id
+  // Verify COMPOSITE UNIQUE index on (account_id, client_request_id).
+  // Hotfix 2026-04-22 (Bug #2): the old global index
+  // idx_paper_orders_client_request_id was replaced by the composite
+  // idx_paper_orders_acct_crid to prevent cross-account id collisions.
   const [idxRows] = await pool.execute(
-    "SELECT INDEX_NAME, NON_UNIQUE FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'paper_orders' AND INDEX_NAME = 'idx_paper_orders_client_request_id'"
+    `SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SEQ_IN_INDEX
+       FROM INFORMATION_SCHEMA.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'paper_orders'
+        AND INDEX_NAME = 'idx_paper_orders_acct_crid'
+      ORDER BY SEQ_IN_INDEX`
   );
-  if (idxRows.length === 0) throw new Error("UNIQUE INDEX idx_paper_orders_client_request_id missing");
-  if (Number(idxRows[0].NON_UNIQUE) !== 0) throw new Error("idx_paper_orders_client_request_id exists but is NOT unique");
+  if (idxRows.length !== 2) {
+    throw new Error("Composite UNIQUE INDEX idx_paper_orders_acct_crid missing or malformed. Apply scripts/migration-2026-04-22-paper-hotfix-account-idempotency.sql first.");
+  }
+  if (Number(idxRows[0].NON_UNIQUE) !== 0) throw new Error("idx_paper_orders_acct_crid exists but is NOT unique");
+  if (String(idxRows[0].COLUMN_NAME) !== "account_id" || String(idxRows[1].COLUMN_NAME) !== "client_request_id") {
+    throw new Error(`idx_paper_orders_acct_crid columns unexpected: ${idxRows.map(r => r.COLUMN_NAME).join(",")}`);
+  }
+
+  // Also ensure the OLD global index is gone so a half-applied migration
+  // can't let cross-account leaks sneak back in.
+  const [oldIdxRows] = await pool.execute(
+    "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'paper_orders' AND INDEX_NAME = 'idx_paper_orders_client_request_id'"
+  );
+  if (oldIdxRows.length > 0) {
+    throw new Error("Legacy global UNIQUE INDEX idx_paper_orders_client_request_id still present. Apply scripts/migration-2026-04-22-paper-hotfix-account-idempotency.sql to drop it.");
+  }
 }
 
 async function upsertAccount(name, initialCash) {
@@ -112,7 +134,13 @@ async function upsertAccount(name, initialCash) {
 }
 
 async function teardown() {
-  for (const name of [TEST_ACCOUNT_DEFAULT, TEST_ACCOUNT_ALT1, "W5_SMOKE_NEW_1", "W5_SMOKE_NEW_2"]) {
+  for (const name of [
+    TEST_ACCOUNT_DEFAULT, TEST_ACCOUNT_ALT1,
+    "W5_SMOKE_NEW_1", "W5_SMOKE_NEW_2",
+    // Hotfix 2026-04-22 test accounts (Test 12/13).
+    "W5_SMOKE_ALPHA_ISO", "W5_SMOKE_BETA_ISO",
+    "W5_SMOKE_RESET_TX", "W5_SMOKE_RESET_EMPTY",
+  ]) {
     const [rows] = await pool.execute("SELECT id FROM paper_accounts WHERE name = ?", [name]);
     for (const row of rows) {
       try {
@@ -495,6 +523,222 @@ async function test11_idempotentReplayConsistency(defaultId) {
   }
 }
 
+// ── Test 12: Cross-account idempotency isolation (Hotfix Bug #2) ─────────
+// Pre-hotfix: the UNIQUE index was on client_request_id ALONE. Submitting
+// the same id from two different accounts returned the FIRST account's row
+// on the second POST — cross-account data leak + the second caller's order
+// was silently deduped away.
+//
+// Post-hotfix: the composite (account_id, client_request_id) index + the
+// account-scoped pre-check make the same id on different accounts two
+// DISTINCT keys. Alpha's order and Beta's order both land, both get their
+// own order_id, and each is correctly attributed.
+async function test12_crossAccountIdempotencyIsolation() {
+  console.log("\nTest 12: Cross-account idempotency — same client_request_id on 2 accounts → 2 distinct orders");
+  if (!(await isDevServerUp())) {
+    console.log("  SKIP (dev server not up at " + HTTP_BASE + ")");
+    return;
+  }
+
+  // Create two fresh test accounts (dedicated names — don't touch real Default).
+  const alphaId = await upsertAccount("W5_SMOKE_ALPHA_ISO", 100000);
+  const betaId  = await upsertAccount("W5_SMOKE_BETA_ISO",  100000);
+
+  const sharedCrid = "smoke-w5-iso-" + Date.now();
+  // Distinct symbols prove Beta's request was actually PROCESSED, not
+  // silently deduped into Alpha's row.
+  const alphaBody = {
+    symbol: "AAPL",
+    side: "BUY",
+    order_type: "LIMIT",
+    investment_usd: 500,
+    limit_price: 1.00,
+    client_request_id: sharedCrid,
+  };
+  const betaBody = {
+    symbol: "MSFT",
+    side: "BUY",
+    order_type: "LIMIT",
+    investment_usd: 500,
+    limit_price: 1.00,
+    client_request_id: sharedCrid,
+  };
+
+  const alphaResp = await httpJson("POST", "/api/paper/order?account_id=" + alphaId, alphaBody);
+  const betaResp  = await httpJson("POST", "/api/paper/order?account_id=" + betaId,  betaBody);
+
+  assert(alphaResp.status === 200,
+    `Alpha POST → 200 (got ${alphaResp.status}, body=${JSON.stringify(alphaResp.json)})`);
+  assert(betaResp.status === 200,
+    `Beta POST → 200 (got ${betaResp.status}, body=${JSON.stringify(betaResp.json)})`);
+
+  const alphaOrderId = alphaResp.json && alphaResp.json.order_id;
+  const betaOrderId  = betaResp.json  && betaResp.json.order_id;
+
+  assert(typeof alphaOrderId === "number" && alphaOrderId > 0,
+    `Alpha got a real order_id (got ${alphaOrderId})`);
+  assert(typeof betaOrderId === "number" && betaOrderId > 0,
+    `Beta got a real order_id (got ${betaOrderId})`);
+  assert(alphaOrderId !== betaOrderId,
+    `Alpha and Beta got DIFFERENT order_ids (no cross-account leak: alpha=${alphaOrderId}, beta=${betaOrderId})`);
+  assert(betaResp.json.idempotent_replay !== true,
+    `Beta POST was NOT a dedup replay (proves Beta's request was processed)`);
+
+  // Verify account attribution at the DB layer.
+  const [alphaRows] = await pool.execute(
+    "SELECT id, account_id, symbol, client_request_id FROM paper_orders WHERE id = ?",
+    [alphaOrderId]
+  );
+  const [betaRows] = await pool.execute(
+    "SELECT id, account_id, symbol, client_request_id FROM paper_orders WHERE id = ?",
+    [betaOrderId]
+  );
+  assert(alphaRows.length === 1 && Number(alphaRows[0].account_id) === Number(alphaId),
+    `Alpha order.account_id = ${alphaId} (got ${alphaRows[0] && alphaRows[0].account_id})`);
+  assert(betaRows.length === 1 && Number(betaRows[0].account_id) === Number(betaId),
+    `Beta order.account_id = ${betaId} (got ${betaRows[0] && betaRows[0].account_id})`);
+  assert(String(alphaRows[0].symbol) !== String(betaRows[0].symbol),
+    `Orders have distinct symbols (alpha='${alphaRows[0].symbol}', beta='${betaRows[0].symbol}') — proves Beta was NOT deduped into Alpha`);
+  assert(String(alphaRows[0].client_request_id) === sharedCrid &&
+         String(betaRows[0].client_request_id) === sharedCrid,
+    `Both rows carry the shared client_request_id ('${sharedCrid}')`);
+
+  // Now verify idempotency STILL works WITHIN the same account. Replay
+  // Alpha's POST with the same id — must return Alpha's existing row.
+  const alphaReplay = await httpJson("POST", "/api/paper/order?account_id=" + alphaId, alphaBody);
+  assert(alphaReplay.status === 200, `Alpha replay → 200`);
+  assert(alphaReplay.json && alphaReplay.json.order_id === alphaOrderId,
+    `Alpha replay returns the SAME order_id (within-account dedup still works: ${alphaReplay.json && alphaReplay.json.order_id} vs ${alphaOrderId})`);
+  assert(alphaReplay.json.idempotent_replay === true,
+    `Alpha replay flagged idempotent_replay=true`);
+
+  // Clean up the two LIMIT orders (teardown below also wipes the accounts).
+  await httpJson("DELETE", "/api/paper/order?id=" + alphaOrderId);
+  await httpJson("DELETE", "/api/paper/order?id=" + betaOrderId);
+}
+
+// ── Test 13: Reset atomicity (Hotfix Bug #4) ─────────────────────────────
+// Verifies the POST /api/paper/account reset path runs its 3 DELETEs + UPDATE
+// inside a single transaction. Two assertions:
+//   (a) Happy path on an account WITH trades: all 4 operations must have
+//       landed (full clear + cash restoration).
+//   (b) Happy path on an account with NO trades: reset must still succeed
+//       (the DELETEs are no-ops but the UPDATE must still fire).
+// A full mid-failure simulation requires injecting an SQL fault — out of
+// scope for a smoke test. The observable guarantee is all-or-nothing;
+// here we assert "all" lands when there's nothing to fail.
+async function test13_resetAtomicity() {
+  console.log("\nTest 13: Reset atomicity — all 4 ops land (or none would) via single transaction");
+  if (!(await isDevServerUp())) {
+    console.log("  SKIP (dev server not up at " + HTTP_BASE + ")");
+    return;
+  }
+
+  // (a) Account with trades + orders + snapshots + a stale reservation.
+  const acctId = await upsertAccount("W5_SMOKE_RESET_TX", 100000);
+
+  // Seed: a filled trade, a pending order with reservation, an equity snapshot.
+  await pool.execute(
+    `INSERT INTO paper_trades (account_id, symbol, side, quantity, buy_price, buy_date, investment_usd, status)
+     VALUES (?, 'AAPL', 'LONG', 10, 150, CURDATE(), 1500, 'OPEN')`, [acctId]
+  );
+  await pool.execute(
+    `INSERT INTO paper_orders (account_id, symbol, side, position_side, order_type, investment_usd, status, reserved_amount)
+     VALUES (?, 'MSFT', 'BUY', 'LONG', 'LIMIT', 500, 'PENDING', 500)`, [acctId]
+  );
+  await pool.execute(
+    "UPDATE paper_accounts SET reserved_cash = 500 WHERE id = ?", [acctId]
+  );
+  await pool.execute(
+    `INSERT INTO paper_equity_snapshots (account_id, equity, cash, positions_value, snapshot_at)
+     VALUES (?, 100500, 99500, 1000, CURRENT_TIMESTAMP(6))`, [acctId]
+  );
+
+  // Snapshot pre-state.
+  const [[ordBefore]] = await pool.execute("SELECT COUNT(*) AS c FROM paper_orders WHERE account_id = ?", [acctId]);
+  const [[trdBefore]] = await pool.execute("SELECT COUNT(*) AS c FROM paper_trades WHERE account_id = ?", [acctId]);
+  const [[snpBefore]] = await pool.execute("SELECT COUNT(*) AS c FROM paper_equity_snapshots WHERE account_id = ?", [acctId]);
+  const [[acctBefore]] = await pool.execute("SELECT cash, reserved_cash, reserved_short_margin FROM paper_accounts WHERE id = ?", [acctId]);
+  assert(Number(ordBefore.c) > 0 && Number(trdBefore.c) > 0 && Number(snpBefore.c) > 0,
+    `seeded rows present (orders=${ordBefore.c}, trades=${trdBefore.c}, snapshots=${snpBefore.c})`);
+  assert(Number(acctBefore.reserved_cash) > 0, `seeded reserved_cash > 0 (got ${acctBefore.reserved_cash})`);
+
+  // Invoke the reset endpoint.
+  const resetResp = await httpJson("POST", "/api/paper/account?account_id=" + acctId, {});
+  assert(resetResp.status === 200, `reset POST → 200 (got ${resetResp.status})`);
+  assert(resetResp.json && resetResp.json.success === true, `reset body success=true`);
+
+  // Post-state: all 4 ops landed.
+  const [[ordAfter]] = await pool.execute("SELECT COUNT(*) AS c FROM paper_orders WHERE account_id = ?", [acctId]);
+  const [[trdAfter]] = await pool.execute("SELECT COUNT(*) AS c FROM paper_trades WHERE account_id = ?", [acctId]);
+  const [[snpAfter]] = await pool.execute("SELECT COUNT(*) AS c FROM paper_equity_snapshots WHERE account_id = ?", [acctId]);
+  const [[acctAfter]] = await pool.execute("SELECT cash, initial_cash, reserved_cash, reserved_short_margin FROM paper_accounts WHERE id = ?", [acctId]);
+  assert(Number(ordAfter.c) === 0, `paper_orders deleted (got ${ordAfter.c})`);
+  assert(Number(trdAfter.c) === 0, `paper_trades deleted (got ${trdAfter.c})`);
+  assert(Number(snpAfter.c) === 0, `paper_equity_snapshots deleted (got ${snpAfter.c})`);
+  assert(Number(acctAfter.cash) === Number(acctAfter.initial_cash), `cash = initial_cash (got ${acctAfter.cash}/${acctAfter.initial_cash})`);
+  assert(Number(acctAfter.reserved_cash) === 0, `reserved_cash cleared (got ${acctAfter.reserved_cash})`);
+  assert(Number(acctAfter.reserved_short_margin) === 0, `reserved_short_margin cleared (got ${acctAfter.reserved_short_margin})`);
+
+  // (b) Account with NO trades — reset must still succeed (UPDATE-only happy path).
+  const emptyId = await upsertAccount("W5_SMOKE_RESET_EMPTY", 25000);
+  const emptyResp = await httpJson("POST", "/api/paper/account?account_id=" + emptyId, {});
+  assert(emptyResp.status === 200, `reset on empty account → 200 (got ${emptyResp.status})`);
+  const [[emptyAfter]] = await pool.execute("SELECT cash, initial_cash FROM paper_accounts WHERE id = ?", [emptyId]);
+  assert(Number(emptyAfter.cash) === Number(emptyAfter.initial_cash),
+    `empty account cash still = initial_cash after reset (got ${emptyAfter.cash}/${emptyAfter.initial_cash})`);
+
+  // Cleanup
+  await pool.execute("DELETE FROM paper_accounts WHERE name IN (?, ?)", ["W5_SMOKE_RESET_TX", "W5_SMOKE_RESET_EMPTY"]);
+}
+
+// ── Test 14: Settings PATCH atomicity + round-trip (Hotfix Bug #6) ──────
+// Verifies PATCH /api/paper/settings wraps its batch of app_settings upserts
+// in a transaction, and that a GET immediately after the PATCH sees BOTH
+// new values (atomic visibility + cache-bust).
+async function test14_settingsPatchAtomicity() {
+  console.log("\nTest 14: Settings PATCH atomicity — batch upsert visible at GET");
+  if (!(await isDevServerUp())) {
+    console.log("  SKIP (dev server not up at " + HTTP_BASE + ")");
+    return;
+  }
+
+  // Capture current settings so we can restore them in finally.
+  const before = await httpJson("GET", "/api/paper/settings");
+  assert(before.status === 200, `GET settings baseline → 200 (got ${before.status})`);
+  const original = before.json;
+
+  try {
+    // Pick two fields that are simultaneously writable. Use distinctive-but-
+    // valid values so we can tell real round-trip reads from cached stale.
+    const patchBody = {
+      slippage_bps: 13,
+      commission_per_share: 0.0042,
+    };
+    const patch = await httpJson("PATCH", "/api/paper/settings", patchBody);
+    assert(patch.status === 200, `PATCH → 200 (got ${patch.status}, body=${JSON.stringify(patch.json)})`);
+    assert(patch.json && patch.json.ok === true, `PATCH body ok=true`);
+
+    // GET immediately — must see BOTH new values (proves atomic commit +
+    // cache invalidation). If the PATCH were non-transactional and one of
+    // the two upserts had failed, we'd see a hybrid config.
+    const after = await httpJson("GET", "/api/paper/settings");
+    assert(after.status === 200, `GET after PATCH → 200`);
+    assert(after.json && Number(after.json.slippage_bps) === 13,
+      `slippage_bps updated (got ${after.json && after.json.slippage_bps})`);
+    assert(after.json && Math.abs(Number(after.json.commission_per_share) - 0.0042) < 1e-9,
+      `commission_per_share updated (got ${after.json && after.json.commission_per_share})`);
+  } finally {
+    // Restore the original config so we don't leave test values in prod DB.
+    if (original) {
+      await httpJson("PATCH", "/api/paper/settings", {
+        slippage_bps: Number(original.slippage_bps),
+        commission_per_share: Number(original.commission_per_share),
+      });
+    }
+  }
+}
+
 (async () => {
   let defaultId, alt1Id;
   try {
@@ -515,6 +759,9 @@ async function test11_idempotentReplayConsistency(defaultId) {
     await test9_getAccountById(alt1Id);
     await test10_httpAccountNotFound(defaultId);
     await test11_idempotentReplayConsistency(defaultId);
+    await test12_crossAccountIdempotencyIsolation();
+    await test13_resetAtomicity();
+    await test14_settingsPatchAtomicity();
 
     console.log(`\n== SUMMARY: ${passed} passed, ${failed} failed ==`);
     if (failed > 0) {

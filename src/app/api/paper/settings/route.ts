@@ -60,13 +60,33 @@ export async function PATCH(req: Request) {
     if (parsed.data.commission_min_per_leg != null) pairs.push(["risk.commission_min_per_leg", String(parsed.data.commission_min_per_leg)]);
     if (parsed.data.allow_fractional_shares != null) pairs.push(["risk.allow_fractional_shares", parsed.data.allow_fractional_shares ? "true" : "false"]);
     if (parsed.data.default_borrow_rate_pct != null) pairs.push(["risk.default_borrow_rate_pct", String(parsed.data.default_borrow_rate_pct)]);
-    for (const [k, v] of pairs) {
-      await pool.execute<mysql.ResultSetHeader>(
-        "INSERT INTO app_settings (`key`, `value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), updated_at = CURRENT_TIMESTAMP(6)",
-        [k, v]
-      );
+
+    // Hotfix 2026-04-22 (Bug #6) — atomic batch upsert. Previously each
+    // INSERT...ON DUPLICATE ran in its own autocommit; a mid-batch failure
+    // (server restart, deadlock, row lock timeout) would leave some keys
+    // updated and others stale, producing a hybrid config. Wrap the loop
+    // in a single transaction so either all keys land together or none do.
+    // Zod validation above already filtered garbage, but atomicity matters
+    // for operational failures (connection drop, lock contention) too.
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      for (const [k, v] of pairs) {
+        await conn.execute<mysql.ResultSetHeader>(
+          "INSERT INTO app_settings (`key`, `value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), updated_at = CURRENT_TIMESTAMP(6)",
+          [k, v]
+        );
+      }
+      await conn.commit();
+    } catch (err) {
+      try { await conn.rollback(); } catch { /* ignore */ }
+      throw err;
+    } finally {
+      conn.release();
     }
+
     // Invalidate the cache so the next fillOrder picks up the change.
+    // Placed AFTER commit so we never show cleared cache + rolled-back DB.
     invalidateRiskConfigCache();
     const cfg = await loadRiskConfig();
     return NextResponse.json({

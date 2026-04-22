@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "start:web": "node .next/standalone/trading/server.js",
-    "lint": "eslint",
+    "lint": "eslint src scripts --ext .ts,.tsx,.js,.jsx",
     "surveillance": "npx tsx scripts/surveillance-cron.ts",
     "start:worker": "npx tsx scripts/surveillance-cron.ts"
   },
