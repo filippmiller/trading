@@ -1250,6 +1250,13 @@ function ScenarioReportModal({
   const fmt$ = (n: number) => `${n >= 0 ? '+' : '-'}$${Math.abs(n).toFixed(0)}`;
   const fmtPct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(1)}%`;
 
+  // Effective sample can go empty between Apply and View Report (e.g. user
+  // unchecked a cohort-date chip that contained all their selected rows).
+  // `applied` survives filter changes, but the reactive `visibleEntries`
+  // collapses — so the report degenerates to all-zeros. Detect it here and
+  // render an empty-state body instead of a misleading 0/0 report.
+  const isEmpty = report.totalCohort === 0;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 animate-in fade-in" onClick={onClose}>
       <div className="bg-white rounded-2xl shadow-2xl ring-1 ring-zinc-200 max-w-2xl w-full max-h-[90vh] overflow-auto" onClick={(e) => e.stopPropagation()}>
@@ -1265,6 +1272,28 @@ function ScenarioReportModal({
         </div>
 
         <div className="px-6 py-4 space-y-4">
+          {isEmpty ? (
+            <div className="py-10 px-4 text-center">
+              <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-zinc-100 mb-3">
+                <svg className="w-5 h-5 text-zinc-400" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M10 21h7a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v4M3 16h10m0 0l-3-3m3 3l-3 3" />
+                </svg>
+              </div>
+              <h4 className="text-sm font-semibold text-zinc-800 mb-1">No matching tickers</h4>
+              <p className="text-xs text-zinc-500 max-w-sm mx-auto leading-relaxed">
+                The current cohort-date and ticker-selection filters exclude every row,
+                so there is nothing to report for <span className="font-semibold text-zinc-700">{report.scenarioLabel}</span> at ${investment}/ticker × {leverage}x.
+                Close this dialog and re-check a cohort date chip (e.g. <span className="font-mono">Select all</span>) or clear the row selection.
+              </p>
+              <button
+                onClick={onClose}
+                className="mt-4 text-xs px-4 py-1.5 rounded-md bg-zinc-900 text-white font-semibold hover:bg-zinc-800"
+              >
+                Close and adjust filters
+              </button>
+            </div>
+          ) : (
+          <>
           <section>
             <div className="text-[9px] font-bold uppercase tracking-wider text-zinc-400 mb-2">Portfolio</div>
             <div className="grid grid-cols-2 gap-y-1 text-sm">
@@ -1333,15 +1362,19 @@ function ScenarioReportModal({
               </tbody>
             </table>
           </section>
+          </>
+          )}
         </div>
 
         <div className="px-6 py-3 border-t border-zinc-100 flex items-center justify-end gap-2 bg-zinc-50">
-          <button
-            onClick={exportCsv}
-            className="text-xs px-3 py-1.5 rounded-md border border-zinc-200 text-zinc-700 hover:bg-white"
-          >
-            Export CSV
-          </button>
+          {!isEmpty && (
+            <button
+              onClick={exportCsv}
+              className="text-xs px-3 py-1.5 rounded-md border border-zinc-200 text-zinc-700 hover:bg-white"
+            >
+              Export CSV
+            </button>
+          )}
           <button
             onClick={onClose}
             className="text-xs px-4 py-1.5 rounded-md bg-zinc-900 text-white font-semibold hover:bg-zinc-800"
