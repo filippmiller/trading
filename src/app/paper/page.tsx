@@ -1006,12 +1006,24 @@ function PaperTradingPageInner() {
         {buyError && <p className="text-rose-500 text-xs mt-2">{buyError}</p>}
       </div>
 
-      {/* Pending orders */}
+      {/* Pending orders — header ALWAYS visible with empty state below,
+          consistent with Open Positions + Trade History. Previous bug:
+          whole section vanished when there were no pending LIMIT/STOP
+          orders, so after filling / cancelling the last order the page
+          looked like pending-order support wasn't a feature at all. */}
+      <div>
+        <h2 className="text-lg font-bold text-zinc-800 mb-3 flex items-center gap-2">
+          <Clock className="h-5 w-5 text-amber-500" /> Pending Orders
+          {orders.length > 0 && (
+            <span className="text-xs font-normal text-zinc-400">({orders.length})</span>
+          )}
+        </h2>
+        {orders.length === 0 && (
+          <div className="text-sm text-zinc-400 italic mb-4">No pending orders.</div>
+        )}
+      </div>
       {orders.length > 0 && (
         <div>
-          <h2 className="text-lg font-bold text-zinc-800 mb-3 flex items-center gap-2">
-            <Clock className="h-5 w-5 text-amber-500" /> Pending Orders
-          </h2>
           <div className="space-y-2">
             {orders.map(o => {
               const dist = computeOrderDistance(o);
@@ -1197,23 +1209,36 @@ function PaperTradingPageInner() {
         )}
       </div>
 
-      {/* Closed Trades — W2: filters + CSV export + held_days column */}
-      {closedTrades.length > 0 && (
-        <div>
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-lg font-bold text-zinc-800 flex items-center gap-2">
-              <XCircle className="h-5 w-5 text-zinc-400" /> Trade History
-              <span className="text-xs font-normal text-zinc-400">
-                ({filteredClosed.length} of {closedTrades.length})
-              </span>
-            </h2>
+      {/* Closed Trades — W2: filters + CSV export + held_days column.
+          Header is ALWAYS rendered (even with 0 trades) so the section
+          stays visible and consistent with Open Positions, which also
+          always shows an empty state. Fix 2026-04-22: previously the
+          whole section (header, filters, table) was gated on
+          closedTrades.length > 0, so after an account reset the page
+          looked like Trade History simply didn't exist. */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-bold text-zinc-800 flex items-center gap-2">
+            <XCircle className="h-5 w-5 text-zinc-400" /> Trade History
+            <span className="text-xs font-normal text-zinc-400">
+              ({filteredClosed.length} of {closedTrades.length})
+            </span>
+          </h2>
+          {closedTrades.length > 0 && (
             <button
               onClick={exportCsv}
               className="flex items-center gap-1 px-3 py-1.5 text-xs bg-zinc-100 hover:bg-zinc-200 rounded-lg"
             >
               <Download className="h-3.5 w-3.5" /> Export CSV
             </button>
-          </div>
+          )}
+        </div>
+        {closedTrades.length === 0 ? (
+          <div className="text-sm text-zinc-400 italic">No closed trades yet.</div>
+        ) : (<></>)}
+      </div>
+      {closedTrades.length > 0 && (
+        <div>
 
           <div className="bg-zinc-50 rounded-lg p-3 mb-3 grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
             <div>
