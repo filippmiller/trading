@@ -9,7 +9,17 @@
 
 import mysql from "mysql2/promise";
 
-const DB_URL = process.env.DATABASE_URL || "mysql://root:trading123@localhost:3319/trading";
+// DATABASE_URL must be set explicitly — credentials must never be hardcoded.
+// Local dev: ensure .env.local is present with DATABASE_URL, then run tunnel-db.sh.
+function requireDatabaseUrl(): string {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    console.error("ERROR: DATABASE_URL environment variable is required. Never hardcode credentials.");
+    process.exit(1);
+  }
+  return url;
+}
+const DB_URL: string = requireDatabaseUrl();
 
 // ── Step 1: Get S&P 500 tickers ──────────────────────────────────────────
 

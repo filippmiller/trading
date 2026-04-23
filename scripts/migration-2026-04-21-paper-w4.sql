@@ -9,7 +9,8 @@
 --      commission schedule, fractional toggle, default borrow rate).
 --
 -- Apply locally:
---   node -e "const m=require('mysql2/promise');const fs=require('fs');(async()=>{const c=await m.createConnection({host:'localhost',port:3319,user:'root',password:'trading123',database:'trading',multipleStatements:true});await c.query(fs.readFileSync('scripts/migration-2026-04-21-paper-w4.sql','utf8'));await c.end();})()"
+--   DATABASE_URL=mysql://root:${DB_PASSWORD}@localhost:3319/trading npx tsx -e \
+--     "import mysql from 'mysql2/promise'; import fs from 'fs'; const c = await mysql.createConnection(process.env.DATABASE_URL); await c.query(fs.readFileSync('scripts/migration-2026-04-21-paper-w4.sql','utf8')); await c.end();"
 --
 -- Apply to Railway prod:
 --   railway run --service MySQL mysql < scripts/migration-2026-04-21-paper-w4.sql

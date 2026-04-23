@@ -102,3 +102,7 @@ tradier-*.png
 /yahoo-*.json
 /.tmp/
 /test-results/
+
+# Security: agent session notes and logs contain env-var snippets — never commit
+/.claude/sessions/
+/.claude/agent-log.md

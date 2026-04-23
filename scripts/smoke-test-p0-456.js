@@ -8,8 +8,28 @@
 
 const mysql = require("mysql2/promise");
 
+// Require DATABASE_URL — never embed credentials in source.
+if (!process.env.DATABASE_URL) {
+  const fs = require("fs"), path = require("path");
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, "..", ".env.local"), "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.match(/^([A-Z0-9_]+)=(.*)$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+    }
+  } catch { /* ok */ }
+}
+if (!process.env.DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL must be set. Never hardcode credentials.");
+  process.exit(1);
+}
+const _dbUrl = new URL(process.env.DATABASE_URL);
 const pool = mysql.createPool({
-  host: "127.0.0.1", port: 3319, user: "root", password: "trading123", database: "trading",
+  host: _dbUrl.hostname,
+  port: _dbUrl.port ? Number(_dbUrl.port) : 3306,
+  user: decodeURIComponent(_dbUrl.username),
+  password: decodeURIComponent(_dbUrl.password),
+  database: _dbUrl.pathname.replace("/", ""),
   waitForConnections: true, connectionLimit: 2, timezone: "Z",
 });
 

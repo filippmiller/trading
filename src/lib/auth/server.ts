@@ -33,23 +33,35 @@ async function seedBootstrapAdmin() {
   if (!email || !rawPassword) return;
 
   const pool = await getPool();
-  const passwordHash = await hashPassword(rawPassword);
+
+  // Check if an admin row already exists for this email.
+  // SECURITY: We intentionally do NOT overwrite an existing row.
+  // If the env vars change after the account is created, that must be
+  // done via the authenticated password-change API — not by env-var
+  // manipulation at deploy time. An attacker who gains write access to
+  // Railway env vars must not be able to silently takeover the admin
+  // account on the next cold start.
   const [rows] = await pool.execute<mysql.RowDataPacket[]>(
     "SELECT id FROM app_users WHERE email = ? LIMIT 1",
     [email]
   );
   if (rows.length > 0) {
-    await pool.execute(
-      "UPDATE app_users SET password_hash = ?, role = 'admin', is_active = 1 WHERE email = ?",
-      [passwordHash, email]
+    // Row already exists — skip. Log a warning so operators know the
+    // env vars are not being applied (avoids silent confusion).
+    console.warn(
+      `[auth] Bootstrap skipped: admin account for ${email} already exists. ` +
+      `To change the password, use the /api/auth/password endpoint. ` +
+      `ADMIN_PASSWORD env var is ignored for existing accounts.`
     );
     return;
   }
 
+  const passwordHash = await hashPassword(rawPassword);
   await pool.execute(
     "INSERT INTO app_users (email, password_hash, role) VALUES (?, ?, 'admin')",
     [email, passwordHash]
   );
+  console.info(`[auth] Bootstrap: created admin account for ${email}.`);
 }
 
 export async function ensureAuthReady() {

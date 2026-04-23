@@ -55,7 +55,7 @@ async function getConn(): Promise<mysql.Connection> {
     host: fromUrl?.host ?? env("MYSQL_HOST", "MYSQLHOST") ?? "localhost",
     port: fromUrl?.port ?? Number(env("MYSQL_PORT", "MYSQLPORT") ?? 3319),
     user: fromUrl?.user ?? env("MYSQL_USER", "MYSQLUSER") ?? "root",
-    password: fromUrl?.password ?? env("MYSQL_PASSWORD", "MYSQLPASSWORD") ?? "trading123",
+    password: fromUrl?.password ?? env("MYSQL_PASSWORD", "MYSQLPASSWORD") ?? (() => { throw new Error("DB password not set: provide DATABASE_URL or MYSQL_PASSWORD env var. Never hardcode credentials."); })(),
     database: fromUrl?.database ?? env("MYSQL_DB", "MYSQLDATABASE") ?? "trading",
   });
 }

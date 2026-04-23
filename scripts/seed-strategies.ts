@@ -9,7 +9,16 @@
 import mysql from "mysql2/promise";
 import { generateAllStrategies } from "../src/lib/strategy-engine";
 
-const DB_URL = process.env.DATABASE_URL || "mysql://root:trading123@localhost:3319/trading";
+// DATABASE_URL must be set explicitly — credentials must never be hardcoded.
+function requireDatabaseUrl(): string {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    console.error("ERROR: DATABASE_URL environment variable is required. Never hardcode credentials.");
+    process.exit(1);
+  }
+  return url;
+}
+const DB_URL: string = requireDatabaseUrl();
 
 async function main() {
   const parsed = new URL(DB_URL);

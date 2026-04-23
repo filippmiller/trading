@@ -22,7 +22,16 @@
 
 import mysql from "mysql2/promise";
 
-const DB_URL = process.env.DATABASE_URL || "mysql://root:trading123@localhost:3319/trading";
+// DATABASE_URL must be set explicitly — credentials must never be hardcoded.
+function requireDatabaseUrl(): string {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    console.error("ERROR: DATABASE_URL environment variable is required. Never hardcode credentials.");
+    process.exit(1);
+  }
+  return url;
+}
+const DB_URL: string = requireDatabaseUrl();
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 const FETCH_TIMEOUT_MS = 10000;
 const RATE_LIMIT_MS = 300; // delay between Yahoo calls

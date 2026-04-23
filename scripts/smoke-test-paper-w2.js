@@ -52,7 +52,11 @@ const TEST_ACCOUNT_NAME = "W2_SMOKE_TEST_DO_NOT_USE";
 const TEST_INITIAL_CASH = 100000;
 const PRECISION_EPS = 1e-6;
 
-const url = new URL(process.env.DATABASE_URL || "mysql://root:trading123@localhost:3319/trading");
+if (!process.env.DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL must be set. Never hardcode credentials. Ensure .env.local has DATABASE_URL.");
+  process.exit(1);
+}
+const url = new URL(process.env.DATABASE_URL);
 const dbConfig = {
   host: url.hostname,
   port: Number(url.port) || 3306,
