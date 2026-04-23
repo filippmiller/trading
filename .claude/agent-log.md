@@ -9,6 +9,33 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-23 07:59] — perf: matrix virtualization + /reversal API status split
+
+**Area:** Trading/Reversal, Trading/Perf
+**Type:** perf
+
+### Files Changed
+- `src/app/reversal/page.tsx` — `loadData(status)` + `fetchedStatus` cache + `Promise.allSettled` (PR #45). `flatRows` memo + `useVirtualizer` + padding-`<tr>` tbody refactor (PR #46).
+- `package.json` — added `@tanstack/react-virtual ^3.13.24`.
+- `.claude/sessions/2026-04-22-204857.md` — recovered orphaned `/log` notes from prior session.
+
+### Functions/Symbols Modified
+- `desiredStatusForView(v)` — new helper
+- `loadData(status)` — modified to take slice param + cache sentinel + `Promise.allSettled`
+- `flatRows`, `matrixScrollRef`, `rowVirtualizer`, `virtualItems`, `virtPaddingTop`, `virtPaddingBottom` — new for virtualization
+- `FlatRow` discriminated union — new type
+
+### Database Tables
+- N/A (pure client optimizations; `/api/reversal` accepts `?status=` unchanged)
+
+### Summary
+User reported app felt resource-heavy. Ran `scripts/perf-probe.mjs` (deleted after) — `/reversal?view=matrix` clocked 66,883 DOM nodes, 3.4s longest main-thread task, 11.6s wall-load. Two PRs: (#45) wire client to fetch only the status slice the current view needs (was always fetching ~800KB union), and (#46) virtualize the 986-row matrix table via `@tanstack/react-virtual`. Post-deploy verification: matrix DOM 66,883 → 327 (−99.5%), longest task 3,391ms → 812ms (−76%), wall-load 11.6s → 4.4s (−62%). Orphaned `/log` session notes from prior session recovered in a chore commit within PR #45.
+
+### Session Notes
+→ `.claude/sessions/2026-04-23-075932.md`
+
+---
+
 ## [2026-04-22 20:48] — Session close: 10 PRs merged, 2 Codex reviews absorbed, 2 user-spotted UI bugs
 
 **Area:** Trading/Multi (Paper, Research, Matrix, Surveillance, Settings, Docs)
