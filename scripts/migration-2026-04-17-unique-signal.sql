@@ -13,7 +13,7 @@
 --
 -- Usage (on VPS via tunnel):
 --   bash scripts/tunnel-db.sh   # in one terminal
---   mysql -h127.0.0.1 -P3319 -uroot -ptrading123 trading \
+--   mysql -h127.0.0.1 -P3319 -uroot -p"${DB_PASSWORD}" trading \
 --     < scripts/migration-2026-04-17-unique-signal.sql
 
 -- Step 1: Find and remove exact duplicates. For each (strategy_id,

@@ -36,7 +36,11 @@ try {
 const TEST_ACCOUNT_DEFAULT = "W5_SMOKE_DEFAULT";
 const TEST_ACCOUNT_ALT1    = "W5_SMOKE_ALT1";
 
-const url = new URL(process.env.DATABASE_URL || "mysql://root:trading123@localhost:3319/trading");
+if (!process.env.DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL must be set. Never hardcode credentials. Ensure .env.local has DATABASE_URL.");
+  process.exit(1);
+}
+const url = new URL(process.env.DATABASE_URL);
 const dbConfig = {
   host: url.hostname,
   port: Number(url.port) || 3306,

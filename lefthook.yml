@@ -1,0 +1,26 @@
+# Lefthook pre-commit hooks for the trading project.
+#
+# Install: npm install --save-dev lefthook && npx lefthook install
+# Skip on a single commit (CI emergency only): LEFTHOOK=0 git commit ...
+#
+# Hooks run locally before every commit; CI should duplicate the secret-scan
+# step via GitHub Actions (see docs/ci-hardening-plan.md in P0-ROTATE-KEYS.md).
+
+pre-commit:
+  parallel: true
+  commands:
+    gitleaks:
+      run: >
+        gitleaks protect --staged --config .gitleaks.toml --redact
+        || (echo "BLOCKED: gitleaks found secrets in staged files. Review above output." && exit 1)
+      # Requires gitleaks to be installed: https://github.com/gitleaks/gitleaks#installing
+      # On macOS: brew install gitleaks
+      # On Linux: download binary from https://github.com/gitleaks/gitleaks/releases
+      # On Windows: scoop install gitleaks  OR  download binary
+
+    no-hardcoded-creds:
+      glob: "scripts/**/*.{js,ts,sql}"
+      run: >
+        grep -rn "trading123\|password.*=.*['\"].\{4,\}['\"]" {staged_files}
+        && echo "BLOCKED: hardcoded credential found in staged script — replace with env var read" && exit 1
+        || exit 0

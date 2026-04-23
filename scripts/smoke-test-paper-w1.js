@@ -55,7 +55,11 @@ const TEST_INITIAL_CASH = 100000;
 // DECIMAL(18,6) precision — anything under 1e-6 is sub-scale.
 const PRECISION_EPS = 1e-6;
 
-const url = new URL(process.env.DATABASE_URL || "mysql://root:trading123@localhost:3319/trading");
+if (!process.env.DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL must be set. Never hardcode credentials. Ensure .env.local has DATABASE_URL.");
+  process.exit(1);
+}
+const url = new URL(process.env.DATABASE_URL);
 const dbConfig = {
   host: url.hostname,
   port: Number(url.port) || 3306,

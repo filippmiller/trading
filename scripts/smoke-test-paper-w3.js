@@ -57,7 +57,11 @@ const TEST_ACCOUNT_NAME = "W3_SMOKE_TEST_DO_NOT_USE";
 const TEST_INITIAL_CASH = 100000;
 const PRECISION_EPS = 1e-4;
 
-const url = new URL(process.env.DATABASE_URL || "mysql://root:trading123@localhost:3319/trading");
+if (!process.env.DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL must be set. Never hardcode credentials. Ensure .env.local has DATABASE_URL.");
+  process.exit(1);
+}
+const url = new URL(process.env.DATABASE_URL);
 const dbConfig = {
   host: url.hostname,
   port: Number(url.port) || 3306,
@@ -97,7 +101,7 @@ async function ensureSchemaMinimal() {
       [table, col]
     );
     if (rows.length === 0) {
-      throw new Error(`Schema check failed: ${table}.${col} missing. Run: node -e "const m=require('mysql2/promise');const fs=require('fs');(async()=>{const c=await m.createConnection({host:'localhost',port:3319,user:'root',password:'trading123',database:'trading',multipleStatements:true});await c.query(fs.readFileSync('scripts/migration-2026-04-21-paper-w3.sql','utf8'));await c.end();})()"`);
+      throw new Error(`Schema check failed: ${table}.${col} missing. Run migration: DATABASE_URL=<your-url> npx tsx -e "import mysql from 'mysql2/promise'; import fs from 'fs'; const c = await mysql.createConnection(process.env.DATABASE_URL); await c.query(fs.readFileSync('scripts/migration-2026-04-21-paper-w3.sql','utf8')); await c.end();"`);;
     }
   }
 }

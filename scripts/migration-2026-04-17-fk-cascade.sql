@@ -15,7 +15,7 @@
 --
 -- Or via SSH tunnel from local machine:
 --   bash scripts/tunnel-db.sh   # in one terminal
---   mysql -h127.0.0.1 -P3319 -uroot -ptrading123 trading \
+--   mysql -h127.0.0.1 -P3319 -uroot -p"${DB_PASSWORD}" trading \
 --     < scripts/migration-2026-04-17-fk-cascade.sql
 
 -- Step 1: Clean orphan rows (signal_id pointing at non-existent signal).

@@ -1,0 +1,33 @@
+# Gitleaks configuration for the trading project.
+# Run manually: gitleaks detect --source . --config .gitleaks.toml
+# Automatically enforced via lefthook pre-commit hook (see lefthook.yml).
+#
+# Install gitleaks: https://github.com/gitleaks/gitleaks#installing
+# Install lefthook: npm install --save-dev lefthook  (then: npx lefthook install)
+
+title = "trading gitleaks config"
+
+[extend]
+# Extend the default gitleaks ruleset.
+useDefault = true
+
+[[rules]]
+id = "trading123-password"
+description = "Hardcoded trading123 DB password"
+regex = '''trading123'''
+tags = ["secret", "password", "database"]
+
+[[rules]]
+id = "mysql-url-with-password"
+description = "MySQL connection string with embedded password"
+regex = '''mysql://[^:]+:[^@]{4,}@'''
+tags = ["secret", "database", "connection-string"]
+
+[allowlist]
+# Allow the placeholder strings in example files and this config itself.
+paths = [
+  ".env.example",
+  "docker/.env.example",
+  ".gitleaks.toml",
+  "P0-ROTATE-KEYS.md",
+]
