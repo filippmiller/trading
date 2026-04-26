@@ -25,7 +25,7 @@ type GridRow = {
   avgPnlPct: number;
   bestPct: number;
   worstPct: number;
-  profitFactor: number;
+  profitFactor: number | null;
   sharpeRatio: number;
   avgHoldDays: number;
 };
@@ -164,6 +164,8 @@ export function GridSweepSection(props: Props) {
   // the user knows the click registered (since the single-run form lives
   // above this component and the apply scrolls up).
   const [appliedIdx, setAppliedIdx] = useState<number | null>(null);
+  const [promotingIdx, setPromotingIdx] = useState<number | null>(null);
+  const [promotionMessage, setPromotionMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
 
   const run = async () => {
     setLoading(true);
@@ -207,6 +209,42 @@ export function GridSweepSection(props: Props) {
   const combos = countCombos(preset);
 
   const fmtNum = (v: number | null) => (v == null ? "—" : `${v}%`);
+
+  const promoteRow = async (row: GridRow, index: number) => {
+    setPromotingIdx(index);
+    setPromotionMessage(null);
+    try {
+      const name = makePromotedStrategyName(props.filters.direction, props.tradeDirection, row);
+      const res = await fetch("/api/strategies/promote", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          filters: props.filters,
+          trade: {
+            investmentUsd: props.investmentUsd,
+            leverage: props.leverage,
+            tradeDirection: props.tradeDirection,
+          },
+          costs: props.costs,
+          row,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.message || data.error || `HTTP ${res.status}`);
+      }
+      const warningCount = Array.isArray(data.strategy?.warnings) ? data.strategy.warnings.length : 0;
+      setPromotionMessage({
+        kind: "ok",
+        text: `Created disabled strategy "${data.strategy?.name ?? name}"${warningCount ? ` with ${warningCount} warning${warningCount === 1 ? "" : "s"}` : ""}.`,
+      });
+    } catch (err) {
+      setPromotionMessage({ kind: "error", text: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setPromotingIdx(null);
+    }
+  };
 
   return (
     <div className="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm space-y-4">
@@ -275,6 +313,15 @@ export function GridSweepSection(props: Props) {
           {error}
         </div>
       )}
+      {promotionMessage && (
+        <div className={`rounded-lg text-sm p-3 border ${
+          promotionMessage.kind === "ok"
+            ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+            : "bg-rose-50 text-rose-700 border-rose-200"
+        }`}>
+          {promotionMessage.text}
+        </div>
+      )}
 
       {result && (
         <div className="space-y-2">
@@ -304,6 +351,7 @@ export function GridSweepSection(props: Props) {
                   <th className="px-2 py-2 text-right">PF</th>
                   <th className="px-2 py-2 text-right">Sharpe</th>
                   {props.onApplyToForm && <th className="px-2 py-2 text-center">Apply</th>}
+                  <th className="px-2 py-2 text-center">Promote</th>
                 </tr>
               </thead>
               <tbody>
@@ -330,7 +378,7 @@ export function GridSweepSection(props: Props) {
                       {r.bestPct >= 0 ? "+" : ""}{r.bestPct.toFixed(0)}%
                     </td>
                     <td className="px-2 py-1.5 text-right font-mono text-rose-600">{r.worstPct.toFixed(0)}%</td>
-                    <td className="px-2 py-1.5 text-right font-mono">{isFinite(r.profitFactor) ? r.profitFactor.toFixed(2) : "∞"}</td>
+                    <td className="px-2 py-1.5 text-right font-mono">{typeof r.profitFactor === "number" && isFinite(r.profitFactor) ? r.profitFactor.toFixed(2) : "∞"}</td>
                     <td className="px-2 py-1.5 text-right font-mono">{r.sharpeRatio.toFixed(2)}</td>
                     {props.onApplyToForm && (
                       <td className="px-2 py-1.5 text-center">
@@ -364,6 +412,17 @@ export function GridSweepSection(props: Props) {
                         )}
                       </td>
                     )}
+                    <td className="px-2 py-1.5 text-center">
+                      <button
+                        type="button"
+                        onClick={() => void promoteRow(r, i)}
+                        disabled={promotingIdx != null}
+                        className="rounded-md border border-emerald-200 bg-emerald-50 text-emerald-700 text-[10px] font-bold px-2 py-1 hover:bg-emerald-100 disabled:opacity-50"
+                        title="Create a disabled paper strategy from this Grid row, preserving research provenance for review before enabling."
+                      >
+                        {promotingIdx === i ? "Creating…" : "Promote"}
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -442,4 +501,23 @@ function countCombos(preset: Preset): number {
 
 function axisKey(label: string, value: Array<number | string | null>): string {
   return `${label}:${value.map((v) => v == null ? "null" : String(v)).join("|")}`;
+}
+
+function makePromotedStrategyName(
+  direction: Filters["direction"],
+  tradeDirection: "LONG" | "SHORT",
+  row: GridRow,
+): string {
+  const source = direction ?? "BOTH";
+  const parts = [
+    "Grid",
+    source,
+    tradeDirection,
+    `${row.holdDays}d`,
+    row.hardStopPct != null ? `SL${Math.abs(row.hardStopPct)}` : null,
+    row.takeProfitPct != null ? `TP${row.takeProfitPct}` : null,
+    row.trailingStopPct != null ? `TR${row.trailingStopPct}` : null,
+    new Date().toISOString().slice(0, 16).replace(/[-:T]/g, ""),
+  ].filter(Boolean);
+  return parts.join(" ").slice(0, 128);
 }

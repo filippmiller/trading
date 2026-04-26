@@ -870,6 +870,10 @@ async function jobExecuteStrategiesImpl() {
     const entry = config.entry || {};
     const sizing = config.sizing || {};
     const leverage = Number(strat.leverage || 1);
+    const configuredTradeDirection =
+      entry.trade_direction === "LONG" || entry.trade_direction === "SHORT"
+        ? entry.trade_direction
+        : null;
     const investmentPerTrade = Number(sizing.amount_usd || 1000);
     const maxConcurrent = Number(sizing.max_concurrent || 15);
     const maxNewPerDay = Number(sizing.max_new_per_day || 3);
@@ -924,6 +928,9 @@ async function jobExecuteStrategiesImpl() {
       }
 
       // Consecutive days filter
+      if (entry.min_consecutive_days != null && e.consecutive_days != null) {
+        if (Number(e.consecutive_days) < entry.min_consecutive_days) continue;
+      }
       if (entry.max_consecutive_days != null && e.consecutive_days != null) {
         if (Number(e.consecutive_days) > entry.max_consecutive_days) continue;
       }
@@ -945,6 +952,7 @@ async function jobExecuteStrategiesImpl() {
       // beat us to it despite the dup-check above), rollback auto-refunds
       // cash and we skip this candidate rather than halt the loop.
       const entryPrice = Number(e.entry_price);
+      const signalDirection = configuredTradeDirection ?? e.direction;
       const conn = await db.getConnection();
       let cashExhausted = false;
       let dupeKey = false;
@@ -967,7 +975,7 @@ async function jobExecuteStrategiesImpl() {
                      ?, CURRENT_TIMESTAMP(6), ?, ?, ?,
                      ?, ?, 0, 0)`,
             [
-              strat.id, e.id, e.symbol, e.direction,
+              strat.id, e.id, e.symbol, signalDirection,
               entryPrice, investmentPerTrade, leverage, investmentPerTrade * leverage,
               entryPrice, entryPrice,
             ]
