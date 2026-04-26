@@ -15,11 +15,19 @@
 
 export type EntryConfig = {
   direction: "LONG" | "SHORT" | "ANY";
+  /**
+   * Optional execution-side override. Historical strategies omit this and use
+   * the cohort direction as the trade direction. Research-promoted strategies
+   * can set it so an UP cohort can be traded LONG, or a DOWN cohort SHORT.
+   */
+  trade_direction?: "LONG" | "SHORT";
   min_drop_pct?: number;    // e.g. -7 → filter day_change_pct <= -7
   max_drop_pct?: number;    // e.g. -15 → filter day_change_pct >= -15
   min_rise_pct?: number;    // for SHORT strategies
   max_rise_pct?: number;
+  min_consecutive_days?: number;
   max_consecutive_days?: number; // skip if too many consecutive days (likely fundamental)
+  enrollment_source?: "MOVERS" | "TREND" | "ANY";
   min_price?: number;       // skip penny stocks
 };
 
@@ -80,6 +88,9 @@ export function matchesEntry(candidate: ReversalCandidate, config: StrategyConfi
   }
 
   // Consecutive days filter
+  if (entry.min_consecutive_days != null && candidate.consecutive_days != null) {
+    if (candidate.consecutive_days < entry.min_consecutive_days) return false;
+  }
   if (entry.max_consecutive_days != null && candidate.consecutive_days != null) {
     if (candidate.consecutive_days > entry.max_consecutive_days) return false;
   }
