@@ -22,6 +22,38 @@ type StrategyData = {
   strategy_type: string;
   leverage: number;
   enabled: boolean;
+  created_at?: string;
+  account_id: number | null;
+  account_name: string | null;
+  config_summary: {
+    entry_direction: string | null;
+    trade_direction: string | null;
+    enrollment_source: string | null;
+    min_drop_pct: number | null;
+    max_drop_pct: number | null;
+    min_rise_pct: number | null;
+    max_rise_pct: number | null;
+    min_consecutive_days: number | null;
+    max_consecutive_days: number | null;
+    amount_usd: number | null;
+    time_exit_days: number | null;
+    hard_stop_pct: number | null;
+    take_profit_pct: number | null;
+    trailing_stop_pct: number | null;
+  } | null;
+  research: {
+    source: string;
+    promotion_key: string | null;
+    promoted_at: string | null;
+    warnings: string[];
+    grid_stats: {
+      n: number | null;
+      win_rate: number | null;
+      total_pnl_usd: number | null;
+      sharpe_ratio: number | null;
+      profit_factor: number | null;
+    } | null;
+  } | null;
   account: {
     initial_cash: number;
     cash: number;
@@ -119,6 +151,8 @@ export default function StrategiesPage() {
   const pnlSign = (value: number) => value >= 0 ? "+" : "";
   const fmtUsd = (value: number) => `${pnlSign(value)}$${Math.abs(value).toFixed(0)}`;
   const fmtPct = (value: number) => `${pnlSign(value)}${value.toFixed(2)}%`;
+  const promotedCount = visibleStrategies.filter((strategy) => strategy.research?.source === "grid_sweep").length;
+  const disabledCount = visibleStrategies.filter((strategy) => !strategy.enabled).length;
 
   if (loading) {
     return <div className="flex items-center justify-center h-96 text-zinc-400">Loading strategies...</div>;
@@ -184,7 +218,7 @@ export default function StrategiesPage() {
       </div>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
-        <SummaryCard icon={<Radar className="h-4 w-4 text-indigo-600" />} label="Visible Strategies" value={String(visibleStrategies.length)} detail={`${scope === "all" ? "Trading + analysis" : `${scope} scope`}`} />
+        <SummaryCard icon={<Radar className="h-4 w-4 text-indigo-600" />} label="Visible Strategies" value={String(visibleStrategies.length)} detail={`${promotedCount} promoted · ${disabledCount} disabled`} />
         <SummaryCard icon={<DollarSign className="h-4 w-4 text-emerald-600" />} label="Aggregate Equity" value={`$${summary.equity.toFixed(0)}`} detail="Cash + marked open positions" />
         <SummaryCard icon={<TrendingUp className="h-4 w-4 text-amber-600" />} label="Realized P&L" value={fmtUsd(summary.realizedPnl)} detail="Closed paper signals only" />
         <SummaryCard icon={<Activity className="h-4 w-4 text-blue-600" />} label="Open Exposure" value={`$${summary.openMarketValue.toFixed(0)}`} detail={`${summary.openPositions} open positions`} />
@@ -235,6 +269,8 @@ export default function StrategiesPage() {
               <tr className="text-left text-zinc-400 text-xs uppercase bg-zinc-50 border-b">
                 <th className="px-4 py-3">#</th>
                 <th className="px-4 py-3">Strategy</th>
+                <th className="px-4 py-3">Source</th>
+                <th className="px-4 py-3">Setup</th>
                 <th className="px-4 py-3">Lev</th>
                 <th className="px-4 py-3 text-right">Trades</th>
                 <th className="px-4 py-3 text-right">Win%</th>
@@ -250,9 +286,39 @@ export default function StrategiesPage() {
             </thead>
             <tbody>
               {ranked.map((strategy, i) => (
-                <tr key={strategy.id} className={`border-b border-zinc-50 hover:bg-zinc-50/50 ${strategy.stats.total_pnl_usd > 0 ? "" : "opacity-75"}`}>
+                <tr key={strategy.id} className={`border-b border-zinc-50 hover:bg-zinc-50/50 ${strategy.enabled ? "" : "bg-amber-50/30"} ${strategy.stats.total_pnl_usd > 0 || !strategy.enabled ? "" : "opacity-75"}`}>
                   <td className="px-4 py-3 font-mono text-zinc-400">{i + 1}</td>
-                  <td className="px-4 py-3 font-bold text-zinc-900">{strategy.name}</td>
+                  <td className="px-4 py-3">
+                    <div className="font-bold text-zinc-900">{strategy.name}</div>
+                    {strategy.account_name && <div className="mt-0.5 text-[10px] text-zinc-400">{strategy.account_name}</div>}
+                  </td>
+                  <td className="px-4 py-3">
+                    {strategy.research?.source === "grid_sweep" ? (
+                      <div className="space-y-1">
+                        <span className="inline-flex rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-bold uppercase text-violet-700 ring-1 ring-violet-100">
+                          Grid Sweep
+                        </span>
+                        {strategy.research.grid_stats && (
+                          <div className="text-[10px] text-zinc-500">
+                            n={strategy.research.grid_stats.n ?? "?"} · WR {fmtNullablePct(strategy.research.grid_stats.win_rate)}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-zinc-400">Seeded</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 min-w-48">
+                    <div className="text-xs text-zinc-700">{formatSetup(strategy.config_summary)}</div>
+                    {strategy.research?.warnings?.length ? (
+                      <details className="mt-1 text-[10px] text-amber-700">
+                        <summary className="cursor-pointer font-semibold">{strategy.research.warnings.length} promotion warning{strategy.research.warnings.length === 1 ? "" : "s"}</summary>
+                        <ul className="mt-1 list-disc space-y-1 pl-4">
+                          {strategy.research.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+                        </ul>
+                      </details>
+                    ) : null}
+                  </td>
                   <td className="px-4 py-3">
                     <span className={`px-2 py-0.5 rounded text-xs font-bold ${
                       strategy.leverage === 10 ? "bg-rose-100 text-rose-700"
@@ -282,7 +348,9 @@ export default function StrategiesPage() {
                     ) : "—"}
                   </td>
                   <td className="px-4 py-3 text-center">
-                    {strategy.account.return_pct > 0 ? (
+                    {!strategy.enabled ? (
+                      <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold uppercase text-amber-700">Disabled</span>
+                    ) : strategy.account.return_pct > 0 ? (
                       <TrendingUp className="h-4 w-4 text-emerald-500 inline" />
                     ) : strategy.account.return_pct < 0 ? (
                       <TrendingDown className="h-4 w-4 text-rose-500 inline" />
@@ -327,6 +395,8 @@ export default function StrategiesPage() {
                       <div>Open: <b>{strategy.stats.open_positions}</b></div>
                       <div>Return: <b className={pnlColor(strategy.account.return_pct)}>{fmtPct(strategy.account.return_pct)}</b></div>
                       <div>Equity: <b>${strategy.account.equity.toFixed(0)}</b></div>
+                      {strategy.research?.source === "grid_sweep" && <div>Source: <b>Grid Sweep</b></div>}
+                      {!strategy.enabled && <div>Status: <b className="text-amber-700">Disabled</b></div>}
                     </div>
                   </div>
                 ))}
@@ -342,6 +412,32 @@ export default function StrategiesPage() {
       </div>
     </div>
   );
+}
+
+function formatSetup(config: StrategyData["config_summary"]): string {
+  if (!config) return "Config unavailable";
+  const cohort = config.entry_direction ?? "ANY";
+  const trade = config.trade_direction ?? cohort;
+  const move = config.min_drop_pct != null || config.max_drop_pct != null
+    ? `${config.min_drop_pct ?? "-∞"}% to ${config.max_drop_pct ?? "∞"}% drop`
+    : config.min_rise_pct != null || config.max_rise_pct != null
+      ? `${config.min_rise_pct ?? 0}% to ${config.max_rise_pct ?? "∞"}% rise`
+      : "any move";
+  const streak = [
+    config.min_consecutive_days != null ? `${config.min_consecutive_days}+ streak` : null,
+    config.max_consecutive_days != null ? `max ${config.max_consecutive_days}` : null,
+  ].filter(Boolean).join(", ");
+  const exits = [
+    config.time_exit_days != null ? `${config.time_exit_days}d` : null,
+    config.hard_stop_pct != null ? `SL ${config.hard_stop_pct}%` : null,
+    config.take_profit_pct != null ? `TP ${config.take_profit_pct}%` : null,
+    config.trailing_stop_pct != null ? `trail ${config.trailing_stop_pct}%` : null,
+  ].filter(Boolean).join(" · ");
+  return `${cohort} cohort -> ${trade} · ${move}${streak ? ` · ${streak}` : ""}${exits ? ` · ${exits}` : ""}`;
+}
+
+function fmtNullablePct(value: number | null): string {
+  return value == null ? "?" : `${value.toFixed(0)}%`;
 }
 
 function SummaryCard({ icon, label, value, detail }: { icon: React.ReactNode; label: string; value: string; detail: string }) {

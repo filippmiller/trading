@@ -6,6 +6,7 @@ import { ensureSchema } from "@/lib/migrations";
 import {
   buildPromotedStrategyConfig,
   PromoteStrategySchema,
+  summarizePromotedStrategy,
 } from "@/lib/strategy-promotion";
 
 /**
@@ -25,6 +26,32 @@ export async function POST(req: Request) {
 
     try {
       await conn.beginTransaction();
+
+      const [duplicates] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id, name, account_id, enabled
+         FROM paper_strategies
+         WHERE JSON_UNQUOTE(JSON_EXTRACT(config_json, '$.research_provenance.promotion_key')) = ?
+         ORDER BY id DESC
+         LIMIT 1`,
+        [config.research_provenance.promotion_key],
+      );
+      const duplicate = duplicates[0];
+      if (duplicate) {
+        await conn.commit();
+        return NextResponse.json({
+          ok: true,
+          duplicate: true,
+          strategy: {
+            id: Number(duplicate.id),
+            name: duplicate.name as string,
+            enabled: duplicate.enabled === 1,
+            account_id: duplicate.account_id == null ? null : Number(duplicate.account_id),
+            account_name: null,
+            summary: summarizePromotedStrategy(input),
+            warnings,
+          },
+        });
+      }
 
       const accountName = makeAccountName(input.name);
       const [accountResult] = await conn.execute<mysql.ResultSetHeader>(
@@ -49,6 +76,7 @@ export async function POST(req: Request) {
           enabled: false,
           account_id: accountId,
           account_name: accountName,
+          summary: summarizePromotedStrategy(input),
           warnings,
         },
       });

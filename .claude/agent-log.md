@@ -9,6 +9,45 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-26 08:02] — feature: complete Grid Sweep strategy promotion workflow
+
+**Area:** Trading/Research, Trading/Strategies
+**Type:** feature
+**Branch:** `master`
+
+### Why
+The initial Grid Sweep promotion slice created disabled paper strategies, but operators still needed duplicate safety and a dashboard-level way to inspect what was promoted, what is executable, and what research-only assumptions were preserved as warnings.
+
+### What
+- Added stable `promotion_key` generation for Grid Sweep promotion payloads.
+- Made `/api/strategies/promote` idempotent for the same filters, trade settings, costs, and Grid row.
+- Added promoted-strategy summaries to promotion responses.
+- Extended `/api/strategies` with parsed executable config summaries and research provenance.
+- Updated `/strategies` to display promoted Grid Sweep source, disabled status, setup details, grid stats, and warning details.
+- Updated Grid Sweep success messaging for duplicate promotions.
+- Added unit coverage for promotion keys and summaries.
+
+### Verification
+```text
+npx tsc --noEmit → passed
+npm test -- src/lib/strategy-promotion.test.ts → 5/5 passed
+npm test → 109/109 passed
+```
+
+### Files Changed
+- `src/lib/strategy-promotion.ts` — promotion key + readable summary helpers
+- `src/app/api/strategies/promote/route.ts` — idempotent duplicate detection
+- `src/app/api/strategies/route.ts` — config/provenance summaries in API response
+- `src/app/strategies/page.tsx` — promoted strategy visibility and warnings
+- `src/components/GridSweepSection.tsx` — duplicate-aware promotion success message
+- `src/lib/strategy-promotion.test.ts` — key/summary coverage
+- `.claude/sessions/2026-04-26-080200.md` — session notes
+
+### Session Notes
+→ `.claude/sessions/2026-04-26-080200.md`
+
+---
+
 ## [2026-04-23 07:59] — perf: matrix virtualization + /reversal API status split
 
 **Area:** Trading/Reversal, Trading/Perf

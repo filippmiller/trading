@@ -235,9 +235,10 @@ export function GridSweepSection(props: Props) {
         throw new Error(data.message || data.error || `HTTP ${res.status}`);
       }
       const warningCount = Array.isArray(data.strategy?.warnings) ? data.strategy.warnings.length : 0;
+      const prefix = data.duplicate ? "Already promoted" : "Created disabled strategy";
       setPromotionMessage({
         kind: "ok",
-        text: `Created disabled strategy "${data.strategy?.name ?? name}"${warningCount ? ` with ${warningCount} warning${warningCount === 1 ? "" : "s"}` : ""}.`,
+        text: `${prefix} "${data.strategy?.name ?? name}"${warningCount ? ` with ${warningCount} warning${warningCount === 1 ? "" : "s"}` : ""}. Review it on the Strategies page before enabling.`,
       });
     } catch (err) {
       setPromotionMessage({ kind: "error", text: err instanceof Error ? err.message : String(err) });

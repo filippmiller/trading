@@ -58,6 +58,7 @@ export type PromoteStrategyInput = z.infer<typeof PromoteStrategySchema>;
 export type PromotedStrategyConfig = StrategyConfig & {
   research_provenance: {
     source: "grid_sweep";
+    promotion_key: string;
     promoted_at: string;
     filters: PromoteStrategyInput["filters"];
     grid_row: PromoteStrategyInput["row"];
@@ -72,6 +73,7 @@ export function buildPromotedStrategyConfig(
   promotedAt = new Date().toISOString(),
 ): { config: PromotedStrategyConfig; warnings: string[] } {
   const warnings: string[] = [];
+  const promotionKey = buildPromotionKey(input);
   const entry: StrategyConfig["entry"] = {
     direction: cohortDirectionFromFilter(input.filters.direction),
     trade_direction: input.trade.tradeDirection,
@@ -128,6 +130,7 @@ export function buildPromotedStrategyConfig(
     exits,
     research_provenance: {
       source: "grid_sweep",
+      promotion_key: promotionKey,
       promoted_at: promotedAt,
       filters: input.filters,
       grid_row: input.row,
@@ -138,6 +141,36 @@ export function buildPromotedStrategyConfig(
   };
 
   return { config, warnings };
+}
+
+export function buildPromotionKey(input: PromoteStrategyInput): string {
+  return [
+    "grid_sweep",
+    stableStringify(normalizeForKey(input.filters)),
+    stableStringify(normalizeForKey(input.trade)),
+    stableStringify(normalizeForKey(input.costs)),
+    stableStringify(normalizeForKey(input.row)),
+  ].join("|");
+}
+
+export function summarizePromotedStrategy(input: PromoteStrategyInput): string {
+  const direction = input.filters.direction ?? "BOTH";
+  const stop = input.row.hardStopPct == null ? "no SL" : `SL ${input.row.hardStopPct}%`;
+  const profit = input.row.takeProfitPct == null ? "no TP" : `TP ${input.row.takeProfitPct}%`;
+  const trail = input.row.trailingStopPct == null ? "no trail" : `trail ${input.row.trailingStopPct}%`;
+  const streak = [
+    input.filters.minStreak != null ? `min streak ${input.filters.minStreak}` : null,
+    input.filters.maxStreak != null ? `max streak ${input.filters.maxStreak}` : null,
+  ].filter(Boolean).join(", ");
+  return [
+    `${direction} cohort traded ${input.trade.tradeDirection}`,
+    `$${input.trade.investmentUsd} at ${input.trade.leverage}x`,
+    `${input.row.holdDays}d hold`,
+    stop,
+    profit,
+    trail,
+    streak || null,
+  ].filter(Boolean).join(" · ");
 }
 
 function cohortDirectionFromFilter(direction: PromoteStrategyInput["filters"]["direction"]): "LONG" | "SHORT" | "ANY" {
@@ -170,4 +203,31 @@ function applyDayChangeFilters(entry: StrategyConfig["entry"], filters: PromoteS
     entry.max_drop_pct = -max;
     entry.max_rise_pct = max;
   }
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value)
+      .filter(([, entryValue]) => entryValue !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableStringify(entryValue)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function normalizeForKey<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeForKey(item)) as T;
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, entryValue] of Object.entries(value)) {
+      if (entryValue !== undefined) out[key] = normalizeForKey(entryValue);
+    }
+    return out as T;
+  }
+  return value;
 }

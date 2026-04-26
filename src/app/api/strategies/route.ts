@@ -11,7 +11,7 @@ export async function GET() {
 
     // Single query: strategies + accounts
     const [strategies] = await pool.execute<mysql.RowDataPacket[]>(
-      `SELECT s.*, a.initial_cash, a.cash
+      `SELECT s.*, a.name AS account_name, a.initial_cash, a.cash
        FROM paper_strategies s
        LEFT JOIN paper_accounts a ON s.account_id = a.id
        ORDER BY s.name`
@@ -71,6 +71,8 @@ export async function GET() {
 
     const results = strategies.map(s => {
       const st = statsMap.get(s.id);
+      const config = parseStrategyConfig(s.config_json);
+      const research = summarizeResearchProvenance(config);
       const wins = Number(st?.wins ?? 0);
       const losses = Number(st?.losses ?? 0);
       const closedTrades = wins + losses;
@@ -87,6 +89,11 @@ export async function GET() {
         strategy_type: s.strategy_type,
         leverage: Number(s.leverage),
         enabled: s.enabled === 1,
+        created_at: s.created_at,
+        account_id: s.account_id == null ? null : Number(s.account_id),
+        account_name: s.account_name == null ? null : String(s.account_name),
+        config_summary: summarizeExecutableConfig(config),
+        research,
         account: {
           initial_cash: initialCash,
           cash,
@@ -123,4 +130,96 @@ export async function GET() {
     const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: msg }, { status: 500 });
   }
+}
+
+type ParsedStrategyConfig = {
+  entry?: {
+    direction?: string;
+    trade_direction?: string;
+    min_drop_pct?: number;
+    max_drop_pct?: number;
+    min_rise_pct?: number;
+    max_rise_pct?: number;
+    min_consecutive_days?: number;
+    max_consecutive_days?: number;
+    enrollment_source?: string;
+    min_price?: number;
+  };
+  sizing?: {
+    amount_usd?: number;
+    max_concurrent?: number;
+    max_new_per_day?: number;
+  };
+  exits?: {
+    time_exit_days?: number;
+    hard_stop_pct?: number;
+    take_profit_pct?: number;
+    trailing_stop_pct?: number;
+    trailing_activates_at_profit_pct?: number;
+  };
+  research_provenance?: {
+    source?: string;
+    promotion_key?: string;
+    promoted_at?: string;
+    warnings?: string[];
+    grid_row?: {
+      n?: number;
+      winRate?: number;
+      totalPnlUsd?: number;
+      sharpeRatio?: number;
+      profitFactor?: number | null;
+    };
+  };
+};
+
+function parseStrategyConfig(raw: unknown): ParsedStrategyConfig | null {
+  if (typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw) as ParsedStrategyConfig;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function summarizeExecutableConfig(config: ParsedStrategyConfig | null) {
+  if (!config) return null;
+  return {
+    entry_direction: config.entry?.direction ?? null,
+    trade_direction: config.entry?.trade_direction ?? config.entry?.direction ?? null,
+    enrollment_source: config.entry?.enrollment_source ?? null,
+    min_drop_pct: config.entry?.min_drop_pct ?? null,
+    max_drop_pct: config.entry?.max_drop_pct ?? null,
+    min_rise_pct: config.entry?.min_rise_pct ?? null,
+    max_rise_pct: config.entry?.max_rise_pct ?? null,
+    min_consecutive_days: config.entry?.min_consecutive_days ?? null,
+    max_consecutive_days: config.entry?.max_consecutive_days ?? null,
+    min_price: config.entry?.min_price ?? null,
+    amount_usd: config.sizing?.amount_usd ?? null,
+    max_concurrent: config.sizing?.max_concurrent ?? null,
+    max_new_per_day: config.sizing?.max_new_per_day ?? null,
+    time_exit_days: config.exits?.time_exit_days ?? null,
+    hard_stop_pct: config.exits?.hard_stop_pct ?? null,
+    take_profit_pct: config.exits?.take_profit_pct ?? null,
+    trailing_stop_pct: config.exits?.trailing_stop_pct ?? null,
+    trailing_activates_at_profit_pct: config.exits?.trailing_activates_at_profit_pct ?? null,
+  };
+}
+
+function summarizeResearchProvenance(config: ParsedStrategyConfig | null) {
+  const provenance = config?.research_provenance;
+  if (!provenance?.source) return null;
+  return {
+    source: provenance.source,
+    promotion_key: provenance.promotion_key ?? null,
+    promoted_at: provenance.promoted_at ?? null,
+    warnings: Array.isArray(provenance.warnings) ? provenance.warnings : [],
+    grid_stats: provenance.grid_row ? {
+      n: provenance.grid_row.n ?? null,
+      win_rate: provenance.grid_row.winRate ?? null,
+      total_pnl_usd: provenance.grid_row.totalPnlUsd ?? null,
+      sharpe_ratio: provenance.grid_row.sharpeRatio ?? null,
+      profit_factor: provenance.grid_row.profitFactor ?? null,
+    } : null,
+  };
 }

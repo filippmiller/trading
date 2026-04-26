@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildPromotedStrategyConfig,
+  buildPromotionKey,
   PromoteStrategySchema,
+  summarizePromotedStrategy,
   type PromoteStrategyInput,
 } from "./strategy-promotion";
 
@@ -70,6 +72,7 @@ describe("strategy promotion", () => {
       take_profit_pct: 10,
     });
     expect(config.research_provenance.source).toBe("grid_sweep");
+    expect(config.research_provenance.promotion_key).toBe(buildPromotionKey(baseInput()));
   });
 
   it("maps DOWN magnitude filters to negative drop bounds", () => {
@@ -110,5 +113,27 @@ describe("strategy promotion", () => {
     expect(PromoteStrategySchema.safeParse(baseInput({
       row: { ...baseInput().row, hardStopPct: 5 },
     })).success).toBe(false);
+  });
+
+  it("builds stable promotion keys and readable summaries", () => {
+    const first = baseInput();
+    const reordered = baseInput({
+      filters: {
+        enrollmentSources: ["MOVERS"],
+        maxStreak: 5,
+        minStreak: 2,
+        maxDayChangePct: 10,
+        minDayChangePct: 3,
+        direction: "UP",
+      },
+    });
+    const changed = baseInput({
+      row: { ...baseInput().row, takeProfitPct: 12 },
+    });
+
+    expect(buildPromotionKey(first)).toBe(buildPromotionKey(reordered));
+    expect(buildPromotionKey(first)).not.toBe(buildPromotionKey(changed));
+    expect(summarizePromotedStrategy(first)).toContain("UP cohort traded LONG");
+    expect(summarizePromotedStrategy(first)).toContain("3d hold");
   });
 });
