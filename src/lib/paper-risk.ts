@@ -41,6 +41,8 @@ import { getPool, mysql } from "@/lib/db";
 export type RiskConfig = {
   /** Market-order adverse slippage in basis points. 5 = 0.05%. */
   slippageBps: number;
+  /** Total bid/ask spread in basis points. BUY pays half, SELL receives half. */
+  spreadBps: number;
   /** Per-share commission in USD. */
   commissionPerShare: number;
   /** Minimum commission per leg (open OR close separately). */
@@ -54,6 +56,7 @@ export type RiskConfig = {
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
   slippageBps: 5,
+  spreadBps: 2,
   commissionPerShare: 0.005,
   commissionMinPerLeg: 1.0,
   allowFractionalShares: true,
@@ -93,6 +96,7 @@ export async function loadRiskConfig(): Promise<RiskConfig> {
     for (const r of rows) map[String(r.key)] = String(r.value);
     const cfg: RiskConfig = {
       slippageBps: parseNumberOr(map["risk.slippage_bps"], DEFAULT_RISK_CONFIG.slippageBps),
+      spreadBps: parseNumberOr(map["risk.spread_bps"], DEFAULT_RISK_CONFIG.spreadBps),
       commissionPerShare: parseNumberOr(map["risk.commission_per_share"], DEFAULT_RISK_CONFIG.commissionPerShare),
       commissionMinPerLeg: parseNumberOr(map["risk.commission_min_per_leg"], DEFAULT_RISK_CONFIG.commissionMinPerLeg),
       allowFractionalShares: parseBoolOr(map["risk.allow_fractional_shares"], DEFAULT_RISK_CONFIG.allowFractionalShares),
@@ -158,7 +162,8 @@ function parseBoolOr(v: string | undefined, fallback: boolean): boolean {
  *
  * MARKET BUY:  price * (1 + bps/10000) — buyer pays a hair extra
  * MARKET SELL: price * (1 - bps/10000) — seller gets a hair less
- * LIMIT/STOP:  price unchanged
+ * STOP:        same as MARKET after trigger
+ * LIMIT:       price unchanged; use `applyExecutionPrice` when spread should apply.
  */
 export function applySlippage(
   basePrice: number,
@@ -167,10 +172,47 @@ export function applySlippage(
   cfg: RiskConfig
 ): number {
   if (!Number.isFinite(basePrice) || basePrice <= 0) return basePrice;
-  if (orderType !== "MARKET") return basePrice;
+  if (orderType !== "MARKET" && orderType !== "STOP") return basePrice;
   const edgePct = cfg.slippageBps / 10_000;
   if (side === "BUY") return basePrice * (1 + edgePct);
   return basePrice * (1 - edgePct);
+}
+
+/**
+ * Convert a last/mid quote into the simulated executable price.
+ *
+ * Yahoo's chart quote is closer to a last/mid mark than an executable order
+ * book. Real fills cross the spread: BUYs pay ask-ish, SELLs receive bid-ish.
+ * MARKET and STOP orders also pay the configured adverse slippage because
+ * STOP orders become market orders after the stop is elected. LIMIT orders
+ * cross only half the spread and are capped at the user's limit so the model
+ * never fills worse than the submitted limit.
+ *
+ * `slippage_usd` records the total difference between the source quote and
+ * this executable price, so it includes both spread crossing and market
+ * slippage.
+ */
+export function applyExecutionPrice(
+  basePrice: number,
+  side: "BUY" | "SELL",
+  orderType: "MARKET" | "LIMIT" | "STOP",
+  cfg: RiskConfig,
+  limitPrice?: number | null
+): number {
+  if (!Number.isFinite(basePrice) || basePrice <= 0) return basePrice;
+  const halfSpreadPct = Math.max(0, cfg.spreadBps) / 2 / 10_000;
+  const marketSlippagePct = (orderType === "MARKET" || orderType === "STOP")
+    ? Math.max(0, cfg.slippageBps) / 10_000
+    : 0;
+  const edgePct = halfSpreadPct + marketSlippagePct;
+  const raw = side === "BUY"
+    ? basePrice * (1 + edgePct)
+    : basePrice * (1 - edgePct);
+
+  if (orderType === "LIMIT" && limitPrice != null && Number.isFinite(limitPrice) && limitPrice > 0) {
+    return side === "BUY" ? Math.min(raw, limitPrice) : Math.max(raw, limitPrice);
+  }
+  return raw;
 }
 
 /**

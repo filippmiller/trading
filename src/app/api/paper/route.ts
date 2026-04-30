@@ -99,6 +99,9 @@ export async function GET(req: Request) {
         current_price: currentPrice,
         live_pnl_usd: pnlUsd,
         live_pnl_pct: pnlPct,
+        commission_usd: Number(r.commission_usd ?? 0),
+        slippage_usd: Number(r.slippage_usd ?? 0),
+        borrow_daily_rate_pct: Number(r.borrow_daily_rate_pct ?? 0),
         as_of: isOpen ? (live?.asOf?.toISOString() ?? null) : null,
         is_live: isOpen ? (live?.isLive ?? false) : true,
         strategy: r.strategy,
@@ -166,6 +169,11 @@ export async function GET(req: Request) {
     // New (scratched-excluded) win rate: wins ÷ non-scratched closed trades.
     const winRateExclScratched = nonScratched.length > 0 ? (wins / nonScratched.length) * 100 : 0;
     const realizedPnl = closedTrades.reduce((s, r) => s + Number(r.pnl_usd || 0), 0);
+    const realizedCosts = closedTrades.reduce(
+      (s, r) => s + Number(r.commission_usd || 0) + Number(r.slippage_usd || 0),
+      0
+    );
+    const realizedNetPnl = realizedPnl - realizedCosts;
 
     const grossWins = nonScratched
       .filter(r => Number(r.pnl_usd) > 0)
@@ -196,6 +204,8 @@ export async function GET(req: Request) {
         stale_positions: equity.stale_positions,
         total_return_pct: totalReturn,
         realized_pnl_usd: realizedPnl,
+        realized_costs_usd: realizedCosts,
+        realized_net_pnl_usd: realizedNetPnl,
         // Original (backward-compat) denominator = `closed_trades`.
         win_rate_pct: winRate,
         // Scratched-excluded variant — prefer this in UI displays.

@@ -17,6 +17,7 @@ type Defaults = {
 /** W4 — paper-trading risk-model config. Edited via /api/paper/settings. */
 type RiskSettings = {
   slippage_bps: number;
+  spread_bps: number;
   commission_per_share: number;
   commission_min_per_leg: number;
   allow_fractional_shares: boolean;
@@ -42,6 +43,7 @@ export default function SettingsPage() {
       const data = await res.json();
       setRisk({
         slippage_bps: Number(data.slippage_bps ?? 0),
+        spread_bps: Number(data.spread_bps ?? 0),
         commission_per_share: Number(data.commission_per_share ?? 0),
         commission_min_per_leg: Number(data.commission_min_per_leg ?? 0),
         allow_fractional_shares: Boolean(data.allow_fractional_shares),
@@ -59,6 +61,7 @@ export default function SettingsPage() {
   // so the user knows WHICH field is out of range and WHY.
   const RISK_BOUNDS = {
     slippage_bps:            { min: 0, max: 200, label: "Slippage (bps)" },
+    spread_bps:              { min: 0, max: 200, label: "Bid/ask spread (bps)" },
     commission_per_share:    { min: 0, max: 0.5, label: "Commission — per share" },
     commission_min_per_leg:  { min: 0, max: 10,  label: "Commission — minimum per leg" },
     default_borrow_rate_pct: { min: 0, max: 100, label: "Default short borrow rate (%)" },
@@ -256,12 +259,15 @@ export default function SettingsPage() {
         <CardHeader>
           <CardTitle>Paper trading — risk model</CardTitle>
           <CardDescription>
-            Slippage, commission, fractional shares, and default short-borrow rate.
+            Spread, slippage, commission, fractional shares, and default short-borrow rate.
             Applied to every paper fill immediately after saving.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          <label className="text-sm text-zinc-600">Slippage (bps) — MARKET orders only</label>
+          <label className="text-sm text-zinc-600">Bid/ask spread (bps) — total quoted spread</label>
+          <Input type="number" step={0.5} min={0} max={200} value={risk.spread_bps}
+            onChange={e => setRisk({ ...risk, spread_bps: Number(e.target.value) })} />
+          <label className="text-sm text-zinc-600">Slippage (bps) — MARKET and STOP orders</label>
           <Input type="number" step={0.5} min={0} max={200} value={risk.slippage_bps}
             onChange={e => setRisk({ ...risk, slippage_bps: Number(e.target.value) })} />
           <label className="text-sm text-zinc-600">Commission — per share ($)</label>

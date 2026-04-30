@@ -472,6 +472,7 @@ async function runSchemaMigrations() {
   // Seed risk params with INSERT IGNORE semantics so re-running is a no-op.
   const riskSeed: Array<[string, string]> = [
     ["risk.slippage_bps", "5"],
+    ["risk.spread_bps", "2"],
     ["risk.commission_per_share", "0.005"],
     ["risk.commission_min_per_leg", "1.0"],
     ["risk.allow_fractional_shares", "true"],

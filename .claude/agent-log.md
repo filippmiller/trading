@@ -9,6 +9,40 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-04-30 11:13] — verification handoff + paper execution-cost prep
+
+**Area:** Trading/Ops, Trading/Paper
+**Type:** chore + verification + feature prep
+**Branch:** integration to `master`
+
+### Why
+Verify production health/data fetching, make sure code is ready to serve from canonical `master`, and leave a clear install/deploy handoff for the next agent.
+
+### What
+- Verified Railway topology: `trading`, `worker`, `MySQL` in project `TRADING` / production.
+- Added 2026-04-30 handoff with install, local-dev, deploy, and smoke-check instructions.
+- Corrected root `AGENTS.md` to point at `.claude/*` instruction files and current Next.js version.
+- Prepared paper execution-cost changes: spread-aware execution price, STOP-as-market fills, cost metrics, risk settings exposure, paper UI previews, and tests.
+
+### Verification
+```text
+npx tsc --noEmit -> tsc_exit=0
+npm test          -> 114/114 passed
+npm run build     -> passed
+curl /api/healthz -> HTTP 200
+Railway worker logs -> active monitor/sync/trend/retention jobs through 2026-04-30
+```
+
+### Files Changed
+- `AGENTS.md` — corrected instruction paths and framework version.
+- `.claude/handoffs/2026-04-30-verification-handoff.md` — new install/deploy/ops handoff.
+- `src/lib/paper-risk.ts` — spread-aware executable price helper and risk config.
+- `src/lib/paper-fill.ts` — fills use executable price and seed short borrow rate.
+- `src/lib/paper-exits.ts` — auto-exits use executable price semantics.
+- `src/app/api/paper/*` and UI/settings files — expose cost metrics and spread setting.
+- `src/lib/*test.ts` — execution-cost/risk test coverage.
+
+---
 ## [2026-04-26 08:02] — feature: complete Grid Sweep strategy promotion workflow
 
 **Area:** Trading/Research, Trading/Strategies

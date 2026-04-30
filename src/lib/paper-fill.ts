@@ -71,7 +71,7 @@
 import type mysqlTypes from "mysql2/promise";
 import {
   applyCommission,
-  applySlippage,
+  applyExecutionPrice,
   loadRiskConfig,
   normalizeQuantity,
   slippageCostUsd,
@@ -333,13 +333,21 @@ async function fillOrderCore(
   const symbol = String(order.symbol);
   const orderType = String(order.order_type ?? "MARKET") as "MARKET" | "LIMIT" | "STOP";
 
-  // W4 — compute slippage-adjusted fill price + per-fill commission BEFORE
+  // W4/W6 — compute executable fill price + per-fill commission BEFORE
   // any cash move. These two are the source of truth for the trade row's
   // `buy_price`, `slippage_usd`, and `commission_usd` columns and for the
   // cash ledger arithmetic below. Keeping them up top means every branch
   // (open LONG / open SHORT / close LONG / cover SHORT) uses the same
-  // adjusted-price + commission numbers without re-deriving them.
-  const adjustedPrice = applySlippage(fillPrice, side, orderType, riskCfg);
+  // adjusted-price + commission numbers without re-deriving them. STOP
+  // orders become market orders after trigger; `applyExecutionPrice` models
+  // that plus bid/ask spread crossing.
+  const adjustedPrice = applyExecutionPrice(
+    fillPrice,
+    side,
+    orderType,
+    riskCfg,
+    order.limit_price != null ? Number(order.limit_price) : null
+  );
   if (!Number.isFinite(adjustedPrice) || adjustedPrice <= 0) {
     return { filled: false, rejection: "INVALID_PRICE" };
   }
@@ -435,7 +443,7 @@ async function fillOrderCore(
     return await insertOpenTrade(conn, {
       accountId, symbol, quantity, fillPrice: adjustedPrice, investment,
       positionSide: "LONG", side: "BUY", order, orderId, opts,
-      slippageUsd, commissionUsd,
+      slippageUsd, commissionUsd, borrowRatePct: 0,
     });
   }
 
@@ -579,7 +587,7 @@ async function fillOrderCore(
     return await insertOpenTrade(conn, {
       accountId, symbol, quantity, fillPrice: adjustedPrice, investment,
       positionSide: "SHORT", side: "SELL", order, orderId, opts,
-      slippageUsd, commissionUsd,
+      slippageUsd, commissionUsd, borrowRatePct: riskCfg.defaultBorrowRatePct,
     });
   }
 
@@ -660,7 +668,6 @@ async function fillOrderCore(
   const pnlSlice = expectedTradeSide === "SHORT"
     ? (buyPrice - adjustedPrice) * closeQty
     : (adjustedPrice - buyPrice) * closeQty;
-  const pnlPctSlice = investmentShare > 0 ? (pnlSlice / investmentShare) * 100 : 0;
 
   const newClosedQty = alreadyClosed + closeQty;
   const willBeFullyClosed = newClosedQty >= totalQty - 1e-9; // float tolerance
@@ -876,11 +883,14 @@ async function insertOpenTrade(
     slippageUsd?: number;
     /** W4 — per-fill commission in USD. */
     commissionUsd?: number;
+    /** Annualized short borrow rate % to seed on SHORT positions. */
+    borrowRatePct?: number;
   }
 ): Promise<FillOrderResult> {
   const { accountId, symbol, quantity, fillPrice, investment, positionSide, side, order, orderId, opts } = args;
   const slippageUsd = args.slippageUsd ?? 0;
   const commissionUsd = args.commissionUsd ?? 0;
+  const borrowRatePct = positionSide === "SHORT" ? Math.max(0, args.borrowRatePct ?? 0) : 0;
 
   const strategyLabel = opts?.strategyLabel ?? `${order.order_type} ${side}`;
   const strategyId = opts?.strategyId ?? null;
@@ -916,9 +926,10 @@ async function insertOpenTrade(
         trailing_stop_pct, trailing_activates_at_profit_pct,
         time_exit_date,
         closed_quantity,
+        borrow_daily_rate_pct,
         slippage_usd, commission_usd)
      VALUES (?, ?, ?, ?, ?, CURRENT_DATE, ?, ?, ?, 'OPEN', ?,
-             ?, ?, ?, ?, ?, 0, ?, ?)`,
+             ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
     [
       accountId,
       symbol,
@@ -934,6 +945,7 @@ async function insertOpenTrade(
       trailingPct,
       trailingActivatesPct,
       timeExitDate,
+      borrowRatePct,
       slippageUsd,
       commissionUsd,
     ]

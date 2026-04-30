@@ -14,6 +14,7 @@ describe("RiskSchema — tightened bounds (Finding #2 hotfix)", () => {
     expect(
       RiskSchema.safeParse({
         slippage_bps: 5,
+        spread_bps: 2,
         commission_per_share: 0.005,
         commission_min_per_leg: 1,
         allow_fractional_shares: true,
@@ -40,6 +41,7 @@ describe("RiskSchema — tightened bounds (Finding #2 hotfix)", () => {
     expect(RiskSchema.safeParse({ commission_per_share: -0.01 }).success).toBe(false);
     expect(RiskSchema.safeParse({ commission_min_per_leg: -1 }).success).toBe(false);
     expect(RiskSchema.safeParse({ slippage_bps: -0.5 }).success).toBe(false);
+    expect(RiskSchema.safeParse({ spread_bps: -0.5 }).success).toBe(false);
     expect(RiskSchema.safeParse({ default_borrow_rate_pct: -1 }).success).toBe(false);
   });
 
@@ -47,6 +49,7 @@ describe("RiskSchema — tightened bounds (Finding #2 hotfix)", () => {
     expect(RiskSchema.safeParse({ commission_per_share: 1 }).success).toBe(false);
     expect(RiskSchema.safeParse({ commission_min_per_leg: 11 }).success).toBe(false);
     expect(RiskSchema.safeParse({ slippage_bps: 201 }).success).toBe(false);
+    expect(RiskSchema.safeParse({ spread_bps: 201 }).success).toBe(false);
     expect(RiskSchema.safeParse({ default_borrow_rate_pct: 101 }).success).toBe(false);
   });
 
@@ -54,6 +57,7 @@ describe("RiskSchema — tightened bounds (Finding #2 hotfix)", () => {
     expect(RiskSchema.safeParse({ commission_per_share: 0.5 }).success).toBe(true);
     expect(RiskSchema.safeParse({ commission_min_per_leg: 10 }).success).toBe(true);
     expect(RiskSchema.safeParse({ slippage_bps: 200 }).success).toBe(true);
+    expect(RiskSchema.safeParse({ spread_bps: 200 }).success).toBe(true);
     expect(RiskSchema.safeParse({ default_borrow_rate_pct: 100 }).success).toBe(true);
   });
 });

@@ -50,27 +50,28 @@ describe("persistWatermarks", () => {
 /**
  * computeExitFillPrice — finding #3 regression tests.
  *
- * Default risk config: slippageBps=5 → edge = 0.0005 (5 bps).
- * LONG auto-exit closes via SELL (price drops a hair).
- * SHORT auto-exit covers via BUY (price rises a hair).
+ * Default risk config: slippageBps=5 and spreadBps=2 → market edge =
+ * 0.0006 (5 bps slippage + half of the 2 bps spread).
+ * LONG auto-exit closes via SELL (price drops).
+ * SHORT auto-exit covers via BUY (price rises).
  * TAKE_PROFIT is a LIMIT — no slippage.
  */
 describe("computeExitFillPrice", () => {
   const cfg = DEFAULT_RISK_CONFIG;
   const trigger = 100;
-  const bpsEdge = cfg.slippageBps / 10_000; // 0.0005
+  const marketEdge = (cfg.slippageBps + cfg.spreadBps / 2) / 10_000; // 0.0006
 
-  it("LONG + HARD_STOP → SELL fill a hair below trigger (market)", () => {
+  it("LONG + HARD_STOP → SELL fill below trigger (market)", () => {
     const r = computeExitFillPrice("HARD_STOP", "LONG", trigger, cfg);
     expect(r.isLimit).toBe(false);
-    expect(r.fillPrice).toBeCloseTo(trigger * (1 - bpsEdge), 8);
+    expect(r.fillPrice).toBeCloseTo(trigger * (1 - marketEdge), 8);
     expect(r.fillPrice).toBeLessThan(trigger);
   });
 
   it("LONG + TRAILING_STOP → SELL fill adjusted down (market)", () => {
     const r = computeExitFillPrice("TRAILING_STOP", "LONG", trigger, cfg);
     expect(r.isLimit).toBe(false);
-    expect(r.fillPrice).toBeCloseTo(trigger * (1 - bpsEdge), 8);
+    expect(r.fillPrice).toBeCloseTo(trigger * (1 - marketEdge), 8);
   });
 
   it("LONG + TIME_EXIT → SELL fill adjusted down (market)", () => {
@@ -91,10 +92,10 @@ describe("computeExitFillPrice", () => {
     expect(r.fillPrice).toBe(trigger);
   });
 
-  it("SHORT + HARD_STOP → BUY fill a hair above trigger (cover is more expensive)", () => {
+  it("SHORT + HARD_STOP → BUY fill above trigger (cover is more expensive)", () => {
     const r = computeExitFillPrice("HARD_STOP", "SHORT", trigger, cfg);
     expect(r.isLimit).toBe(false);
-    expect(r.fillPrice).toBeCloseTo(trigger * (1 + bpsEdge), 8);
+    expect(r.fillPrice).toBeCloseTo(trigger * (1 + marketEdge), 8);
     expect(r.fillPrice).toBeGreaterThan(trigger);
   });
 
@@ -109,8 +110,8 @@ describe("computeExitFillPrice", () => {
     expect(r.fillPrice).toBe(trigger);
   });
 
-  it("zero slippage config → fillPrice == triggerPrice on every reason/side combo", () => {
-    const noSlip = { ...cfg, slippageBps: 0 };
+  it("zero spread/slippage config → fillPrice == triggerPrice on every reason/side combo", () => {
+    const noSlip = { ...cfg, slippageBps: 0, spreadBps: 0 };
     for (const reason of ["HARD_STOP", "TRAILING_STOP", "TIME_EXIT", "LIQUIDATED", "TAKE_PROFIT"] as const) {
       for (const side of ["LONG", "SHORT"] as const) {
         const r = computeExitFillPrice(reason, side, trigger, noSlip);

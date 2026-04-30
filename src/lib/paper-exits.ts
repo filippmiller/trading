@@ -26,7 +26,7 @@ import type mysqlTypes from "mysql2/promise";
 import { recordEquitySnapshotInTx } from "./paper-fill";
 import {
   applyCommission,
-  applySlippage,
+  applyExecutionPrice,
   loadRiskConfig,
   slippageCostUsd,
   type RiskConfig,
@@ -305,14 +305,10 @@ export function inputsFromTradeRow(row: PaperTradeRow, maxPrice: number | null, 
  *
  * Semantics — matches how the exit would fill on a real brokerage:
  *   HARD_STOP, TRAILING_STOP, TIME_EXIT, LIQUIDATED → MARKET fill after trigger.
- *     Apply slippage against the trigger price. Closing a LONG is a SELL
- *     (price drops a hair); covering a SHORT is a BUY (price rises a hair).
- *     Either way, the filled P&L is a hair worse than the trigger quote —
- *     which matches what a user sees when they manually close at the same
- *     visible price.
- *   TAKE_PROFIT → LIMIT order already resting at the target price. Filled
- *     AT the limit, no slippage. Leaving this path as-is keeps take-profit
- *     exits behaving like the happy-path outcome the user planned for.
+ *     Cross the spread and apply slippage against the trigger price. Closing
+ *     a LONG is a SELL (price drops); covering a SHORT is a BUY (price rises).
+ *   TAKE_PROFIT → LIMIT order already resting at the target price. It never
+ *     fills worse than the target limit.
  *
  * Finding #3 (internal-critic 2026-04-21): before this, auto-exits always
  * used the raw trigger price, producing a systematic P&L inflation vs the
@@ -328,7 +324,7 @@ export function computeExitFillPrice(
   const isLimit = reason === "TAKE_PROFIT";
   const effectiveOrderType: "MARKET" | "LIMIT" = isLimit ? "LIMIT" : "MARKET";
   const exitSide: "BUY" | "SELL" = side === "LONG" ? "SELL" : "BUY";
-  const fillPrice = applySlippage(triggerPrice, exitSide, effectiveOrderType, cfg);
+  const fillPrice = applyExecutionPrice(triggerPrice, exitSide, effectiveOrderType, cfg, triggerPrice);
   return { fillPrice, isLimit };
 }
 

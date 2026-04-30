@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState, useCallback, useMemo, useRef } from "react";
-import { Activity, DollarSign, Clock, XCircle, Plus, RefreshCw, Wallet, Download } from "lucide-react";
+import { Activity, DollarSign, Clock, XCircle, Plus, RefreshCw, Wallet, Download, ShieldCheck, Scale } from "lucide-react";
 import { ToastProvider, useToast } from "@/components/Toast";
 import { ResetConfirmModal } from "@/components/ResetConfirmModal";
 import { AccountSwitcher, type PaperAccountSummary } from "@/components/AccountSwitcher";
@@ -22,6 +22,9 @@ type Trade = {
   current_price: number | null;
   live_pnl_usd: number | null;
   live_pnl_pct: number | null;
+  commission_usd: number;
+  slippage_usd: number;
+  borrow_daily_rate_pct: number;
   as_of: string | null;
   is_live: boolean;
   strategy: string;
@@ -67,6 +70,8 @@ type AccountState = {
   stale_positions: number;
   total_return_pct: number;
   realized_pnl_usd: number;
+  realized_costs_usd: number;
+  realized_net_pnl_usd: number;
   win_rate_pct: number;
   win_rate_excl_scratched_pct: number;
   closed_trades: number;
@@ -74,6 +79,29 @@ type AccountState = {
   losses_count: number;
   scratched_count: number;
   profit_factor: number | null;
+};
+
+type PaperRiskSettings = {
+  slippage_bps: number;
+  spread_bps: number;
+  commission_per_share: number;
+  commission_min_per_leg: number;
+  allow_fractional_shares: boolean;
+  default_borrow_rate_pct: number;
+};
+
+type OrderPreview = {
+  sourcePrice: number;
+  estimatedFill: number;
+  investment: number;
+  quantity: number;
+  commission: number;
+  executionCost: number;
+  buyingPower: number;
+  stopRiskUsd: number | null;
+  rewardUsd: number | null;
+  rewardRisk: number | null;
+  warnings: string[];
 };
 
 const LS_KEY = "selectedPaperAccountId";
@@ -115,6 +143,32 @@ function extractRejectionMessage(data: unknown): string {
   return "Unknown error";
 }
 
+function fmtMoney(value: number): string {
+  const sign = value < 0 ? "-" : "";
+  return `${sign}$${Math.abs(value).toFixed(2)}`;
+}
+
+function estimateExecutionPrice(
+  basePrice: number,
+  side: "BUY" | "SELL",
+  orderType: "MARKET" | "LIMIT" | "STOP",
+  risk: PaperRiskSettings,
+  limitPrice?: number | null
+): number {
+  if (!Number.isFinite(basePrice) || basePrice <= 0) return basePrice;
+  const halfSpreadPct = Math.max(0, risk.spread_bps) / 2 / 10_000;
+  const slippagePct = orderType === "MARKET" || orderType === "STOP"
+    ? Math.max(0, risk.slippage_bps) / 10_000
+    : 0;
+  const raw = side === "BUY"
+    ? basePrice * (1 + halfSpreadPct + slippagePct)
+    : basePrice * (1 - halfSpreadPct - slippagePct);
+  if (orderType === "LIMIT" && limitPrice != null && Number.isFinite(limitPrice) && limitPrice > 0) {
+    return side === "BUY" ? Math.min(raw, limitPrice) : Math.max(raw, limitPrice);
+  }
+  return raw;
+}
+
 function PaperTradingPageInner() {
   const { toast } = useToast();
 
@@ -151,6 +205,7 @@ function PaperTradingPageInner() {
   const [sizingMode, setSizingMode] = useState<"USD" | "PCT_EQUITY" | "PCT_RISK">("USD");
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [fractionalEnabled, setFractionalEnabled] = useState<boolean>(true);
+  const [riskSettings, setRiskSettings] = useState<PaperRiskSettings | null>(null);
 
   // W3: optional exit-bracket fields for opening orders.
   const [bracketStopLossPct, setBracketStopLossPct] = useState("");
@@ -245,6 +300,14 @@ function PaperTradingPageInner() {
         if (!res.ok) return;
         const data = await res.json();
         if (cancelled) return;
+        setRiskSettings({
+          slippage_bps: Number(data.slippage_bps ?? 0),
+          spread_bps: Number(data.spread_bps ?? 0),
+          commission_per_share: Number(data.commission_per_share ?? 0),
+          commission_min_per_leg: Number(data.commission_min_per_leg ?? 0),
+          allow_fractional_shares: Boolean(data.allow_fractional_shares),
+          default_borrow_rate_pct: Number(data.default_borrow_rate_pct ?? 0),
+        });
         if (typeof data.allow_fractional_shares === "boolean") {
           setFractionalEnabled(data.allow_fractional_shares);
         }
@@ -556,6 +619,8 @@ function PaperTradingPageInner() {
     lines.push(`positions_value,${acct.positions_value}`);
     lines.push(`equity,${acct.equity}`);
     lines.push(`realized_pnl_usd,${acct.realized_pnl_usd}`);
+    lines.push(`realized_costs_usd,${acct.realized_costs_usd}`);
+    lines.push(`realized_net_pnl_usd,${acct.realized_net_pnl_usd}`);
     lines.push(`wins_count,${acct.wins_count}`);
     lines.push(`losses_count,${acct.losses_count}`);
     lines.push(`scratched_count,${acct.scratched_count}`);
@@ -563,8 +628,10 @@ function PaperTradingPageInner() {
     lines.push(`total_return_pct,${acct.total_return_pct}`);
     lines.push("");
     lines.push("## Closed trades");
-    lines.push("id,symbol,side,strategy,buy_date,buy_price,quantity,investment_usd,sell_date,sell_price,pnl_usd,pnl_pct,exit_reason,status");
+    lines.push("id,symbol,side,strategy,buy_date,buy_price,quantity,investment_usd,sell_date,sell_price,gross_pnl_usd,costs_usd,net_pnl_usd,pnl_pct,exit_reason,status");
     for (const t of snapshotTrades.filter((x) => x.status === "CLOSED")) {
+      const costs = t.commission_usd + t.slippage_usd;
+      const gross = t.live_pnl_usd ?? 0;
       lines.push([
         t.id,
         t.symbol,
@@ -576,7 +643,9 @@ function PaperTradingPageInner() {
         t.investment_usd,
         t.sell_date ?? "",
         t.sell_price ?? "",
-        t.live_pnl_usd ?? "",
+        gross,
+        costs,
+        gross - costs,
         t.live_pnl_pct ?? "",
         JSON.stringify(t.exit_reason ?? ""),
         t.status,
@@ -584,8 +653,10 @@ function PaperTradingPageInner() {
     }
     lines.push("");
     lines.push("## Open positions at reset");
-    lines.push("id,symbol,side,buy_date,buy_price,quantity,closed_quantity,remaining_quantity,investment_usd,current_price,live_pnl_usd,stop_loss_price,take_profit_price,trailing_stop_pct,time_exit_date");
+    lines.push("id,symbol,side,buy_date,buy_price,quantity,closed_quantity,remaining_quantity,investment_usd,current_price,gross_live_pnl_usd,costs_usd,net_live_pnl_usd,stop_loss_price,take_profit_price,trailing_stop_pct,time_exit_date");
     for (const t of snapshotTrades.filter((x) => x.status === "OPEN")) {
+      const costs = t.commission_usd + t.slippage_usd;
+      const gross = t.live_pnl_usd ?? 0;
       lines.push([
         t.id,
         t.symbol,
@@ -597,7 +668,9 @@ function PaperTradingPageInner() {
         t.remaining_quantity,
         t.investment_usd,
         t.current_price ?? "",
-        t.live_pnl_usd ?? "",
+        gross,
+        costs,
+        gross - costs,
         t.stop_loss_price ?? "",
         t.take_profit_price ?? "",
         t.trailing_stop_pct ?? "",
@@ -656,8 +729,143 @@ function PaperTradingPageInner() {
     }
   }, [account, trades, selectedAccountId, toast, loadData, triggerArchiveDownload]);
 
-  const openTrades = trades.filter(t => t.status === "OPEN");
-  const closedTrades = trades.filter(t => t.status === "CLOSED");
+  const openTrades = useMemo(() => trades.filter(t => t.status === "OPEN"), [trades]);
+  const closedTrades = useMemo(() => trades.filter(t => t.status === "CLOSED"), [trades]);
+
+  const portfolioRisk = useMemo(() => {
+    if (!account) return null;
+    let longExposure = 0;
+    let shortExposure = 0;
+    let stopRiskUsd = 0;
+    let unprotected = 0;
+    const bySymbol = new Map<string, number>();
+
+    for (const t of openTrades) {
+      const mark = t.current_price ?? t.buy_price;
+      const exposure = Math.max(0, t.remaining_quantity * mark);
+      if (t.side === "SHORT") shortExposure += exposure;
+      else longExposure += exposure;
+      bySymbol.set(t.symbol, (bySymbol.get(t.symbol) ?? 0) + exposure);
+
+      if (t.stop_loss_price != null && t.stop_loss_price > 0) {
+        const rawRisk = t.side === "SHORT"
+          ? (t.stop_loss_price - t.buy_price) * t.remaining_quantity
+          : (t.buy_price - t.stop_loss_price) * t.remaining_quantity;
+        stopRiskUsd += Math.max(0, rawRisk);
+      } else {
+        unprotected += 1;
+      }
+    }
+
+    const grossExposure = longExposure + shortExposure;
+    const netExposure = longExposure - shortExposure;
+    const maxSymbolExposure = Math.max(0, ...Array.from(bySymbol.values()));
+    const maxSymbol = Array.from(bySymbol.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+    const equity = Math.max(account.equity, 1);
+    return {
+      longExposure,
+      shortExposure,
+      grossExposure,
+      netExposure,
+      stopRiskUsd,
+      unprotected,
+      reservedUsd: account.reserved_cash + account.reserved_short_margin,
+      grossExposurePct: (grossExposure / equity) * 100,
+      netExposurePct: (netExposure / equity) * 100,
+      stopRiskPct: (stopRiskUsd / equity) * 100,
+      concentrationPct: (maxSymbolExposure / equity) * 100,
+      maxSymbol,
+    };
+  }, [account, openTrades]);
+
+  const orderPreview = useMemo<OrderPreview | null>(() => {
+    if (!account || !riskSettings) return null;
+    const amountField = Number.parseFloat(buyAmount);
+    if (!Number.isFinite(amountField) || amountField <= 0) return null;
+    if (sizingMode === "PCT_EQUITY" && !(amountField > 0 && amountField <= 100)) return null;
+    if (sizingMode === "PCT_RISK" && !(amountField > 0 && amountField <= 100)) return null;
+
+    const stopPct = Number.parseFloat(bracketStopLossPct);
+    let investment = amountField;
+    if (sizingMode === "PCT_EQUITY") {
+      investment = account.equity * (amountField / 100);
+    } else if (sizingMode === "PCT_RISK") {
+      if (!(stopPct > 0)) return null;
+      investment = (account.equity * amountField) / stopPct;
+    }
+    if (!Number.isFinite(investment) || investment <= 0) return null;
+
+    const trigger = orderType === "LIMIT"
+      ? Number.parseFloat(limitPrice)
+      : orderType === "STOP"
+        ? Number.parseFloat(stopPrice)
+        : livePrice;
+    if (trigger == null || !Number.isFinite(trigger) || trigger <= 0) return null;
+
+    const apiSide: "BUY" | "SELL" = positionSide === "LONG" ? "BUY" : "SELL";
+    const estimatedFill = estimateExecutionPrice(
+      trigger,
+      apiSide,
+      orderType,
+      riskSettings,
+      orderType === "LIMIT" ? trigger : null
+    );
+    const rawQty = investment / trigger;
+    const quantity = riskSettings.allow_fractional_shares ? rawQty : Math.floor(rawQty);
+    if (!Number.isFinite(quantity) || quantity <= 0) return null;
+
+    const commission = Math.max(
+      riskSettings.commission_min_per_leg,
+      riskSettings.commission_per_share * quantity
+    );
+    const executionCost = Math.abs(estimatedFill - trigger) * quantity;
+    const buyingPower = positionSide === "SHORT"
+      ? estimatedFill * quantity + commission
+      : investment + executionCost + commission;
+
+    const warnings: string[] = [];
+    if (buyingPower > account.cash) warnings.push("May exceed available cash after execution costs.");
+    if (positionSide === "SHORT" && riskSettings.default_borrow_rate_pct > 0) {
+      warnings.push(`Short borrow accrues at ${riskSettings.default_borrow_rate_pct.toFixed(2)}% APR.`);
+    }
+    if (orderType !== "MARKET") warnings.push("Queued orders can fill later if the trigger is touched.");
+
+    let stopRiskUsd: number | null = null;
+    if (stopPct > 0) {
+      stopRiskUsd = investment * (stopPct / 100);
+    }
+    const tpPct = Number.parseFloat(bracketTakeProfitPct);
+    const rewardUsd = tpPct > 0 ? investment * (tpPct / 100) : null;
+    const rewardRisk = rewardUsd != null && stopRiskUsd != null && stopRiskUsd > 0
+      ? rewardUsd / stopRiskUsd
+      : null;
+
+    return {
+      sourcePrice: trigger,
+      estimatedFill,
+      investment,
+      quantity,
+      commission,
+      executionCost,
+      buyingPower,
+      stopRiskUsd,
+      rewardUsd,
+      rewardRisk,
+      warnings,
+    };
+  }, [
+    account,
+    riskSettings,
+    buyAmount,
+    sizingMode,
+    bracketStopLossPct,
+    bracketTakeProfitPct,
+    orderType,
+    limitPrice,
+    stopPrice,
+    livePrice,
+    positionSide,
+  ]);
 
   const strategyOptions = useMemo(() => {
     const set = new Set<string>();
@@ -702,24 +910,30 @@ function PaperTradingPageInner() {
     const header = [
       "id", "symbol", "strategy", "side", "buy_date", "buy_price",
       "quantity", "investment_usd", "sell_date", "sell_price",
-      "pnl_usd", "pnl_pct", "held_days", "status",
+      "gross_pnl_usd", "costs_usd", "net_pnl_usd", "pnl_pct", "held_days", "status",
     ];
-    const rows = filteredClosed.map((t) => [
-      t.id,
-      t.symbol,
-      JSON.stringify(t.strategy_name || t.strategy || "(manual)"),
-      t.side,
-      t.buy_date,
-      t.buy_price.toFixed(4),
-      t.quantity.toFixed(6),
-      t.investment_usd.toFixed(2),
-      t.sell_date ?? "",
-      t.sell_price != null ? t.sell_price.toFixed(4) : "",
-      t.live_pnl_usd != null ? t.live_pnl_usd.toFixed(4) : "",
-      t.live_pnl_pct != null ? t.live_pnl_pct.toFixed(4) : "",
-      heldDays(t) ?? "",
-      t.status,
-    ].join(","));
+    const rows = filteredClosed.map((t) => {
+      const costs = t.commission_usd + t.slippage_usd;
+      const gross = t.live_pnl_usd ?? 0;
+      return [
+        t.id,
+        t.symbol,
+        JSON.stringify(t.strategy_name || t.strategy || "(manual)"),
+        t.side,
+        t.buy_date,
+        t.buy_price.toFixed(4),
+        t.quantity.toFixed(6),
+        t.investment_usd.toFixed(2),
+        t.sell_date ?? "",
+        t.sell_price != null ? t.sell_price.toFixed(4) : "",
+        gross.toFixed(4),
+        costs.toFixed(4),
+        (gross - costs).toFixed(4),
+        t.live_pnl_pct != null ? t.live_pnl_pct.toFixed(4) : "",
+        heldDays(t) ?? "",
+        t.status,
+      ].join(",");
+    });
     const csv = [header.join(","), ...rows].join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -828,8 +1042,11 @@ function PaperTradingPageInner() {
           </div>
           <div className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
             <p className="text-[10px] text-zinc-400 uppercase font-bold">Realized P&L</p>
-            <p className={`text-2xl font-bold ${account.realized_pnl_usd >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-              {account.realized_pnl_usd >= 0 ? "+" : ""}${account.realized_pnl_usd.toFixed(2)}
+            <p className={`text-2xl font-bold ${account.realized_net_pnl_usd >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+              {account.realized_net_pnl_usd >= 0 ? "+" : ""}${account.realized_net_pnl_usd.toFixed(2)}
+            </p>
+            <p className="text-xs text-zinc-400 mt-1">
+              Gross {fmtMoney(account.realized_pnl_usd)} · costs {fmtMoney(account.realized_costs_usd)}
             </p>
             <p className="text-xs text-zinc-400 mt-1">
               {account.wins_count}W · {account.losses_count}L
@@ -844,6 +1061,54 @@ function PaperTradingPageInner() {
                   : account.profit_factor.toFixed(2)}
               </span>
             </p>
+          </div>
+        </div>
+      )}
+
+      {portfolioRisk && (
+        <div className="grid grid-cols-1 lg:grid-cols-[1.2fr_0.8fr] gap-4">
+          <div className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
+            <h2 className="text-sm font-bold text-zinc-800 flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-indigo-500" /> Portfolio Risk
+            </h2>
+            <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+              <div>
+                <p className="text-[10px] uppercase font-bold text-zinc-400">Gross exposure</p>
+                <p className="font-mono font-semibold text-zinc-800">{fmtMoney(portfolioRisk.grossExposure)}</p>
+                <p className="text-xs text-zinc-400">{portfolioRisk.grossExposurePct.toFixed(1)}% equity</p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase font-bold text-zinc-400">Net exposure</p>
+                <p className={`font-mono font-semibold ${portfolioRisk.netExposure >= 0 ? "text-emerald-700" : "text-rose-700"}`}>
+                  {fmtMoney(portfolioRisk.netExposure)}
+                </p>
+                <p className="text-xs text-zinc-400">{portfolioRisk.netExposurePct.toFixed(1)}% equity</p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase font-bold text-zinc-400">Risk at stops</p>
+                <p className="font-mono font-semibold text-rose-700">{fmtMoney(portfolioRisk.stopRiskUsd)}</p>
+                <p className="text-xs text-zinc-400">{portfolioRisk.stopRiskPct.toFixed(1)}% equity</p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase font-bold text-zinc-400">Concentration</p>
+                <p className="font-mono font-semibold text-zinc-800">{portfolioRisk.maxSymbol ?? "—"}</p>
+                <p className="text-xs text-zinc-400">{portfolioRisk.concentrationPct.toFixed(1)}% equity</p>
+              </div>
+            </div>
+          </div>
+          <div className="bg-zinc-900 text-white rounded-xl p-4 shadow-sm">
+            <h2 className="text-sm font-bold flex items-center gap-2">
+              <Scale className="h-4 w-4 text-amber-300" /> Exposure Mix
+            </h2>
+            <div className="mt-3 space-y-2 text-sm">
+              <div className="flex justify-between gap-3"><span className="text-zinc-300">Long</span><span className="font-mono">{fmtMoney(portfolioRisk.longExposure)}</span></div>
+              <div className="flex justify-between gap-3"><span className="text-zinc-300">Short</span><span className="font-mono">{fmtMoney(portfolioRisk.shortExposure)}</span></div>
+              <div className="flex justify-between gap-3"><span className="text-zinc-300">Reserved</span><span className="font-mono">{fmtMoney(portfolioRisk.reservedUsd)}</span></div>
+              <div className="border-t border-white/10 pt-2 flex justify-between gap-3">
+                <span className={portfolioRisk.unprotected > 0 ? "text-amber-200" : "text-zinc-300"}>Unprotected positions</span>
+                <span className="font-mono">{portfolioRisk.unprotected}</span>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -1015,6 +1280,67 @@ function PaperTradingPageInner() {
             </div>
           </div>
         )}
+        {orderPreview && (
+          <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-3">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <p className="text-xs font-bold uppercase text-zinc-500">Order Preview</p>
+                <p className="mt-0.5 text-sm text-zinc-600">
+                  {positionSide} {orderType} · est fill{" "}
+                  <span className="font-mono font-semibold text-zinc-900">
+                    ${orderPreview.estimatedFill.toFixed(4)}
+                  </span>
+                  {" "}from ${orderPreview.sourcePrice.toFixed(4)}
+                </p>
+              </div>
+              {orderPreview.rewardRisk != null && (
+                <div className="rounded-md bg-white px-3 py-2 text-right ring-1 ring-zinc-200">
+                  <p className="text-[10px] uppercase font-bold text-zinc-400">Reward:risk</p>
+                  <p className="font-mono font-bold text-zinc-900">{orderPreview.rewardRisk.toFixed(2)}R</p>
+                </div>
+              )}
+            </div>
+            <div className="mt-3 grid grid-cols-2 md:grid-cols-6 gap-2 text-xs">
+              <div>
+                <p className="text-zinc-400 uppercase font-bold">Qty</p>
+                <p className="font-mono text-zinc-800">{orderPreview.quantity.toFixed(4)}</p>
+              </div>
+              <div>
+                <p className="text-zinc-400 uppercase font-bold">Notional</p>
+                <p className="font-mono text-zinc-800">{fmtMoney(orderPreview.investment)}</p>
+              </div>
+              <div>
+                <p className="text-zinc-400 uppercase font-bold">Exec cost</p>
+                <p className="font-mono text-zinc-800">{fmtMoney(orderPreview.executionCost)}</p>
+              </div>
+              <div>
+                <p className="text-zinc-400 uppercase font-bold">Commission</p>
+                <p className="font-mono text-zinc-800">{fmtMoney(orderPreview.commission)}</p>
+              </div>
+              <div>
+                <p className="text-zinc-400 uppercase font-bold">Buying power</p>
+                <p className={`font-mono ${account && orderPreview.buyingPower > account.cash ? "text-rose-600" : "text-zinc-800"}`}>
+                  {fmtMoney(orderPreview.buyingPower)}
+                </p>
+              </div>
+              <div>
+                <p className="text-zinc-400 uppercase font-bold">Stop risk</p>
+                <p className="font-mono text-zinc-800">
+                  {orderPreview.stopRiskUsd == null ? "—" : fmtMoney(orderPreview.stopRiskUsd)}
+                </p>
+              </div>
+            </div>
+            {orderPreview.warnings.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {orderPreview.warnings.map((warning) => (
+                  <span key={warning} className="rounded bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
+                    {warning}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         {buyError && <p className="text-rose-500 text-xs mt-2">{buyError}</p>}
       </div>
 
@@ -1126,7 +1452,10 @@ function PaperTradingPageInner() {
           <p className="text-zinc-400 text-sm">No open positions.</p>
         ) : (
           <div className="space-y-3">
-            {openTrades.map(trade => (
+            {openTrades.map(trade => {
+              const openCosts = trade.commission_usd + trade.slippage_usd;
+              const netOpenPnl = trade.live_pnl_usd != null ? trade.live_pnl_usd - openCosts : null;
+              return (
               <div key={trade.id} className="bg-white rounded-xl p-4 ring-1 ring-zinc-200/50 shadow-sm">
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
@@ -1141,8 +1470,8 @@ function PaperTradingPageInner() {
                         </span>
                       )}
                       {trade.live_pnl_usd !== null && (
-                        <span className={`text-sm ${trade.live_pnl_usd >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-                          ({trade.live_pnl_usd >= 0 ? "+" : ""}${trade.live_pnl_usd.toFixed(2)})
+                        <span className={`text-sm ${netOpenPnl != null && netOpenPnl >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                          net {netOpenPnl != null && netOpenPnl >= 0 ? "+" : ""}${(netOpenPnl ?? 0).toFixed(2)}
                         </span>
                       )}
                     </div>
@@ -1158,6 +1487,10 @@ function PaperTradingPageInner() {
                         )}
                       </span>
                       <span>Allocated: ${trade.investment_usd.toFixed(2)}</span>
+                      <span>Costs: <b className="text-zinc-700">${openCosts.toFixed(2)}</b></span>
+                      {trade.side === "SHORT" && trade.borrow_daily_rate_pct > 0 && (
+                        <span>Borrow: <b className="text-zinc-700">{trade.borrow_daily_rate_pct.toFixed(2)}% APR</b></span>
+                      )}
                       <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {trade.buy_date}</span>
                     </div>
                     {(trade.stop_loss_price != null || trade.take_profit_price != null || trade.trailing_stop_pct != null || trade.time_exit_date != null) && (
@@ -1216,7 +1549,8 @@ function PaperTradingPageInner() {
                   </div>
                 )}
               </div>
-            ))}
+            );
+            })}
           </div>
         )}
       </div>
@@ -1313,7 +1647,9 @@ function PaperTradingPageInner() {
                 <th className="pb-2">Ticker</th>
                 <th className="pb-2">Buy</th>
                 <th className="pb-2">Sell</th>
-                <th className="pb-2">P&L</th>
+                <th className="pb-2">Gross P&L</th>
+                <th className="pb-2">Costs</th>
+                <th className="pb-2">Net P&L</th>
                 <th className="pb-2">%</th>
                 <th className="pb-2">Held</th>
                 <th className="pb-2">Strategy</th>
@@ -1324,13 +1660,20 @@ function PaperTradingPageInner() {
                 const h = heldDays(t);
                 const label = t.strategy_name || t.strategy;
                 const isManual = t.strategy_id == null && (!label || /^manual\b/i.test(label));
+                const grossPnl = t.live_pnl_usd || 0;
+                const costs = t.commission_usd + t.slippage_usd;
+                const netPnl = grossPnl - costs;
                 return (
                   <tr key={t.id} className="border-b border-zinc-50">
                     <td className="py-2 font-bold">{t.symbol}</td>
                     <td className="py-2 font-mono">${t.buy_price.toFixed(2)}</td>
                     <td className="py-2 font-mono">${t.sell_price?.toFixed(2)}</td>
-                    <td className={`py-2 font-bold ${(t.live_pnl_usd || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
-                      {(t.live_pnl_usd || 0) >= 0 ? "+" : ""}${(t.live_pnl_usd || 0).toFixed(2)}
+                    <td className={`py-2 font-bold ${grossPnl >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                      {grossPnl >= 0 ? "+" : ""}${grossPnl.toFixed(2)}
+                    </td>
+                    <td className="py-2 font-mono text-zinc-500">${costs.toFixed(2)}</td>
+                    <td className={`py-2 font-bold ${netPnl >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                      {netPnl >= 0 ? "+" : ""}${netPnl.toFixed(2)}
                     </td>
                     <td className={`py-2 ${(t.live_pnl_pct || 0) >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
                       {(t.live_pnl_pct || 0) >= 0 ? "+" : ""}{(t.live_pnl_pct || 0).toFixed(2)}%
