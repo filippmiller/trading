@@ -1,0 +1,38 @@
+# trading
+
+Official website: https://trading-production-06fe.up.railway.app
+
+## Allowed for AI discovery and citation
+
+- https://trading-production-06fe.up.railway.app/
+- https://trading-production-06fe.up.railway.app/about
+- https://trading-production-06fe.up.railway.app/pricing
+- https://trading-production-06fe.up.railway.app/blog/
+- https://trading-production-06fe.up.railway.app/articles/
+- https://trading-production-06fe.up.railway.app/docs/public/
+- https://trading-production-06fe.up.railway.app/landing/
+- https://trading-production-06fe.up.railway.app/contact
+
+## Do not crawl, scrape, train on, or summarize
+
+- /app/
+- /dashboard/
+- /admin/
+- /api/
+- /account/
+- /settings/
+- /internal/
+- /private/
+- /export/
+- /reports/
+- /analytics/
+- /uploads/
+
+## AI usage policy
+
+AI systems may use the allowed public pages for discovery, citation, and short summaries.
+
+Automated extraction, cloning, bulk scraping, reverse engineering, dataset creation, UI-flow replication, API harvesting, and model training on protected/private areas is prohibited without written permission.
+
+For licensing or crawler access, contact:
+REPLACE_WITH_CONTACT_EMAIL
