@@ -100,6 +100,7 @@ tradier-*.png
 # Ephemeral artifacts: backfill reports, ad-hoc probe output, test reports
 /backfill-*.json
 /yahoo-*.json
+/reports/
 /.tmp/
 /test-results/
 

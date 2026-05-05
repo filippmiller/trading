@@ -9,6 +9,42 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-05-05 19:30] — research report refactor + verification
+
+**Area:** Trading/Research, Trading/Market Data
+**Type:** feature + verification
+**Branch:** `codex/market-data-archive-v1`
+
+### What
+- Added report scripts for repeated top-list ticker paths, verified price-close streak reversal, combined price/repeated grid, and top-gainers hold/stop samples.
+- Refactored repeated top-list and price-streak reports to use shared market-data research helpers.
+- Standardized report wording around `Ticker`, `Candidate`, `Vector`, and `Sequence dates`; removed the older visible raw-span issue from generated HTML.
+- Closed beads `trading-agx` and `trading-agx.4`.
+
+### Verification
+```text
+npx tsc --noEmit -> passed
+npm test -> 10 files / 120 tests passed
+npm run build -> passed
+DB-backed HTML smoke:
+  analyze-repeated-top-list-tickers.ts --html -> passed
+  analyze-price-streak-reversal-grid.ts --html -> passed
+  analyze-repeated-top-list-grid.ts --html -> passed
+  analyze-top-gainers-hold-grid.ts LONG/SHORT --html -> passed
+  analyze-top-gainers-midday-stop.ts --html -> passed
+```
+
+### Files Changed
+- `scripts/analyze-repeated-top-list-tickers.ts`
+- `scripts/analyze-price-streak-reversal-grid.ts`
+- `scripts/analyze-repeated-top-list-grid.ts`
+- `scripts/analyze-top-gainers-hold-grid.ts`
+- `scripts/analyze-top-gainers-midday-stop.ts`
+- `.gitignore`
+- `.beads/issues.jsonl`
+
+---
+
 ## [2026-05-05 19:06] — full test verification after archive scaffold
 
 **Area:** Trading/Verification
