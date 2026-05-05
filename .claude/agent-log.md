@@ -9,6 +9,44 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-05-05 20:05] — self-review fixes + production deploy
+
+**Area:** Trading/Market Data, Trading/Research, Trading/Ops
+**Type:** code review + fixes + deploy
+**Branch:** `master`
+
+### What
+- Reviewed Market Data Archive v1 work with two subagent review passes plus local review.
+- Fixed repeated top-list false positives by making repeated-list reports MOVERS-only and using the full MOVERS cohort calendar before filtering reportable exits.
+- Fixed price-streak stale-data risk by requiring an exact `prices_daily` close on the candidate date.
+- Deduplicated same symbol/date/vector rows before repeated-list run detection.
+- Escaped DB-backed text in generated HTML report cells.
+- Made `sync-market-bars.ts` fail loudly on zero symbols/total failures, record `market_data_runs`, and support explicit `--allow-partial`.
+- Added CSV quoted-field parsing/validation for optional SP500 seed input.
+- Deduplicated archive schema definitions by importing the market archive statements into app migrations.
+
+### Verification
+```text
+npx tsc --noEmit -> passed
+npm test -> 10 files / 121 tests passed
+npm run build -> passed
+npx tsx scripts/sync-market-universe.ts -> upserted 647 rows across 584 symbols
+npx tsx scripts/sync-market-bars.ts --source=MOVERS --limit=3 --min-bars=5 --allow-partial -> 66 bars, 0 failures
+DB-backed HTML smoke for repeated-top-list, price-streak, top-gainers hold/short, and midday-stop reports -> passed
+git push origin master -> 6684008
+Railway trading deployment -> SUCCESS for commit 668400841344fe6afdb498116e11ec65a056f670
+Prod /api/healthz -> 200 on 3 consecutive attempts
+```
+
+### Review Findings Fixed
+- P1 repeated top-list reports included TREND rows.
+- P2 repeated-list cohort dates could bridge gaps after filtering rows by exits.
+- P2 midday-stop summary denominator included skipped rows.
+- P1 bar sync could fail while exiting successfully.
+- P2 simple CSV split could corrupt SP500 seed metadata.
+
+---
+
 ## [2026-05-05 19:30] — research report refactor + verification
 
 **Area:** Trading/Research, Trading/Market Data
