@@ -9,6 +9,75 @@ Each entry tracks: timestamp, area, files changed, functions/symbols used, datab
 
 ---
 
+## [2026-05-05 19:06] — full test verification after archive scaffold
+
+**Area:** Trading/Verification
+**Type:** verification
+**Branch:** `master`
+
+### Verification
+```text
+npm test -> 10 files / 120 tests passed
+```
+
+---
+
+## [2026-05-05 19:05] — market data archive v1 verification
+
+**Area:** Trading/Market Data, Trading/Research
+**Type:** verification
+**Branch:** `master`
+
+### What
+- Verified Market Data Archive v1 provider/schema/research helper scaffold.
+- Smoke-tested universe sync and daily bar archive scripts against local VPS MySQL tunnel.
+- Left `trading-agx.4` open for the next slice: refactor HTML reports to consume the shared helper layer.
+
+### Verification
+```text
+npx tsc --noEmit -> passed
+npx vitest run src/lib/market-data/research.test.ts -> 1 file / 5 tests passed
+npx tsx scripts/sync-market-universe.ts -> upserted 647 rows across 584 symbols
+npx tsx scripts/sync-market-bars.ts --source=MOVERS --limit=3 -> 66 bars, 0 failures
+```
+
+### Notes
+- CLI sync scripts use a narrow archive-schema initializer instead of full app `ensureSchema()` to avoid triggering unrelated historical migrations/backfills over the SSH tunnel.
+- MySQL writes are batched/retried for transient tunnel failures.
+
+---
+
+## [2026-05-05 00:00] — market data archive v1 scaffold
+
+**Area:** Trading/Market Data, Trading/Research
+**Type:** feature
+**Branch:** `master`
+
+### Why
+Move from one-off reports over MOVERS samples toward a durable market archive that can compare SP500/NASDAQ/MOVERS behavior by universe, while preserving the existing paper-trading workflow.
+
+### What
+- Initialized beads for Market Data Archive v1 (`trading-agx` and children).
+- Added market data provider interfaces with a working Yahoo/Stooq daily adapter and safe stubs for Polygon, Alpaca, FMP, and TwelveData.
+- Added idempotent archive tables for universe membership, OHLCV bars, data runs, and streak signals.
+- Added pure research helpers for price-streak detection, repeated top-list candidates, contrarian PnL paths, and first reversal day.
+- Added scripts to seed market universe rows and fetch daily archive bars.
+
+### Verification
+```text
+Pending in current session.
+```
+
+### Files Changed
+- `.beads/*` — local issue tracker database/export for Market Data Archive v1.
+- `src/lib/market-data/*` — provider abstraction and research helpers.
+- `src/lib/migrations.ts` — market archive tables.
+- `scripts/sync-market-universe.ts` — universe seeding script.
+- `scripts/sync-market-bars.ts` — daily bar archive script.
+- `docs/market-data-archive-v1.md` — operating notes.
+
+---
+
 ## [2026-04-30 11:13] — verification handoff + paper execution-cost prep
 
 **Area:** Trading/Ops, Trading/Paper
