@@ -107,6 +107,17 @@ function colored(value: number, text: string): string {
   return `<span class="${cls}">${text}</span>`;
 }
 
+function textCell(value: string): string {
+  if (!OUTPUT_HTML) return value;
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  })[char] ?? char);
+}
+
 function pnlCell(pct: number): string {
   return colored(pct, `${fmtUsd(usd(pct))} / ${fmtPct(pct)}`);
 }
@@ -136,7 +147,7 @@ function table(headers: string[], rows: string[][]) {
 
 function sequenceHtml(dates: string[] | undefined): string {
   if (!dates?.length) return "";
-  return OUTPUT_HTML ? dates.join("<br/>") : dates.join(", ");
+  return OUTPUT_HTML ? dates.map(textCell).join("<br/>") : dates.join(", ");
 }
 
 function buildPriceStreakCandidates(entries: EntryRow[]): CandidateRow[] {
@@ -222,11 +233,11 @@ function renderScenario(title: string, description: string, candidates: Candidat
     const detailRows = directionRows.map((row) => {
       const entry = num(row.entry_price);
       return [
-        dateStr(row.cohort_date),
-        row.symbol,
+        textCell(dateStr(row.cohort_date)),
+        textCell(row.symbol),
         row.bucket === 5 ? `${row.repeated_count ?? row.consecutive_days ?? "5+"}d` : `${row.repeated_count ?? row.consecutive_days ?? row.bucket}d`,
         fmtPct(num(row.day_change_pct)),
-        row.enrollment_source ?? "",
+        textCell(row.enrollment_source ?? ""),
         entry.toFixed(2),
         pnlCell(pnlPoint(direction, entry, "morning", num(row.d1_morning as string | number)).tradePnlPct),
         pnlCell(pnlPoint(direction, entry, "midday", num(row.d1_midday as string | number)).tradePnlPct),
@@ -263,9 +274,27 @@ async function main() {
       ORDER BY cohort_date ASC, id ASC`,
   );
 
-  const cohortDates = [...new Set(entries.map((row) => dateStr(row.cohort_date)))].sort();
+  const [allMoverDateRows] = await pool.execute<mysql.RowDataPacket[]>(
+    `SELECT DISTINCT cohort_date
+       FROM reversal_entries
+      WHERE entry_price > 0
+        AND (enrollment_source = 'MOVERS' OR enrollment_source IS NULL)
+      ORDER BY cohort_date ASC`,
+  );
+  const [allMoverRows] = await pool.execute<EntryRow[]>(
+    `SELECT id, symbol, cohort_date, day_change_pct, entry_price, consecutive_days,
+            enrollment_source, d1_morning, d1_midday, d1_close
+       FROM reversal_entries
+      WHERE entry_price > 0
+        AND (enrollment_source = 'MOVERS' OR enrollment_source IS NULL)
+      ORDER BY cohort_date ASC, id ASC`,
+  );
+
+  const reportableEntryIds = new Set(entries.map((row) => row.id));
+  const cohortDates = allMoverDateRows.map((row) => dateStr(row.cohort_date as Date | string));
   const priceCandidates = buildPriceStreakCandidates(entries);
-  const repeatedCandidates = buildRepeatedTopListCandidates(entries, cohortDates);
+  const repeatedCandidates = buildRepeatedTopListCandidates(allMoverRows, cohortDates)
+    .filter((candidate) => reportableEntryIds.has(candidate.id));
 
   if (OUTPUT_HTML) {
     console.log(`<!doctype html>

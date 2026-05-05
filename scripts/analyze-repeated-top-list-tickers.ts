@@ -102,6 +102,17 @@ function colored(value: number, text: string): string {
   return `<span class="${cls}">${text}</span>`;
 }
 
+function textCell(value: string): string {
+  if (!OUTPUT_HTML) return value;
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  })[char] ?? char);
+}
+
 function priceCell(candidate: Candidate, day: number): string {
   const raw = candidate[`d${day}_close` as keyof EntryRow] as string | number | null;
   if (raw == null) return "-";
@@ -176,6 +187,7 @@ async function main() {
             d6_close, d7_close, d8_close, d9_close, d10_close
        FROM reversal_entries
       WHERE entry_price > 0
+        AND (enrollment_source = 'MOVERS' OR enrollment_source IS NULL)
       ORDER BY cohort_date ASC, id ASC`,
   );
 
@@ -218,12 +230,12 @@ async function main() {
       }),
     }));
     return [
-      dateStr(candidate.cohort_date),
-      candidate.symbol,
+      textCell(dateStr(candidate.cohort_date)),
+      textCell(candidate.symbol),
       candidate.side === "UP" ? "Repeated top gainers" : "Repeated top losers",
       String(candidate.runLength),
       candidate.side === "UP" ? "SHORT" : "LONG",
-      candidate.sequenceDates.join(", "),
+      OUTPUT_HTML ? candidate.sequenceDates.map(textCell).join(", ") : candidate.sequenceDates.join(", "),
       fmtPct(num(candidate.day_change_pct)),
       num(candidate.entry_price).toFixed(2),
       firstReversal ?? "none in d1-d10",
@@ -233,8 +245,8 @@ async function main() {
   table(["Entry date", "Ticker", "Vector", "Days in list", "Trade", "Consecutive list dates", "Last-day move", "Entry close", "First reversal close"], summaryRows);
 
   const detailRows = candidates.map((candidate) => [
-    dateStr(candidate.cohort_date),
-    candidate.symbol,
+    textCell(dateStr(candidate.cohort_date)),
+    textCell(candidate.symbol),
     candidate.side,
     String(candidate.runLength),
     candidate.side === "UP" ? "SHORT" : "LONG",

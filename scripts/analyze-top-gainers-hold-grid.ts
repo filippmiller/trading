@@ -73,6 +73,17 @@ function colored(value: number, text: string): string {
   return `<span class="${cls}">${text}</span>`;
 }
 
+function textCell(value: string): string {
+  if (!OUTPUT_HTML) return value;
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  })[char] ?? char);
+}
+
 function fmtPnlCell(usd: number, pct: number): string {
   return colored(usd, `${fmtUsd(usd)} / ${fmtPct(pct)}`);
 }
@@ -167,7 +178,7 @@ async function main() {
     console.log(`<h1>Top gainers hold grid</h1>`);
     console.log(`<p class="meta">Dataset: last ${COHORT_DAYS} fully matured MOVERS cohort dates with top ${TOP_N} gainers each.</p>`);
     console.log(`<p class="meta">Trade: ${TRADE_DIRECTION === "SHORT" ? "short/sell" : "buy"} close on cohort date, $${POSITION_USD} each, 1x leverage, no costs/slippage.</p>`);
-    console.log(`<p class="meta">Cohort dates: ${selected.map((group) => group.date).reverse().join(", ")}</p>`);
+    console.log(`<p class="meta">Cohort dates: ${selected.map((group) => textCell(group.date)).reverse().join(", ")}</p>`);
   } else {
     console.log(`# Top gainers hold grid`);
     console.log(`Dataset: last ${COHORT_DAYS} fully matured MOVERS cohort dates with top ${TOP_N} gainers each.`);
@@ -179,7 +190,7 @@ async function main() {
   console.log(OUTPUT_HTML ? `<h2>Completeness check for latest ${COHORT_DAYS} available cohort dates</h2><ul>` : `## Completeness check for latest ${COHORT_DAYS} available cohort dates`);
   for (const group of latest) {
     const fullD5 = group.rows.filter((row) => HOLD_DAYS.every((d) => row[`d${d}_close`] != null)).length;
-    console.log(OUTPUT_HTML ? `<li>${group.date}: ${group.rows.length}/${TOP_N} top gainers, ${fullD5}/${TOP_N} have d1-d5 close</li>` : `- ${group.date}: ${group.rows.length}/${TOP_N} top gainers, ${fullD5}/${TOP_N} have d1-d5 close`);
+    console.log(OUTPUT_HTML ? `<li>${textCell(group.date)}: ${group.rows.length}/${TOP_N} top gainers, ${fullD5}/${TOP_N} have d1-d5 close</li>` : `- ${group.date}: ${group.rows.length}/${TOP_N} top gainers, ${fullD5}/${TOP_N} have d1-d5 close`);
   }
   if (OUTPUT_HTML) console.log(`</ul>`);
   console.log("");
@@ -225,7 +236,7 @@ async function main() {
         const exit = num(row[`d${d}_close`] as string | number);
         return fmtPnlCell(pnlUsd(entry, exit), pnlPct(entry, exit));
       });
-      const cells = [group.date, row.symbol, fmtPct(num(row.day_change_pct)), entry.toFixed(2), ...pnls];
+      const cells = [textCell(group.date), textCell(row.symbol), fmtPct(num(row.day_change_pct)), entry.toFixed(2), ...pnls];
       console.log(OUTPUT_HTML ? `<tr>${cells.map((cell) => `<td>${cell}</td>`).join("")}</tr>` : `| ${cells.join(" | ")} |`);
     }
   }

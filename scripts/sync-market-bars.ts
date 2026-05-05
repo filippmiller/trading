@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 
 import mysql from "mysql2/promise";
 
@@ -31,6 +32,8 @@ function parseArgs() {
   return {
     source: args.get("source") ?? "MOVERS",
     limit: Number(args.get("limit") ?? 25),
+    minBars: Number(args.get("min-bars") ?? 5),
+    allowPartial: args.has("allow-partial"),
   };
 }
 
@@ -78,58 +81,97 @@ async function main() {
     connectionLimit: 1,
   });
   await ensureMarketDataArchiveSchema(pool);
-
-  const [symbols] = (await executeWithRetry(
+  const runId = randomUUID();
+  await executeWithRetry(
     pool,
-    `SELECT symbol FROM market_universe
-      WHERE source = ? AND active = 1
-      ORDER BY symbol
-      LIMIT ${Math.max(1, Math.min(5000, Math.floor(args.limit)))}`,
-    [args.source],
-  )) as [mysql.RowDataPacket[], mysql.FieldPacket[]];
+    `INSERT INTO market_data_runs (id, kind, provider, status, params_json)
+     VALUES (?, ?, ?, ?, ?)`,
+    [runId, "sync_market_bars", yahooStooqProvider.name, "RUNNING", JSON.stringify(args)],
+  );
 
-  let barsUpserted = 0;
-  let failures = 0;
-  for (const row of symbols) {
-    const symbol = String(row.symbol);
-    try {
-      const bars = await yahooStooqProvider.fetchDailyBars?.({ symbol });
-      for (const bar of bars ?? []) {
-        await executeWithRetry(
-          pool,
-          `INSERT INTO market_bars
-            (symbol, ts, timeframe, provider, open, high, low, close, volume)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE
-            open = VALUES(open),
-            high = VALUES(high),
-            low = VALUES(low),
-            close = VALUES(close),
-            volume = VALUES(volume),
-            updated_at = CURRENT_TIMESTAMP(6)`,
-          [
-            bar.symbol,
-            mysqlDateTime(bar.ts),
-            bar.timeframe,
-            bar.provider,
-            bar.open,
-            bar.high,
-            bar.low,
-            bar.close,
-            bar.volume,
-          ],
-        );
-        barsUpserted++;
-      }
-      console.log(`[market-bars] ${symbol} ${bars?.length ?? 0} daily bars`);
-    } catch (err) {
-      failures++;
-      console.warn(`[market-bars] ${symbol} failed: ${err instanceof Error ? err.message : String(err)}`);
+  try {
+    const [symbols] = (await executeWithRetry(
+      pool,
+      `SELECT symbol FROM market_universe
+        WHERE source = ? AND active = 1
+        ORDER BY symbol
+        LIMIT ${Math.max(1, Math.min(5000, Math.floor(args.limit)))}`,
+      [args.source],
+    )) as [mysql.RowDataPacket[], mysql.FieldPacket[]];
+    if (symbols.length === 0) {
+      throw new Error(`No active symbols found for source=${args.source}`);
     }
-  }
 
-  console.log(`[market-bars] source=${args.source} symbols=${symbols.length} bars=${barsUpserted} failures=${failures}`);
-  await pool.end();
+    let barsUpserted = 0;
+    let failures = 0;
+    const warnings: string[] = [];
+    for (const row of symbols) {
+      const symbol = String(row.symbol);
+      try {
+        const bars = await yahooStooqProvider.fetchDailyBars?.({ symbol });
+        if (!bars?.length) throw new Error("Provider returned no bars");
+        if (bars.length < args.minBars) {
+          warnings.push(`${symbol}: only ${bars.length} bars returned`);
+        }
+        for (const bar of bars) {
+          await executeWithRetry(
+            pool,
+            `INSERT INTO market_bars
+              (symbol, ts, timeframe, provider, open, high, low, close, volume)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+              open = VALUES(open),
+              high = VALUES(high),
+              low = VALUES(low),
+              close = VALUES(close),
+              volume = VALUES(volume),
+              updated_at = CURRENT_TIMESTAMP(6)`,
+            [
+              bar.symbol,
+              mysqlDateTime(bar.ts),
+              bar.timeframe,
+              bar.provider,
+              bar.open,
+              bar.high,
+              bar.low,
+              bar.close,
+              bar.volume,
+            ],
+          );
+          barsUpserted++;
+        }
+        console.log(`[market-bars] ${symbol} ${bars.length} daily bars`);
+      } catch (err) {
+        failures++;
+        console.warn(`[market-bars] ${symbol} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    const status = failures === 0 ? "SUCCESS" : failures === symbols.length ? "FAILED" : "PARTIAL";
+    const summary = { source: args.source, symbols: symbols.length, bars: barsUpserted, failures, warnings };
+    await executeWithRetry(
+      pool,
+      `UPDATE market_data_runs
+          SET status = ?, summary_json = ?, finished_at = CURRENT_TIMESTAMP(6), error_message = ?
+        WHERE id = ?`,
+      [status, JSON.stringify(summary), warnings.length ? warnings.slice(0, 20).join("; ") : null, runId],
+    );
+    console.log(`[market-bars] source=${args.source} symbols=${symbols.length} bars=${barsUpserted} failures=${failures}`);
+    if (failures === symbols.length || (failures > 0 && !args.allowPartial)) {
+      throw new Error(`market-bars ${status}: ${failures}/${symbols.length} symbols failed`);
+    }
+  } catch (err) {
+    await executeWithRetry(
+      pool,
+      `UPDATE market_data_runs
+          SET status = 'FAILED', finished_at = CURRENT_TIMESTAMP(6), error_message = ?
+        WHERE id = ?`,
+      [err instanceof Error ? err.message : String(err), runId],
+    ).catch(() => undefined);
+    throw err;
+  } finally {
+    await pool.end();
+  }
 }
 
 main().catch((err) => {

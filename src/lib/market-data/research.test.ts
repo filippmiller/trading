@@ -65,6 +65,25 @@ describe("market-data research helpers", () => {
     });
   });
 
+  it("deduplicates same-day repeated top-list rows before building runs", () => {
+    const candidates = detectRepeatedTopListCandidates(
+      [
+        { symbol: "AAA", direction: "UP", date: "2026-04-14", id: 1 },
+        { symbol: "AAA", direction: "UP", date: "2026-04-14", id: 2 },
+        { symbol: "AAA", direction: "UP", date: "2026-04-15", id: 3 },
+        { symbol: "AAA", direction: "UP", date: "2026-04-16", id: 4 },
+      ],
+      ["2026-04-14", "2026-04-15", "2026-04-16"],
+    );
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      entry: { symbol: "AAA", date: "2026-04-16", id: 4 },
+      runLength: 3,
+      sequenceDates: ["2026-04-14", "2026-04-15", "2026-04-16"],
+    });
+  });
+
   it("computes long and short pnl directionally", () => {
     expect(computeTradePnlPct(100, 110, "LONG")).toBeCloseTo(10);
     expect(computeTradePnlPct(100, 110, "SHORT")).toBeCloseTo(-10);

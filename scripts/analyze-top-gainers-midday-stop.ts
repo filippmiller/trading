@@ -65,6 +65,17 @@ function colored(value: number, text: string): string {
   return `<span class="${cls}">${text}</span>`;
 }
 
+function textCell(value: string): string {
+  if (!OUTPUT_HTML) return value;
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  })[char] ?? char);
+}
+
 function cell(pctValue: number): string {
   return colored(pctValue, `${fmtUsd(usd(pctValue))} / ${fmtPct(pctValue)}`);
 }
@@ -139,6 +150,8 @@ async function main() {
   let baselineTotal = 0;
   let stoppedTotal = 0;
   let stoppedCount = 0;
+  let evaluatedCount = 0;
+  let skippedCount = 0;
 
   if (OUTPUT_HTML) {
     console.log(`<table><thead><tr><th>Cohort</th><th>Symbol</th><th>Trigger %</th><th>Entry</th><th>d1 morning</th><th>d1 midday check</th><th>Decision</th><th>Exit used</th><th>Stop-rule PnL</th><th>Baseline d5 PnL</th><th>Delta vs d5</th></tr></thead><tbody>`);
@@ -152,17 +165,21 @@ async function main() {
     const morningPct = row.d1_morning == null ? null : pct(entry, num(row.d1_morning));
     const middayPct = row.d1_midday == null ? null : pct(entry, num(row.d1_midday));
     const d5Pct = row.d5_close == null ? null : pct(entry, num(row.d5_close));
-    if (middayPct == null || d5Pct == null) continue;
+    if (middayPct == null || d5Pct == null) {
+      skippedCount++;
+      continue;
+    }
 
     const stopped = middayPct <= STOP_PCT;
     const finalPct = stopped ? middayPct : d5Pct;
+    evaluatedCount++;
     baselineTotal += usd(d5Pct);
     stoppedTotal += usd(finalPct);
     if (stopped) stoppedCount++;
 
     const cells = [
-      row.cohort,
-      row.symbol,
+      textCell(row.cohort),
+      textCell(row.symbol),
       fmtPct(num(row.day_change_pct)),
       entry.toFixed(2),
       morningPct == null ? "-" : cell(morningPct),
@@ -177,21 +194,24 @@ async function main() {
   }
   if (OUTPUT_HTML) console.log(`</tbody></table>`);
 
-  const deployed = allRows.length * POSITION_USD;
+  const deployed = evaluatedCount * POSITION_USD;
+  const baselineReturn = deployed > 0 ? (baselineTotal / deployed) * 100 : 0;
+  const stoppedReturn = deployed > 0 ? (stoppedTotal / deployed) * 100 : 0;
   const summaryCells = [
-    String(allRows.length),
+    String(evaluatedCount),
     String(stoppedCount),
-    colored(baselineTotal, `${fmtUsd(baselineTotal)} / ${fmtPct((baselineTotal / deployed) * 100)}`),
-    colored(stoppedTotal, `${fmtUsd(stoppedTotal)} / ${fmtPct((stoppedTotal / deployed) * 100)}`),
+    String(skippedCount),
+    colored(baselineTotal, `${fmtUsd(baselineTotal)} / ${fmtPct(baselineReturn)}`),
+    colored(stoppedTotal, `${fmtUsd(stoppedTotal)} / ${fmtPct(stoppedReturn)}`),
     colored(stoppedTotal - baselineTotal, fmtUsd(stoppedTotal - baselineTotal)),
-    colored(stoppedTotal, fmtPct((stoppedTotal / deployed) * 100)),
+    colored(stoppedTotal, fmtPct(stoppedReturn)),
   ];
   console.log(OUTPUT_HTML ? "<h2>Summary</h2>" : "\n## Summary");
   if (OUTPUT_HTML) {
-    console.log(`<table><thead><tr><th>Trades</th><th>Stopped</th><th>Baseline d5 PnL</th><th>Stop-rule PnL</th><th>Delta</th><th>Stop-rule return</th></tr></thead><tbody><tr>${summaryCells.map((entry) => `<td>${entry}</td>`).join("")}</tr></tbody></table></body></html>`);
+    console.log(`<table><thead><tr><th>Evaluated trades</th><th>Stopped</th><th>Skipped incomplete</th><th>Baseline d5 PnL</th><th>Stop-rule PnL</th><th>Delta</th><th>Stop-rule return</th></tr></thead><tbody><tr>${summaryCells.map((entry) => `<td>${entry}</td>`).join("")}</tr></tbody></table></body></html>`);
   } else {
-    console.log("| Trades | Stopped | Baseline d5 PnL | Stop-rule PnL | Delta | Stop-rule return |");
-    console.log("|---:|---:|---:|---:|---:|---:|");
+    console.log("| Evaluated trades | Stopped | Skipped incomplete | Baseline d5 PnL | Stop-rule PnL | Delta | Stop-rule return |");
+    console.log("|---:|---:|---:|---:|---:|---:|---:|");
     console.log(`| ${summaryCells.join(" | ")} |`);
   }
 

@@ -67,17 +67,44 @@ function parseArgs() {
   };
 }
 
+function parseCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let cell = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    const next = line[i + 1];
+    if (char === "\"" && quoted && next === "\"") {
+      cell += "\"";
+      i++;
+    } else if (char === "\"") {
+      quoted = !quoted;
+    } else if (char === "," && !quoted) {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+  cells.push(cell.trim());
+  if (quoted) throw new Error(`Malformed CSV row with unclosed quote: ${line}`);
+  return cells;
+}
+
 function readSp500Csv(csvPath: string): UniverseRow[] {
   if (!fs.existsSync(csvPath)) return [];
   const lines = fs.readFileSync(csvPath, "utf8").split(/\r?\n/).filter(Boolean);
   const [header, ...body] = lines;
-  const cols = header.split(",").map((col) => col.trim().toLowerCase());
+  const cols = parseCsvLine(header).map((col) => col.trim().toLowerCase());
   const symbolIdx = cols.indexOf("symbol");
   const nameIdx = cols.indexOf("name");
   const exchangeIdx = cols.indexOf("exchange");
   if (symbolIdx < 0) throw new Error(`${csvPath} must include a symbol column`);
   return body.map((line) => {
-    const cells = line.split(",").map((cell) => cell.trim());
+    const cells = parseCsvLine(line);
+    if (cells.length !== cols.length) {
+      throw new Error(`${csvPath} row has ${cells.length} cells but header has ${cols.length}: ${line}`);
+    }
     return {
       symbol: cells[symbolIdx].toUpperCase(),
       source: "SP500",

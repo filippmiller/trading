@@ -85,6 +85,17 @@ function colored(value: number, text: string): string {
   return `<span class="${cls}">${text}</span>`;
 }
 
+function textCell(value: string): string {
+  if (!OUTPUT_HTML) return value;
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  })[char] ?? char);
+}
+
 function usd(pct: number): number {
   return (pct / 100) * POSITION_USD;
 }
@@ -134,7 +145,7 @@ function tradePct(row: EntryRow, side: Side, exitBar: ExitBar): number {
 function evidenceHtml(evidence: AnalyzedRow["evidence"]): string {
   const parts = evidence.map((item) => {
     const move = item.movePct == null ? "" : ` (${fmtPct(item.movePct)})`;
-    return `${item.date}: ${item.close.toFixed(2)}${move}`;
+    return `${textCell(item.date)}: ${item.close.toFixed(2)}${move}`;
   });
   return OUTPUT_HTML ? parts.join("<br/>") : parts.join("; ");
 }
@@ -203,7 +214,7 @@ async function main() {
     const side: Side = num(entry.day_change_pct) >= 0 ? "UP" : "DOWN";
     const allPrices = pricesBySymbol.get(entry.symbol) ?? [];
     const cohort = dateStr(entry.cohort_date);
-    const idx = allPrices.findLastIndex((price) => dateStr(price.date) <= cohort);
+    const idx = allPrices.findIndex((price) => dateStr(price.date) === cohort);
     if (idx < 1) continue;
     const prices = allPrices.slice(Math.max(0, idx - 7), idx + 1);
     const result = detectVerifiedStreak(prices, side);
@@ -295,13 +306,13 @@ async function main() {
     const detailRows = sideRows.map((row) => {
       const entry = num(row.entry_price);
       return [
-        dateStr(row.cohort_date),
-        row.symbol,
+        textCell(dateStr(row.cohort_date)),
+        textCell(row.symbol),
         OUTPUT_HTML ? `<span class="badge">${row.computed_streak}d</span>` : `${row.computed_streak}d`,
         row.streak_side,
         tradeSide,
         fmtPct(num(row.day_change_pct)),
-        row.enrollment_source ?? "",
+        textCell(row.enrollment_source ?? ""),
         entry.toFixed(2),
         pnlCell(tradePct(row, scenario.side, "morning")),
         pnlCell(tradePct(row, scenario.side, "midday")),

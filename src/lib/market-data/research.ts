@@ -107,7 +107,12 @@ export function detectRepeatedTopListCandidates<T extends RepeatedListEntry>(
   minimumRunLength = 3,
 ): Array<RepeatedListCandidate<T>> {
   const cohortIndex = new Map(cohortDates.map((date, index) => [date, index]));
-  const sorted = [...entries].sort((a, b) => {
+  const uniqueEntries = new Map<string, T>();
+  for (const entry of entries) {
+    const key = `${entry.symbol}|${entry.direction}|${entry.date}`;
+    if (!uniqueEntries.has(key)) uniqueEntries.set(key, entry);
+  }
+  const sorted = [...uniqueEntries.values()].sort((a, b) => {
     const bySymbol = a.symbol.localeCompare(b.symbol);
     if (bySymbol !== 0) return bySymbol;
     const byDirection = a.direction.localeCompare(b.direction);
